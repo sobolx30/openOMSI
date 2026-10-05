@@ -7,14 +7,13 @@ use omsi_render::{Corona, LightMode, Lighting, PointLight, Scene};
 
 use omsi_sim::{Daylight, VehicleInstance};
 
-/// A headlight's strength for the enhanced renderer, its beam's at full (`headlamp` in
-/// `enhanced.wgsl`): the road from the bumper out to some 12 m lit about as brightly as a
-/// street under a lamp, and less beyond.
-const HEADLIGHT_INTENSITY: f32 = 1800.0;
-
-/// A `[spotlight]` declaring this range or more is a full beam (the stock buses' 500, the
-/// Grand Paris-Moulon Citaro's 450), less a low beam (the stock 100, that Citaro's 200).
-const FULL_BEAM_RANGE: f32 = 300.0;
+/// A headlight's strength for the enhanced renderer along its axis, in units of a
+/// `[maplight]` core (`PointLight::intensity`): some 1 100 cd. The stock spots point 17°
+/// down, so the axis meets the road a few metres ahead of the bumper; a real low beam's
+/// 20 000 cd there would be a floodlight. (At 20 the road ahead at night came out barely
+/// brighter with the lights on than off - 11 → 19 of 255 on Novi Sad's asphalt - where
+/// OMSI's buses throw a clear pool.)
+const HEADLIGHT_INTENSITY: f32 = 45.0;
 
 /// A headlight's strength in the classic picture, as a map lamp's (`PointLight::intensity`).
 /// Measured against OMSI 2 from above, the stock NL202 at night in Spandau: its pool is
@@ -117,13 +116,17 @@ pub fn apply_weather(
     l.snow = snow;
 }
 
-/// Coronas and point lights of one vehicle in its current state.
+/// Coronas and point lights of one vehicle in its current state. `shadow`: the vehicle is the
+/// player's, whose headlamps cast the shadows of what stands in front of them in the enhanced
+/// picture (`PointLight::shadow`).
 pub fn vehicle_lights(
     v: &VehicleInstance,
     coronas: &mut Vec<Corona>,
     lights: &mut Vec<PointLight>,
     night: f32,
+    shadow: bool,
 ) {
+    let first = lights.len();
     let ty = &v.ty;
     // def index → loaded mesh index (animation transform)
     let value_of = |name: &str| -> f32 {
@@ -246,6 +249,13 @@ pub fn vehicle_lights(
             }
         }
     }
+    // the headlamps of the player's vehicle, those that shine along the road (not a lamp over a
+    // door, pointing down), have the lamp shadow map drawn for them
+    if shadow {
+        for l in lights[first..].iter_mut().filter(|l| l.mode == LightMode::Enhanced) {
+            l.shadow = l.direction.normalize_or_zero().z.abs() < 0.5;
+        }
+    }
     // [interiorlight]s light only the meshes listing them and the passengers (per-instance
     // term, see MeshProps::interior); they do not shine on the outside world.
     let _ = &ty.model.interior_lights;
@@ -282,7 +292,7 @@ fn push_spot(lights: &mut Vec<PointLight>, at: DVec3, d: Vec3, vals: &[f32; 12],
         position: at,
         radius: spot_reach(vals[9], 45.0),
         color,
-        intensity: VANILLA_HEADLIGHT_INTENSITY * share * (0.3 + 0.7 * night),
+        intensity: VANILLA_HEADLIGHT_INTENSITY * share * (0.3 + 0.7 * night) * short_range_gain(vals[9]),
         direction: d,
         cone,
         mode: LightMode::Vanilla,
@@ -293,25 +303,62 @@ fn push_spot(lights: &mut Vec<PointLight>, at: DVec3, d: Vec3, vals: &[f32; 12],
         position: at,
         radius: spot_reach(vals[9], 60.0),
         color,
-        intensity: HEADLIGHT_INTENSITY * share,
+        intensity: HEADLIGHT_INTENSITY * share * short_range_gain(vals[9]),
         direction: d,
         cone,
-        core: 1.0,
-        // (a lamp pointing steeply down - a `[spotlight_2]` over a door - keeps its cone: the
-        // road lamp's profile is for one aimed along the road)
-        beam: if d.normalize_or_zero().z.abs() >= 0.5 { 0.0 } else if vals[9] >= FULL_BEAM_RANGE { -1.0 } else { 1.0 },
+        // (a metre, less on a lamp of a shorter reach)
+        core: (spot_reach(vals[9], 60.0) * 0.25).clamp(0.1, 1.0),
+        // (a plain spot, as Direct3D lights OMSI's road: the low-beam profile's
+        // bright band under a hard cut-off has nothing like it in the original)
+        beam: full_beam_gain(vals[9]),
         mode: LightMode::Enhanced,
+        shadow: false,
     });
 }
 
+/// How much more a `[spotlight]` of this range throws towards the horizon than along its
+/// axis in the enhanced picture (`PointLight::beam`, negative: a full beam): none up to the
+/// stock low beam's 100, beyond it the square of its reach over the low beam's, so it lights
+/// the road as far out as it reaches further - the stock full beam's 500, 25 times. Its
+/// longer reach alone showed nothing: lit inverse-square from a one-metre core, the road
+/// 60 m ahead had next to no light from either beam, and a full beam lit the road as the
+/// low beam did (#1068). (The classic picture's spot is full within an eighth of its reach,
+/// so its full beam's pool there is five times as long as the low beam's.)
+fn full_beam_gain(range: f32) -> f32 {
+    let k = spot_reach(range, 60.0) / 60.0;
+    if k > 1.0 {
+        -(k * k)
+    } else {
+        0.0
+    }
+}
+
 /// How far a `[spotlight]` reaches in the picture, from its declared range (value 9):
-/// up to `low` metres as declared, as before, and a range past the stock low beam's 100 in
+/// up to `low` metres as declared (down to half a metre: a lamp of a metre's range lights a
+/// metre, it used to light ten), and a range past the stock low beam's 100 in
 /// proportion to it (`low` metres for 100), at most five times `low`. The stock buses' full beam declares 500 against the low beam's 100; both
 /// cut at the same 45 m (60 in Enhanced), the full beam lit no further than the low beam
 /// (#941). (The light's core grows with it - a fixed share of the reach - so the full beam
 /// is also brighter ahead, as one is.)
 fn spot_reach(range: f32, low: f32) -> f32 {
-    range.clamp(10.0, low).max(range * low / 100.0).min(low * 5.0)
+    range.clamp(0.5, low).max(range * low / 100.0).min(low * 5.0)
+}
+
+/// A `[spotlight]` of a range under this (m) is weaker as its range is shorter.
+const SHORT_SPOT_RANGE: f32 = 10.0;
+
+/// How much of its colour's strength a `[spotlight]` of this range gives: all from
+/// `SHORT_SPOT_RANGE` on, below it the square of the range over it (5 m a quarter, 1 m a
+/// hundredth), so that a short range makes a faint, ambient lamp - at a metre's range the lamp
+/// lit the pavement like a floodlight (`HEADLIGHT_INTENSITY` is the strength of a lamp at its
+/// core). Its colour (0-255) dims it as well.
+fn short_range_gain(range: f32) -> f32 {
+    if range >= SHORT_SPOT_RANGE {
+        1.0
+    } else {
+        let r = range.max(0.5) / SHORT_SPOT_RANGE;
+        r * r
+    }
 }
 
 #[cfg(test)]
@@ -324,26 +371,25 @@ mod spot_tests {
         assert_eq!(super::spot_reach(500.0, 60.0), 300.0);
         // short ranges as declared, as before
         assert_eq!(super::spot_reach(30.0, 45.0), 30.0);
-        assert_eq!(super::spot_reach(2.0, 45.0), 10.0);
+        assert_eq!(super::spot_reach(2.0, 45.0), 2.0);
+        assert_eq!(super::spot_reach(0.2, 45.0), 0.5);
+        // a short range is a faint lamp, a long one as bright as ever
+        assert_eq!(super::short_range_gain(100.0), 1.0);
+        assert_eq!(super::short_range_gain(10.0), 1.0);
+        assert_eq!(super::short_range_gain(5.0), 0.25);
+        assert!((super::short_range_gain(1.0) - 0.01).abs() < 1e-6);
         assert_eq!(super::spot_reach(5000.0, 45.0), 225.0);
     }
 
-    /// The enhanced picture lights a `[spotlight]` as a low beam below the full beam's range
-    /// (the stock 100, the Grand Paris-Moulon Citaro's 200) and as a full beam from it on.
+    /// The enhanced picture's full beam throws towards the horizon as many times further as
+    /// its range says; a low beam stays a plain spot (#1068).
     #[test]
-    fn a_spotlight_is_a_low_or_a_full_beam_by_its_range() {
-        let beam = |range: f32| {
-            let vals = [0.0, 6.5, 0.76, 0.0, 1.0, -0.3, 255.0, 255.0, 233.0, range, 30.0, 80.0];
-            let mut lights = Vec::new();
-            super::push_spot(&mut lights, glam::DVec3::ZERO, glam::Vec3::Y, &vals, 0.5, 1.0);
-            lights.iter().find(|l| l.mode == omsi_render::LightMode::Enhanced).map(|l| l.beam)
-        };
-        assert_eq!([100.0, 200.0, 450.0, 500.0].map(beam), [Some(1.0), Some(1.0), Some(-1.0), Some(-1.0)]);
-        // a lamp over a door, pointing down, keeps its cone
-        let vals = [0.0, 6.5, 2.5, 0.0, 0.0, -1.0, 255.0, 255.0, 233.0, 100.0, 30.0, 80.0];
-        let mut lights = Vec::new();
-        super::push_spot(&mut lights, glam::DVec3::ZERO, glam::Vec3::NEG_Z, &vals, 0.5, 1.0);
-        assert_eq!(lights.iter().find(|l| l.mode == omsi_render::LightMode::Enhanced).map(|l| l.beam), Some(0.0));
+    fn a_full_beam_throws_its_light_further_down_the_road() {
+        assert_eq!(super::full_beam_gain(100.0), 0.0);
+        assert_eq!(super::full_beam_gain(30.0), 0.0);
+        assert_eq!(super::full_beam_gain(500.0), -25.0);
+        assert_eq!(super::full_beam_gain(200.0), -4.0);
+        assert_eq!(super::full_beam_gain(5000.0), -25.0);
     }
 
     /// `[spotlight_2]`: a pair mirrored across the axis sharing the light, or one lamp, as
@@ -490,8 +536,9 @@ pub fn collect(
             log::info!("smoke: {} particles from objects, first at ({:.1}, {:.1}, {:.1}) size {:.2} alpha {:.2}", scene.smoke.len(), p.position.x, p.position.y, p.position.z, p.size, p.alpha);
         }
     }
-    for v in vehicles {
-        vehicle_lights(v, &mut scene.coronas, &mut scene.lights, night);
+    // (the callers list the player's vehicle first, when there is one)
+    for (i, v) in vehicles.iter().enumerate() {
+        vehicle_lights(v, &mut scene.coronas, &mut scene.lights, night, i == 0);
         particle_sprites(&v.particles, &mut scene.smoke, &mut scene.coronas);
         for t in &v.trailers {
             particle_sprites(&t.particles, &mut scene.smoke, &mut scene.coronas);

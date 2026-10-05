@@ -160,26 +160,47 @@ struct Surface {
     rough: f32,
 };
 
-// A headlamp's intensity towards `t` (from the lamp) by the angles of a road lamp, not
-// around its axis: wide across, brightest just under the lamp's horizon where it reaches
-// far down the road, weak straight down, and with a low beam a sharp cut-off above it.
-fn headlamp(t: vec3<f32>, dir: vec3<f32>, low: bool) -> f32 {
-    let fwd = normalize(dir.xy + vec2<f32>(1e-6, 0.0));
-    let ahead = dot(t.xy, fwd);
-    if (ahead <= 0.0) {
-        return 0.0;
+// The shadow of the player's headlamps at a point: the map lies in the right half of the far
+// cascade's texture, drawn from the middle of the lamps with a perspective projection
+// (`LampShadow` in lib.rs). `to_lamp`: the unit vector from the point towards the lamp.
+// 1 = lit, 0 = in shadow; lit wherever the map does not reach.
+fn lamp_shadow(world: vec3<f32>, n: vec3<f32>, to_lamp: vec3<f32>) -> f32 {
+    if (camera.lamp.x < 0.5) {
+        return 1.0;
     }
-    let across = abs(t.x * fwd.y - t.y * fwd.x) / ahead;
-    let wide = 0.2 * smoothstep(1.0, 0.55, across) + 0.8 * exp(-across * across / 0.2);
-    let drop = -t.z / max(length(t.xy), 1e-3);
-    // full out to where the road is 0.06 under the lamp's horizon, then less as the cube of
-    // the drop and a little more: the road is lit evenly from the bumper on, a little
-    // brighter as far as the beam reaches, and not as one hot pool where its axis lands
-    var up = min(1.0, pow(0.06 / max(abs(drop), 1e-4), 3.4));
-    if (low) {
-        up = up * smoothstep(-0.012, 0.025, drop);
+    let near = camera.lamp.y;
+    let far = camera.lamp.z;
+    let d0 = (camera.light_view_proj_lamp * vec4<f32>(world, 1.0)).w;
+    if (d0 <= near || d0 >= far) {
+        return 1.0;
     }
-    return wide * up;
+    // pushed off the surface along its normal by about a texel of the map there (2 d tan(fov/2)
+    // over the map's size, taken as 0.004 d), more where the surface turns away from the lamp
+    let nl = clamp(dot(n, to_lamp), 0.0, 1.0);
+    let push = (0.03 + 0.004 * d0) * (1.0 + 2.0 * (1.0 - nl));
+    let lp = camera.light_view_proj_lamp * vec4<f32>(world + n * push, 1.0);
+    if (lp.w <= near) {
+        return 1.0;
+    }
+    let ndc = lp.xyz / lp.w;
+    let uv = vec2<f32>(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5);
+    if (uv.x < 0.01 || uv.x > 0.99 || uv.y < 0.01 || uv.y > 0.99 || ndc.z <= 0.0 || ndc.z >= 1.0) {
+        return 1.0;
+    }
+    // the depth bias in metres (a little more far away, where a texel is wider), turned into the
+    // perspective depth's units there: dz/dd = far near / ((far - near) d^2)
+    let dzdd = far * near / ((far - near) * lp.w * lp.w);
+    let bias = dzdd * (0.04 + 0.005 * lp.w);
+    let texel = camera.lamp.w;
+    var sum = 0.0;
+    for (var iy = -1; iy <= 1; iy = iy + 1) {
+        for (var ix = -1; ix <= 1; ix = ix + 1) {
+            let o = vec2<f32>(f32(ix), f32(iy)) * texel * 1.2;
+            let a = vec2<f32>((uv.x + o.x) * 0.5 + 0.5, uv.y + o.y);
+            sum = sum + textureSampleCompareLevel(t_shadow_far, s_shadow, a, ndc.z - bias);
+        }
+    }
+    return sum / 9.0;
 }
 
 // The point and spot lights of the pixel's grid cell: diffuse and specular.
@@ -224,14 +245,35 @@ fn lamp_light(p: vec3<f32>, n: vec3<f32>, v: vec3<f32>, sf: Surface, thin: bool)
         let q = dist2 / (range * range);
         let window = (1.0 - q * q) * (1.0 - q * q);
         var e = core * core / sqrt(dist2 * dist2 + core * core * core * core) * window;
-        if (l.extra.z != 0.0) {
-            e = headlamp(-ld, l.dir.xyz, l.extra.z > 0.0) / max(dist2, 0.3) * window;
-        } else if (l.dir.w > -1.5) {
+        if (l.dir.w > -1.5) {
             let cd = dot(-ld, l.dir.xyz);
             e = e * smoothstep(l.dir.w, l.extra.x, cd);
+            if (l.extra.z > 0.0) {
+                // a low beam: brightest just under its cut-off, where it reaches far down
+                // the road (the gain keeps the light on a flat road from falling off with
+                // the cube of the drop angle), back to the plain cone above the horizon
+                let drop = ld.z;
+                let axis = max(-l.dir.z, 0.05);
+                let gain = clamp(axis * axis / max(drop * drop, 1e-6), 1.0, l.extra.z);
+                e = e * mix(1.0, gain, smoothstep(-0.04, 0.0, drop));
+            } else if (l.extra.z < 0.0) {
+                // a full beam (the gain as a negative number): as much stronger towards the
+                // horizon, where it reaches far down the road, above it as well as below - it
+                // has no cut-off
+                let drop = abs(ld.z);
+                let axis = max(-l.dir.z, 0.05);
+                e = e * clamp(axis * axis / max(drop * drop, 1e-6), 1.0, -l.extra.z);
+            }
         }
         if (e <= 0.0) {
             continue;
+        }
+        // (pos.w is -1 on a headlamp the lamp shadow map is drawn for)
+        if (l.pos.w < 0.0) {
+            e = e * lamp_shadow(p, n, ld);
+            if (e <= 0.0) {
+                continue;
+            }
         }
         let irr = l.color.rgb * l.color.w * enh.lights.y * e;
         let nl = dot(n, ld);

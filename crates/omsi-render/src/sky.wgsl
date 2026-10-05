@@ -28,6 +28,8 @@ struct Camera {
     flags: vec4<f32>,
     light_view_proj_close: mat4x4<f32>,
     wind: vec4<f32>,
+    light_view_proj_lamp: mat4x4<f32>,
+    lamp: vec4<f32>,
 };
 
 // A hash of a lattice point, from its integer bits.

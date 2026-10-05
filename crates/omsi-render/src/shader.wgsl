@@ -22,6 +22,8 @@ struct Camera {
     flags: vec4<f32>,        // x detail texturing, y enhanced graphics, z never set (see fs_main's end), w close cascade half range
     light_view_proj_close: mat4x4<f32>,
     wind: vec4<f32>,         // the player's vehicle's velocity (m/s, world): the airstream on its glass
+    light_view_proj_lamp: mat4x4<f32>, // the player's headlamps' shadow map (perspective), see `lamp_shadow`
+    lamp: vec4<f32>,         // x 1 when the lamp shadow map was drawn this frame, y near, z far plane (m), w texel size
 };
 
 // 1 when the point lies inside the player's vehicle (its [boundingbox], shrunk a little so
@@ -690,8 +692,40 @@ fn vs_shadow_far(in: VsIn) -> VsOut {
     return out;
 }
 
+// The lamp shadow pass (the player's headlamps, `LampShadow` in lib.rs): the same casters,
+// from a perspective camera at the lamps, into the right half of the far cascade's texture.
+// Nothing here is nudged away from the sun: that is for the sun's map only.
+@vertex
+fn vs_shadow_lamp(in: VsIn) -> VsOut {
+    let e = draw_list[in.inst];
+    let m = model_matrix(e);
+    let wp = m * vec4<f32>(in.pos, 1.0);
+    var out: VsOut;
+    out.clip = camera.light_view_proj_lamp * wp;
+    out.world = wp.xyz;
+    out.normal = in.normal;
+    out.spec_sun = vec3<f32>(0.0);
+    out.spec_sky = vec3<f32>(0.0);
+    let pr = inst_params[e * 2u];
+    out.uv = in.uv + pr.zw;
+    out.params = pr;
+    out.params2 = inst_params[e * 2u + 1u];
+    if (pr.y < 0.5) {
+        out.clip = vec4<f32>(0.0, 0.0, 2.0, 1.0);
+    }
+    return out;
+}
+
 @fragment
 fn fs_shadow(in: FsIn) {
+}
+
+// The player's own vehicle casts no shadow of the lamps: they shine from inside its body.
+@fragment
+fn fs_shadow_lamp(in: FsIn) {
+    if (near_player_vehicle(in.world) > 0.5) {
+        discard;
+    }
 }
 
 // Reflection rays need the window surface as well as the opaque interior behind it.
@@ -714,8 +748,8 @@ fn fs_puddle_glass_depth(in: FsIn) {
     }
 }
 
-@fragment
-fn fs_shadow_test(in: FsIn) {
+// The coverage of an alpha-tested caster at this texel (see `fs_shadow_test`).
+fn shadow_test_alpha(in: FsIn) -> f32 {
     var duv = tex_address(in.uv);
     if (material.extra.x > 0.5) {
         duv = in.uv * material.extra.z;
@@ -733,7 +767,20 @@ fn fs_shadow_test(in: FsIn) {
         let tm = sample_transmap(tex_address(in.uv - in.params.zw));
         a = select(1.0, tm.a, material.params.w > 0.5);
     }
-    if (a < 0.5) {
+    return a;
+}
+
+@fragment
+fn fs_shadow_test(in: FsIn) {
+    if (shadow_test_alpha(in) < 0.5) {
+        discard;
+    }
+}
+
+@fragment
+fn fs_shadow_lamp_test(in: FsIn) {
+    let a = shadow_test_alpha(in);
+    if (a < 0.5 || near_player_vehicle(in.world) > 0.5) {
         discard;
     }
 }
@@ -886,13 +933,18 @@ fn shadow_close(world: vec3<f32>, n: vec3<f32>, ndl: f32, thin: bool) -> vec2<f3
     return vec2<f32>(shadow_pcf_close(uv, lp.z, slope, camera.shadow.y), w);
 }
 
+// The far cascade lies in the left half of its texture; the right half is the lamp shadow map.
+fn far_atlas(p: vec2<f32>) -> vec2<f32> {
+    return vec2<f32>(clamp(p.x, 0.0, 0.999) * 0.5, p.y);
+}
+
 fn shadow_pcf_far(uv: vec2<f32>, z: f32, slope: vec2<f32>, texel: f32) -> f32 {
     let bias = SHADOW_BIAS_FAR / SHADOW_DEPTH_RANGE;
     // (corners first, as in `shadow_pcf_atlas`)
     var corners = 0.0;
     for (var k = 0; k < 5; k = k + 1) {
         let o = SHADOW_OFFSETS[SHADOW_CORNERS[k]] * texel * 2.2;
-        corners = corners + textureSampleCompareLevel(t_shadow_far, s_shadow, uv + o, z + dot(slope, o) - bias);
+        corners = corners + textureSampleCompareLevel(t_shadow_far, s_shadow, far_atlas(uv + o), z + dot(slope, o) - bias);
     }
     if (corners <= 0.0 || corners >= 5.0) {
         return corners * 0.2;
@@ -900,7 +952,7 @@ fn shadow_pcf_far(uv: vec2<f32>, z: f32, slope: vec2<f32>, texel: f32) -> f32 {
     var sum = corners;
     for (var k = 0; k < 11; k = k + 1) {
         let o = SHADOW_OFFSETS[SHADOW_REST[k]] * texel * 2.2;
-        sum = sum + textureSampleCompareLevel(t_shadow_far, s_shadow, uv + o, z + dot(slope, o) - bias);
+        sum = sum + textureSampleCompareLevel(t_shadow_far, s_shadow, far_atlas(uv + o), z + dot(slope, o) - bias);
     }
     return sum / 16.0;
 }

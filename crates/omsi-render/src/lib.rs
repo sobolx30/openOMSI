@@ -66,6 +66,10 @@ struct CameraUniform {
     /// The player's vehicle's velocity (m/s, world) and 1: the airstream the rain on its
     /// glass meets (see `Lighting::glass_wind`).
     wind: [f32; 4],
+    /// The player's headlamps' shadow map (see `LampShadow`): the perspective view-projection,
+    light_view_proj_lamp: [[f32; 4]; 4],
+    /// and x 1 when it was drawn this frame, y its near and z its far plane (m), w its texel.
+    lamp: [f32; 4],
 }
 
 /// The period the sky's cloud patterns repeat with (m): 5 x the cloud field (14 km), 8 x
@@ -284,6 +288,10 @@ pub struct PointLight {
     pub beam: f32,
     /// Which path draws the light.
     pub mode: LightMode,
+    /// A headlamp of the player's vehicle the lamp shadow map is drawn for (enhanced path):
+    /// what stands in front of the lamps keeps the light off the road behind it. See
+    /// `LampShadow`.
+    pub shadow: bool,
 }
 
 impl Default for PointLight {
@@ -298,8 +306,91 @@ impl Default for PointLight {
             core: 0.0,
             beam: 0.0,
             mode: LightMode::Both,
+            shadow: false,
         }
     }
+}
+
+/// How near to the lamps the lamp shadow map starts (m): what the lamps sit in - their own
+/// housing, the bumper - is nearer than that and casts nothing.
+const LAMP_SHADOW_NEAR: f32 = 1.0;
+/// The lamp shadow map reaches at most this far (m); beyond it the light is unshadowed.
+const LAMP_SHADOW_FAR: f32 = 120.0;
+/// Headlamps whose directions are within about 25 degrees of the first one's share one map.
+const LAMP_SHADOW_SAME_DIR: f32 = 0.9;
+
+/// What the lamp shadow map is drawn for: the player's headlamps (`PointLight::shadow`) taken
+/// as one light at their middle, shining along their mean direction, with a perspective
+/// camera wide enough for their cones. The map takes the right half of the far cascade's
+/// texture (twice as wide as before), drawn after the sun's maps with the same casters, and
+/// is read by `lamp_shadow` in enhanced.wgsl for the lamps whose `pos.w` is -1.
+#[derive(Debug, Clone, Copy)]
+struct LampShadow {
+    /// Relative to the render origin.
+    pos: Vec3,
+    dir: Vec3,
+    /// The full field of view (radians) and the far plane (m).
+    fov: f32,
+    far: f32,
+}
+
+impl LampShadow {
+    fn view_proj(&self) -> Mat4 {
+        let up = if self.dir.z.abs() > 0.95 { Vec3::Y } else { Vec3::Z };
+        let view = Mat4::look_to_rh(self.pos, self.dir, up);
+        let proj = Mat4::perspective_rh(self.fov, 1.0, LAMP_SHADOW_NEAR, self.far);
+        proj * view
+    }
+
+    /// Whether a sphere (centre relative to the render origin) may be seen by the map's
+    /// camera: inside the cone round its axis that holds the square field of view.
+    fn sees(&self, centre: Vec3, radius: f32) -> bool {
+        let v = centre - self.pos;
+        let along = v.dot(self.dir);
+        if along < -radius || along > self.far + radius {
+            return false;
+        }
+        // the half angle of the cone through the field's corners
+        let half = (self.fov * 0.5).tan() * std::f32::consts::SQRT_2;
+        let half = half.atan();
+        let perp = (v - self.dir * along).length();
+        perp * half.cos() - along * half.sin() <= radius
+    }
+}
+
+/// A light the lamp shadow map may be drawn for.
+fn lamp_candidate(l: &PointLight) -> bool {
+    l.shadow && l.mode != LightMode::Vanilla && l.intensity > 0.0 && l.direction.length_squared() > 1e-6
+}
+
+/// Whether a light is one of those the map is drawn for, with `reference` its first one's
+/// direction (as `lamp_shadow_pick` returns it).
+fn lamp_member(l: &PointLight, reference: Vec3) -> bool {
+    lamp_candidate(l) && l.direction.normalize().dot(reference) >= LAMP_SHADOW_SAME_DIR
+}
+
+/// The lamp shadow map's camera for the frame's lights, and the direction that picks the
+/// lamps it is for (`lamp_member`). None: no headlamp of the player's is on.
+fn lamp_shadow_pick(lights: &[PointLight], origin: DVec3) -> Option<(LampShadow, Vec3)> {
+    let reference = lights.iter().find(|l| lamp_candidate(l))?.direction.normalize();
+    let (mut pos, mut dir, mut n) = (Vec3::ZERO, Vec3::ZERO, 0.0f32);
+    let (mut min_cos, mut far) = (1.0f32, 0.0f32);
+    for l in lights.iter().filter(|l| lamp_member(l, reference)) {
+        pos += (l.position - origin).as_vec3();
+        dir += l.direction.normalize();
+        n += 1.0;
+        min_cos = min_cos.min(l.cone[1]);
+        far = far.max(l.radius);
+    }
+    let dir = dir.normalize_or_zero();
+    if n < 1.0 || dir == Vec3::ZERO {
+        return None;
+    }
+    // the cones' outer half angle and a margin: the lamps are not on one point, nor all of
+    // them on the mean axis
+    let half = min_cos.clamp(-1.0, 1.0).acos();
+    let fov = (2.0 * half + 12.0f32.to_radians()).clamp(40.0f32.to_radians(), 125.0f32.to_radians());
+    Some((LampShadow { pos: pos / n, dir, fov, far: far.clamp(20.0, LAMP_SHADOW_FAR) }, reference))
 }
 
 /// Which renderer a light belongs to: a vehicle's headlight is three point lights along
@@ -1942,8 +2033,9 @@ pub struct Renderer {
     shadow_view_far: wgpu::TextureView,
     shadow_sampler: wgpu::Sampler,
     shadow_layout: wgpu::BindGroupLayout,
-    /// [near opaque, near alpha-tested, far opaque, far alpha-tested]
-    shadow_pipelines: [wgpu::RenderPipeline; 6],
+    /// [near opaque, near alpha-tested, far opaque, far alpha-tested, close opaque, close
+    /// alpha-tested, lamp opaque, lamp alpha-tested]
+    shadow_pipelines: [wgpu::RenderPipeline; 8],
     /// The settings this renderer was built with.
     pub options: RenderOptions,
     /// Enhanced path: the HDR targets per size, the post pipelines and their resources.
@@ -2872,7 +2964,8 @@ impl Renderer {
         let shadow_tex_far = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("shadow map far"),
             size: wgpu::Extent3d {
-                width: shadow_size,
+                // the far cascade on the left, the player's headlamps' map on the right
+                width: shadow_size * 2,
                 height: shadow_size,
                 depth_or_array_layers: 1,
             },
@@ -2907,7 +3000,8 @@ impl Renderer {
                     entry_point: Some(match cascade {
                         0 => "vs_shadow",
                         1 => "vs_shadow_far",
-                        _ => "vs_shadow_close",
+                        2 => "vs_shadow_close",
+                        _ => "vs_shadow_lamp",
                     }),
                     buffers: &[vertex_layout.clone()],
                     compilation_options: Default::default(),
@@ -2932,7 +3026,12 @@ impl Renderer {
                 multisample: Default::default(),
                 fragment: Some(wgpu::FragmentState {
                     module: &shader,
-                    entry_point: Some(if kind == PIPE_ALPHA_TEST { "fs_shadow_test" } else { "fs_shadow" }),
+                    entry_point: Some(match (kind == PIPE_ALPHA_TEST, cascade == 3) {
+                        (false, false) => "fs_shadow",
+                        (true, false) => "fs_shadow_test",
+                        (false, true) => "fs_shadow_lamp",
+                        (true, true) => "fs_shadow_lamp_test",
+                    }),
                     targets: &[],
                     compilation_options: Default::default(),
                 }),
@@ -2988,6 +3087,8 @@ impl Renderer {
             make_shadow(PIPE_ALPHA_TEST, 1),
             make_shadow(PIPE_OPAQUE, 2),
             make_shadow(PIPE_ALPHA_TEST, 2),
+            make_shadow(PIPE_OPAQUE, 3),
+            make_shadow(PIPE_ALPHA_TEST, 3),
         ];
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             address_mode_u: wgpu::AddressMode::Repeat,
@@ -7381,6 +7482,8 @@ impl Renderer {
             gpu_lights.push(gpu_light(l, (l.position - ro).as_vec3()));
         }
         let mut grid = vec![u32::MAX; side * side * LIGHT_CELL_CAP];
+        // the headlamps the lamp shadow map is for (pos.w -1: see `lamp_shadow` in enhanced.wgsl)
+        let lamp_reference = if enhanced { lamp_shadow_pick(&scene.lights, ro).map(|(_, r)| r) } else { None };
         for l in &scene.lights {
             if !drawn_by(l, enhanced) {
                 continue;
@@ -7394,7 +7497,11 @@ impl Renderer {
                 continue;
             }
             let idx = gpu_lights.len() as u32;
-            gpu_lights.push(gpu_light(l, p));
+            let mut g = gpu_light(l, p);
+            if l.mode == LightMode::Enhanced && lamp_reference.is_some_and(|r| lamp_member(l, r)) {
+                g.pos[3] = -1.0;
+            }
+            gpu_lights.push(g);
             for y in (y0.max(0.0) as usize)..=(y1.min(side as f32 - 1.0) as usize) {
                 for x in (x0.max(0.0) as usize)..=(x1.min(side as f32 - 1.0) as usize) {
                     let base = (y * side + x) * LIGHT_CELL_CAP;
@@ -8465,6 +8572,17 @@ impl Renderer {
             let v: [f32; 4] = [(lx - ro.x) as f32, (ly - ro.y) as f32, side as f32, if side > 0.0 { 1.0 } else { 0.0 }];
             self.queue.write_buffer(&self.lm_uniform, 0, bytemuck::cast_slice(&v));
         }
+        // The player's headlamps' shadow map (the window's enhanced picture only): drawn into the
+        // right half of the far cascade's texture after the sun's maps (OMSI_NO_LAMP_SHADOW=1
+        // leaves it out)
+        // (not by day: lit headlamps are invisible then, and the map would cost for nothing)
+        let lamp_pick = if enhanced && with_overlays && projection.is_none() && lighting.night > 0.1 && omsi_cfg::env::var_os("OMSI_NO_LAMP_SHADOW").is_none() {
+            lamp_shadow_pick(&scene.lights, ro).map(|(l, _)| l)
+        } else {
+            None
+        };
+        let lamp_view_proj = lamp_pick.map_or(Mat4::IDENTITY, |l| l.view_proj());
+        let lamp_on = lamp_pick.is_some();
         let cu = CameraUniform {
             post: [
                 if enhanced { 1.0 } else { 0.0 },
@@ -8563,6 +8681,13 @@ impl Renderer {
             ],
             light_view_proj_close: light_view_proj_close.to_cols_array_2d(),
             wind: [lighting.glass_wind.x, lighting.glass_wind.y, lighting.glass_wind.z, 1.0],
+            light_view_proj_lamp: lamp_view_proj.to_cols_array_2d(),
+            lamp: [
+                if lamp_on { 1.0 } else { 0.0 },
+                LAMP_SHADOW_NEAR,
+                lamp_pick.map_or(1.0, |l| l.far),
+                1.0 / self.options.shadow_size as f32,
+            ],
         };
         self.queue
             .write_buffer(&self.camera_buf, 0, bytemuck::bytes_of(&cu));
@@ -8584,8 +8709,8 @@ impl Renderer {
         let debug_cull = omsi_cfg::env::var_os("OMSI_DEBUG_CULL").is_some();
         let mut list: Vec<u32> = Vec::new();
         let mut items: Vec<DrawItem> = Vec::new();
-        // near, far, close
-        let mut shadow_batches: [Vec<Batch>; 3] = [Vec::new(), Vec::new(), Vec::new()];
+        // near, far, close, lamp
+        let mut shadow_batches: [Vec<Batch>; 4] = [Vec::new(), Vec::new(), Vec::new(), Vec::new()];
         let kind_of = |alpha: AlphaMode| -> u8 {
             match alpha {
                 AlphaMode::Opaque => PIPE_OPAQUE,
@@ -8601,15 +8726,16 @@ impl Renderer {
             let d = ((inst.origin - scene.render_origin).as_vec3() - cam_rel).length();
             if d <= radius { f32::MAX } else { 2.0 * radius / (d.max(0.01) * lod_fov) }
         };
-        let active = [draw_shadows && redraw_near, draw_shadows && redraw_far, draw_shadows];
-        let boxes = [(SHADOW_RANGE, light_view_proj, 0.4f32), (SHADOW_RANGE_FAR, light_view_proj_far, 6.0), (SHADOW_RANGE_CLOSE, light_view_proj_close, 0.1)];
+        let active = [draw_shadows && redraw_near, draw_shadows && redraw_far, draw_shadows, lamp_on];
+        // (the lamp's entry is a perspective camera: its box is the `LampShadow::sees` cone)
+        let boxes = [(SHADOW_RANGE, light_view_proj, 0.4f32), (SHADOW_RANGE_FAR, light_view_proj_far, 6.0), (SHADOW_RANGE_CLOSE, light_view_proj_close, 0.1), (1.0, lamp_view_proj, 0.1)];
         let dbg_shadow = omsi_cfg::env::var_os("OMSI_DEBUG_SHADOW").is_some();
         let dbg_r: f32 = omsi_cfg::env::var("OMSI_DEBUG_SHADOW")
             .ok()
             .and_then(|v| v.trim().parse().ok())
             .unwrap_or(3.0);
-        let casters = |span: std::ops::Range<usize>| -> [Vec<DrawItem>; 3] {
-            let mut out: [Vec<DrawItem>; 3] = [Vec::new(), Vec::new(), Vec::new()];
+        let casters = |span: std::ops::Range<usize>| -> [Vec<DrawItem>; 4] {
+            let mut out: [Vec<DrawItem>; 4] = [Vec::new(), Vec::new(), Vec::new(), Vec::new()];
             let mut ranges: Vec<(u8, u32, u32, usize, u32)> = Vec::new();
             for inst in &scene.instances[span] {
                 if !inst.visible || !inst.casts_shadow || (self.options.omsi_shadow_casters && !inst.omsi_caster) {
@@ -8665,7 +8791,11 @@ impl Renderer {
                     }
                     let lc = lvp.project_point3(c);
                     let rr = r / range;
-                    if lc.x.abs() > 1.0 + rr || lc.y.abs() > 1.0 + rr {
+                    let outside = match lamp_pick.filter(|_| cascade == 3) {
+                        Some(lamp) => !lamp.sees(c, r),
+                        None => lc.x.abs() > 1.0 + rr || lc.y.abs() > 1.0 + rr,
+                    };
+                    if outside {
                         if dbg {
                             log::info!("shadow: mesh r={r:.1} outside the light box at ({:.2}, {:.2})", lc.x, lc.y);
                         }
@@ -8676,7 +8806,8 @@ impl Renderer {
                     }
                     for &(kind, ri, slot, mat_id, look) in &ranges {
                         let kind = if kind == PIPE_KINDS {
-                            if cascade != 1 {
+                            // (the lamp map has no traced rays: it draws the solid ones too)
+                            if cascade != 1 && cascade != 3 {
                                 continue;
                             }
                             PIPE_OPAQUE
@@ -8707,15 +8838,21 @@ impl Renderer {
                 blocks.as_ref().is_none_or(|bl| {
                     let (c, r) = bl[b];
                     boxes.iter().enumerate().any(|(k, &(range, lvp, _))| {
+                        if !active[k] {
+                            return false;
+                        }
+                        if let Some(lamp) = lamp_pick.filter(|_| k == 3) {
+                            return lamp.sees(c, r);
+                        }
                         let lc = lvp.project_point3(c);
                         let rr = r / range;
-                        active[k] && lc.x.abs() <= 1.0 + rr && lc.y.abs() <= 1.0 + rr
+                        lc.x.abs() <= 1.0 + rr && lc.y.abs() <= 1.0 + rr
                     })
                 })
             };
-            let mut found: [Vec<DrawItem>; 3] = [Vec::new(), Vec::new(), Vec::new()];
+            let mut found: [Vec<DrawItem>; 4] = [Vec::new(), Vec::new(), Vec::new(), Vec::new()];
             for part in run_parts(self.encoding_pool.as_ref(), parts, |p| {
-                let mut out: [Vec<DrawItem>; 3] = [Vec::new(), Vec::new(), Vec::new()];
+                let mut out: [Vec<DrawItem>; 4] = [Vec::new(), Vec::new(), Vec::new(), Vec::new()];
                 let end = ((p + 1) * chunk).min(n);
                 let mut b = p * chunk;
                 while b < end {
@@ -8733,7 +8870,7 @@ impl Renderer {
                     a.extend(b);
                 }
             }
-            for cascade in 0..3 {
+            for cascade in 0..4 {
                 if !active[cascade] {
                     continue;
                 }
@@ -9549,10 +9686,41 @@ impl Renderer {
                     &self.shadow_pipelines[4 + pipe as usize]
                 });
             } else {
+                // (the left half of its texture: the right half is the lamp shadow map)
+                let sz = self.options.shadow_size as f32;
+                pass.set_viewport(0.0, 0.0, sz, sz, 0.0, 1.0);
                 encode_batches(&mut pass, scene, &shadow_batches[cascade], |pipe| {
                     &self.shadow_pipelines[cascade * 2 + pipe as usize]
                 });
             }
+        }
+        // --- the player's headlamps' shadow map: the right half of the far cascade's texture,
+        // cleared and drawn every frame (the lamps move with the bus), after the sun's maps
+        if lamp_on {
+            let sz = self.options.shadow_size as f32;
+            let mut pass = shadow_encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("shadow lamp"),
+                color_attachments: &[],
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: &self.shadow_view_far,
+                    depth_ops: Some(wgpu::Operations {
+                        load: wgpu::LoadOp::Load,
+                        store: wgpu::StoreOp::Store,
+                    }),
+                    stencil_ops: None,
+                }),
+                timestamp_writes: pass_timer(tset.as_ref(), &mut timed, "shadow lamp"),
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            pass.set_viewport(sz, 0.0, sz, sz, 0.0, 1.0);
+            pass.set_scissor_rect(sz as u32, 0, sz as u32, sz as u32);
+            pass.set_pipeline(&self.shadow_clear_pipeline);
+            pass.draw(0..3, 0..1);
+            pass.set_bind_group(0, scene.shadow_bind_group.as_ref().unwrap(), &[]);
+            encode_batches(&mut pass, scene, &shadow_batches[3], |pipe| {
+                &self.shadow_pipelines[6 + pipe as usize]
+            });
         }
         // --- depth prepass + ambient occlusion (single-sampled, camera projection)
         if prepass_on {
