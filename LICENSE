@@ -1,3 +1,16 @@
+openOMSI is distributed under two licences. Which one applies depends on who wrote the
+part in question.
+
+==============================================================================
+PART 1 - THE ORIGINAL CODE (MIT License)
+==============================================================================
+
+"Original Code" means the code, documentation and other files of openOMSI as written by
+usonskyyyy and published at https://github.com/openOMSI-Project/openOMSI, before any
+change made in this repository.
+
+The Original Code remains under the MIT License and stays available to everyone under it:
+
 MIT License
 
 Copyright (c) 2026 usonskyyyy
@@ -19,3 +32,36 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
+
+==============================================================================
+PART 2 - MODIFICATIONS MADE IN THIS REPOSITORY (All Rights Reserved)
+==============================================================================
+
+"Modifications" means every change, addition, new file, new feature and new text made in
+this repository (https://github.com/sobolx30/openOMSI) by sobolx30 or accepted into it,
+as recorded in its commit history, that is not part of the Original Code.
+
+Copyright (c) 2026 sobolx30. All rights reserved.
+
+1. The Modifications are NOT licensed under the MIT License. Part 1 does not apply to
+   them.
+2. The Modifications may be used only as a part of this program (openOMSI as published in
+   this repository and its releases). Permission is given to run and use the program.
+3. Without written permission of the copyright holder, the Modifications may not be
+   copied, extracted, reused or adapted in any other program or project, and may not be
+   redistributed, sublicensed or sold on their own or in a modified version of the
+   program.
+4. Where a file contains both Original Code and Modifications, the Original Code in it
+   remains under Part 1 and the Modifications under Part 2.
+5. The Modifications are provided "as is", without warranty of any kind; the copyright
+   holder is not liable for any damages arising from their use.
+
+==============================================================================
+THIRD-PARTY FILES AND TRADEMARKS
+==============================================================================
+
+Third-party files shipped with the program (for example the Roboto fonts and the Material
+icons) keep their own licences, as stated with those files.
+
+OMSI and OMSI 2 are trademarks of their respective owners. openOMSI is an independent
+project and is not affiliated with them.
