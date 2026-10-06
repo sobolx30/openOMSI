@@ -60,6 +60,8 @@ impl ApplicationHandler for App {
     fn suspended(&mut self, _event_loop: &ActiveEventLoop) {
         self.surface = None;
         self.touch.drop_gpu();
+        self.quick.drop_gpu();
+        self.summary.drop_gpu();
         self.input_lost();
         self.save_last_situation();
     }
@@ -191,6 +193,9 @@ impl ApplicationHandler for App {
                 button: winit::event::MouseButton::Right,
                 ..
             } => {
+                if state == ElementState::Pressed {
+                    self.quick.alt_armed = false;
+                }
                 if let Some(edit) = self.vr_nav_edit.as_mut() {
                     edit.rotating = state == ElementState::Pressed;
                     return;
@@ -219,6 +224,9 @@ impl ApplicationHandler for App {
                 button: winit::event::MouseButton::Middle,
                 ..
             } => {
+                if state == ElementState::Pressed {
+                    self.quick.alt_armed = false;
+                }
                 if self.vr_nav_edit.is_some() { return; }
                 if self.navigator.as_ref().map(|n| n.map_open()).unwrap_or(false) {
                     return;
@@ -228,10 +236,15 @@ impl ApplicationHandler for App {
                 self.update_hover();
             }
             WindowEvent::MouseWheel { delta, .. } => {
+                self.quick.alt_armed = false;
                 let amount = match delta {
                     winit::event::MouseScrollDelta::LineDelta(_, y) => y,
                     winit::event::MouseScrollDelta::PixelDelta(p) => p.y as f32 / 40.0,
                 };
+                // (over the trip summary the wheel scrolls its table)
+                if self.summary_wheel(amount) {
+                    return;
+                }
                 self.wheel(amount);
             }
             WindowEvent::CursorMoved { position, .. } => {
@@ -276,6 +289,14 @@ impl ApplicationHandler for App {
                     }
                 } else {
                     let pressed = state == ElementState::Pressed;
+                    // (a click in the trip summary is the window's)
+                    if self.summary_click(pressed) {
+                        return;
+                    }
+                    // (a click on a tile of the quick menu is the menu's)
+                    if self.quick_menu_click(pressed) {
+                        return;
+                    }
                     self.buttons_held.0 = pressed;
                     // the right button already down (looking round): both held zoom, and
                     // the click works nothing in the cab
@@ -586,7 +607,10 @@ impl ApplicationHandler for App {
                                 .values()
                                 .flat_map(|r| traffic::vehicle_bodies(r.vehicle())),
                         );
-                        if let Some(s) = self.schedule.as_mut() {
+                        // (the timetable buses only when the game was started with them: a timetable
+                        // read later, for the lists of lines and tours, brings none)
+                        let ai_buses = self.args.schedule;
+                        if let Some(s) = self.schedule.as_mut().filter(|_| ai_buses) {
                             let window = if self.first_populate {
                                 20.0 * 60.0
                             } else {
@@ -699,6 +723,8 @@ impl ApplicationHandler for App {
                 #[cfg(not(windows))]
                 let vr_on = false;
                 let needs_mouse = self.mouse_drive
+                    || self.quick.open
+                    || self.summary.open
                     || self.game_menu.is_some()
                     || self.chooser.is_some()
                     || self.list_kind.is_some()
@@ -891,6 +917,7 @@ impl ApplicationHandler for App {
                 }
                 // the on-screen wheel and pedals (a phone)
                 self.touch_frame(dt);
+                self.quick_menu_frame();
                 if let (Some(p), Some(r), Some(scene)) = (
                     self.player.as_mut(),
                     self.renderer.as_ref(),
@@ -1399,6 +1426,8 @@ impl ApplicationHandler for App {
                 }
                 *self.profile.entry("humans").or_default() += __t.elapsed().as_secs_f64();
                 self.foot_after_humans();
+                // (the trip that is over this frame, for its summary)
+                let mut trip_ended: Option<usize> = None;
                 if let (Some(d), Some(p), Some(w), false) = (
                     self.duty.as_mut(),
                     self.player.as_mut(),
@@ -1413,11 +1442,19 @@ impl ApplicationHandler for App {
                     }
                     d.learn_loaded(&w.object_positions.lock());
                     let due = (d.trip_index, d.next_stop);
+                    let trip_before = d.trip_index;
                     let served = d.update(&mut p.vehicle, self.clock.time);
                     if let Some((arrival, departure)) = served {
                         self.career.stop_served(arrival, departure);
                     }
-                    crate::journey::note(&mut self.journey, d, due, served, &self.args.root, || crate::journey::head(&self.career, &w.global.name, &p.vehicle, &self.clock));
+                    crate::journey::note(&mut self.journey, d, due, served, crate::journey::odometer_km(&p.vehicle), &self.args.root, || crate::journey::head(&self.career, &w.global.name, &p.vehicle, &self.clock));
+                    // a trip is over: the next one began (the bus left this one behind), or the
+                    // tour's last trip stands served at its terminus
+                    if d.trip_index != trip_before {
+                        trip_ended = Some(trip_before);
+                    } else if d.terminus_served() {
+                        trip_ended = Some(d.trip_index);
+                    }
                     if let Some((count, due_at, at)) = d.take_skipped() {
                         use omsi_plugin::InfoValue::Num;
                         crate::plugins::queue_event(&mut self.plugin_events, "stops_skipped", vec![Num(count as f64), Num(due_at as f64), Num(at as f64)]);
@@ -1434,6 +1471,9 @@ impl ApplicationHandler for App {
                     ) {
                         log::warn!("driver timetable paper: {e:#}");
                     }
+                }
+                if let Some(t) = trip_ended {
+                    self.trip_summary_open(t);
                 }
                 if let Some(p) = self.player.as_mut() {
                     let riders = self.humans.as_ref().map(|h| h.riding()).unwrap_or(0);
@@ -2429,6 +2469,8 @@ impl ApplicationHandler for App {
                 if let Some(s) = self.surface.as_ref() {
                     let (w, h) = (s.config.width, s.config.height);
                     self.touch_prepare(w, h);
+                    self.quick_prepare(w, h);
+                    self.summary_prepare(w, h);
                 }
                 if let (Some(s), Some(r), Some(scene), Some(cam), Some(win)) = (
                     self.surface.as_ref(),
@@ -2744,6 +2786,10 @@ impl ApplicationHandler for App {
                         }
                         // the on-screen controls over the picture (a phone)
                         self.touch.render(r, &view, s.config.width, s.config.height);
+                        // the quick menu (Alt) over the picture
+                        self.quick.render(r, &view, s.config.width, s.config.height);
+                        // the summary of the trip just driven over everything
+                        self.summary.render(r, &view, s.config.width, s.config.height);
                         *self.profile.entry("render").or_default() += __t.elapsed().as_secs_f64();
                         if omsi_cfg::env::var_os("OMSI_PROFILE_GPU").is_some() {
                             // wait for the GPU here, so that its time shows as a stage of its own

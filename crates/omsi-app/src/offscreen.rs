@@ -650,7 +650,7 @@ pub(crate) fn run_offscreen(
                 if let Some((arrival, departure)) = served {
                     career.stop_served(arrival, departure);
                 }
-                crate::journey::note(&mut journey, d, due, served, &args.root, || crate::journey::head(&career, &world.global.name, &player.vehicle, &player.vehicle.host.clock));
+                crate::journey::note(&mut journey, d, due, served, crate::journey::odometer_km(&player.vehicle), &args.root, || crate::journey::head(&career, &world.global.name, &player.vehicle, &player.vehicle.host.clock));
                 if d.take_trip_change() && player.duty_typed {
                     let (trip, stop) = d.trip_for_ibis();
                     player.set_duty_destination(trip, stop);

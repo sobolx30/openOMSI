@@ -210,6 +210,14 @@ impl App {
             } else if !pressed {
                 self.keys.remove(&code);
             }
+            // the trip summary's keys (while it is up)
+            if self.summary_key(code, pressed, repeat) {
+                return;
+            }
+            // the quick menu: Alt tapped alone shows and hides it, Esc hides it
+            if self.quick_menu_key(code, pressed, repeat) {
+                return;
+            }
             // Alt+Enter: full screen on and off
             if pressed && !repeat && matches!(code, KeyCode::Enter | KeyCode::NumpadEnter) && (self.keys.contains(&KeyCode::AltLeft) || self.keys.contains(&KeyCode::AltRight)) {
                 if self.spanned {
@@ -1742,6 +1750,7 @@ impl App {
     /// Open the game menu: the simulation pauses (not in a LAN session, which runs on
     /// for the other players).
     pub(crate) fn open_game_menu(&mut self) {
+        self.quick.open = false;
         self.menu_prev_pause = self.paused;
         // the menu takes the keys, their key-ups too: what is held now is let go here, or a
         // steering key let go in the menu went on turning the wheel to full lock once the
@@ -1782,6 +1791,7 @@ impl App {
     /// controller's axes stay theirs.
     pub(crate) fn input_lost(&mut self) {
         self.input_away = true;
+        self.quick.alt_armed = false;
         self.release_vehicle_keys();
         self.keys.clear();
         if let Some(p) = self.player.as_mut() {
@@ -1819,6 +1829,11 @@ impl App {
 
     /// Show one of the menu's lists in the chooser (see `game_lists`).
     pub(crate) fn open_list(&mut self, kind: crate::game_lists::ListKind) {
+        // (the lines and tours come from the map's timetable, which a game started without
+        // timetable buses has not read yet)
+        if matches!(kind, crate::game_lists::ListKind::Lines | crate::game_lists::ListKind::Tours(..) | crate::game_lists::ListKind::RouteNumbers) {
+            crate::game_lists::ensure_schedule(self);
+        }
         crate::game_lists::forget_page_titles();
         self.dropdown = None;
         self.admin_list = Some(crate::game_lists::items(self, &kind));
@@ -3415,13 +3430,14 @@ impl App {
         }
     }
 
-    /// One of the depot services of the game menu: "refuel", "wash" or "repair".
+    /// One of the depot services of the game menu: "refuel", "wash" or "repair" (and the quick
+    /// menu's "washfuel": both refuelling and washing).
     pub(crate) fn run_service(&mut self, kind: &str) {
         let Some(w) = self.world.clone() else { return };
         let Some(p) = self.player.as_mut() else { return };
         let one = Args {
-            refuel: kind == "refuel",
-            wash: kind == "wash",
+            refuel: kind == "refuel" || kind == "washfuel",
+            wash: kind == "wash" || kind == "washfuel",
             repair: kind == "repair",
             ..self.args.clone()
         };
@@ -3439,8 +3455,10 @@ impl App {
         for line in &msg {
             log::info!("{line}");
         }
-        if let Some(line) = msg.into_iter().next() {
-            self.service_msg = Some((line, 6.0));
+        // (refuelling and washing together say both: what the tank took, and the wash)
+        let shown = if kind == "washfuel" { msg.iter().take(2).cloned().collect::<Vec<_>>().join(" · ") } else { msg.first().cloned().unwrap_or_default() };
+        if !shown.is_empty() {
+            self.service_msg = Some((shown, 6.0));
         }
     }
 

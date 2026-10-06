@@ -358,6 +358,10 @@ pub(crate) struct App {
     pub(crate) plugins: Option<omsi_plugin::Plugins>,
     /// The on-screen controls of a phone (see `touch.rs`).
     pub(crate) touch: crate::touch::Touch,
+    /// The quick menu (Alt): the tiles for what is wanted often (see `quick_menu.rs`).
+    pub(crate) quick: crate::quick_menu::QuickMenu,
+    /// The summary of the trip just driven (see `trip_summary.rs`).
+    pub(crate) summary: crate::trip_summary::SummaryWindow,
 }
 
 impl App {

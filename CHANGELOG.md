@@ -6,6 +6,43 @@ Every push to `main` is released as `MAJOR.MINOR.COMMIT` (see
 
 ## Unreleased
 
+### Added
+
+* A **trip summary** window when a trip is over (the bus stopped at its last stop with a passenger
+  door open): the line and the tour's number and a table of the stops - planned and real arrival,
+  difference, planned and real departure, difference and the bus's odometer, `---` where a stop was
+  never served - to copy (Ctrl+C) or save as a text file in `Journeys` (Ctrl+E). It does not pause the
+  game. The setting *Show a summary after each trip* (Settings → Gameplay, the game menu's options)
+  switches the windows off. The journey log has the odometer column and `---` for missed stops too.
+  (`trip_summary.rs`, `journey.rs`)
+
+* The quick menu (**Alt** tapped alone, as in OMSI 2): twelve tiles in the lower right corner -
+  place, swap and remove a vehicle, teleport to a start point, line and tour, destination display,
+  repair, refuel and wash, route arrows, time, weather and game controllers - an overlay that does
+  not pause the game. The tiles that choose something open the game menu on that list at once,
+  without its pause, and it closes when the list is done. While a timetable is active, the
+  line-and-tour tile becomes the one that ends it (red, with a cross): a click asks first, then the
+  game drives free as *Free drive* in the list of lines does. (`quick_menu.rs`)
+
+### Changed
+
+* The tour's next trip begins as soon as the bus has stopped at the last stop of a trip with a
+  passenger door open, as in OMSI 2 (before: only after the bus had left the terminus by 60 m, within
+  five minutes of the trip's time), so that the timetable and the IBIS delay show the time to the
+  departure at once and the passengers board for the new trip.
+
+### Fixed
+
+* Choosing a timetable (*Line and tour*, from the Esc menu or the quick menu) no longer types the
+  line and destination into the bus's IBIS or roller blind by itself, and the displays no longer
+  follow the duty from trip to trip afterwards: the driver sets them at the bus's own controller, as
+  in OMSI 2. What still does it, on request: Shift+U (the start-up macro) and a game started with
+  *Put the bus into service on start* (`--autostart`).
+* A game started without *Timetable buses* had no timetable in it: *Line and tour* (Esc menu and
+  the quick menu) said "No timetable on this map". The map's timetable is now read when the list is
+  first opened; the timetable buses on the road stay off unless the game was started with them. A
+  timetable with no tour running at the game's time says so instead of "no timetable".
+
 ### Removed
 
 * The updater, completely: the launcher no longer asks GitHub for a newer release when it starts

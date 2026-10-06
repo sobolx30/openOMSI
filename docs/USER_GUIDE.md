@@ -70,6 +70,19 @@ by itself and has no switch for it. To update, download a release from the proje
 page and unpack it over the old folder (settings, mods and content stay; on Android install the
 new APK over the old one). An `update_*` line left in an older `settings.cfg` is ignored.
 
+**Alt** (tapped alone: press and let go with no other key or click between) shows and hides the
+quick menu, as in OMSI 2: tiles in the lower right corner for what is wanted often, without the way
+through the Esc menu. It is an overlay: the game goes on under it, nothing is paused, and only a
+click on a tile is taken from the mouse. The tiles: place a vehicle, swap it for another, remove it,
+teleport to a start point, the line and tour, the destination display, repair, refuel and wash (at
+a petrol station or in the wash yard), the route arrows (lit while on), the time, the weather and the
+game controllers. While a timetable is active the line-and-tour tile turns red with a cross and ends
+the timetable instead: a click asks "You have an active timetable - cancel it?" (Enter or Y: yes, Esc
+or N: keep it) and, on yes, the game drives free as *Free drive* in the list of lines does. A tile
+that chooses something opens that list at once, again without a pause, and
+the menu closes when the choice is made or the list is left with Esc. Esc also hides the quick
+menu; Alt+Enter, Alt+S and the other Alt chords work as before.
+
 **O** switches mouse steering on and off, as in OMSI (Omsi.exe's own formula): the cursor's
 place across the whole window is the steering from full left to full right lock
 (`[inv_min_turnradius]` of the bus), from the middle up to the top edge is the throttle and
@@ -131,8 +144,20 @@ On a duty the game keeps a **journey log** in the content folder's `Journeys` (o
 a duty, named by the real date and time it began and the line and tour): each trip driven
 with its stops, their planned and actual arrival and departure and how far off those were,
 and whether the bus came late (over 3 minutes), left early (over 2 minutes, as the personnel
-file counts them) or missed a stop. It is written again at every stop, so a crash loses
-nothing - what virtual bus companies ask their drivers for.
+file counts them) or missed a stop (its real times are `---`), and the bus's odometer at each
+stop. It is written again at every stop, so a crash loses nothing - what virtual bus companies ask
+their drivers for.
+
+**The end of a trip.** When the bus has stopped at the last stop of a trip with a passenger door
+open, the tour's next trip begins at once, as in OMSI 2: the timetable (and the IBIS delay) then
+shows how long it is to its departure, and the people at the stop board for it. At the same moment
+a **trip summary** comes up: the line and the tour's number, and a table of the stops with the
+planned and the real arrival, how far off it was, the planned and the real departure, how far off
+that was, and the odometer; a stop the bus never served has `---` for its real times. Its buttons
+copy the whole summary to the clipboard (Ctrl+C) or save it as a text file in `Journeys` (Ctrl+E);
+Esc or Enter closes it, Page Up, Page Down, Home and End and the mouse wheel scroll a long table.
+The game goes on meanwhile. *Show a summary after each trip* (Settings → Gameplay, and the game
+menu's options) switches the windows off; the next trip still begins at once.
 
 ## The launcher
 

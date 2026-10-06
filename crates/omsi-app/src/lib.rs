@@ -24,6 +24,8 @@ mod mac_hid;
 mod android;
 mod platform;
 mod touch;
+mod quick_menu;
+mod trip_summary;
 mod placing;
 mod mt;
 mod version;
@@ -614,6 +616,8 @@ pub(crate) fn make_app(mut args: Args, server_cfg: Option<server::ServerCfg>) ->
         stand_in: None,
         cpu_mark: None,
         touch: touch::Touch::new(),
+        quick: quick_menu::QuickMenu::new(),
+        summary: trip_summary::SummaryWindow::new(),
     };
     app.lan = lan;
     app.remotes = lan_game;

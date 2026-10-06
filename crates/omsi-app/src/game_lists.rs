@@ -438,7 +438,9 @@ pub(crate) fn items(app: &App, kind: &ListKind) -> Vec<(String, String)> {
                 }
             }
             if out.is_empty() {
-                out.push((tr("No timetable on this map"), "back".into()));
+                // (a timetable with lines but no tour at this hour is not "no timetable")
+                let known = app.schedule.as_ref().is_some_and(|s| s.data.lines.iter().any(|l| l.user_allowed));
+                out.push((tr(if known { "No tour is running at this time of day: change the time first" } else { "No timetable on this map" }), "back".into()));
             }
         }
         ListKind::Tours(line, _) => {
@@ -1460,6 +1462,7 @@ fn toggle_now(app: &App, id: &str) -> Option<bool> {
         "info_bar" => app.info_bar,
         "nav_arrows" => app.navigator.as_ref().map_or(s.nav_arrows, |n| n.arrows),
         "exact_fare" => s.exact_fare,
+        "trip_summary" => s.trip_summary,
         "collision_pedestrians" => s.collision_pedestrians,
         "ssao" => s.ssao,
         "detail_textures" => s.detail_textures,
@@ -1640,6 +1643,10 @@ fn toggle_set(app: &mut App, id: &str, on: bool) -> Option<(&'static str, String
         "exact_fare" => {
             app.settings.exact_fare = on;
             Some(("exact_fare", bit))
+        }
+        "trip_summary" => {
+            app.settings.trip_summary = on;
+            Some(("trip_summary", bit))
         }
         "collision_pedestrians" => {
             app.settings.collision_pedestrians = on;
@@ -2159,6 +2166,7 @@ fn options_pages(app: &App) -> Vec<Page> {
         switch_row(app, "timetable_win", "Timetable window (Insert)", "Displays a list of all stops (only when a tour is active)"),
         switch_row(app, "info_bar", "Information bar (Shift+Y)", "Displays information such as the time, speed, and other details at the top of the screen"),
         switch_row(app, "exact_fare", "Passengers pay the exact fare", "No change is given at the cash desk"),
+        switch_row(app, "trip_summary", "Show a summary after each trip", "A window with the trip's stops and times comes up when a trip is over"),
         pick("boarding", "Boarding", "How passengers get their tickets"),
         pick("maintenance", "Maintenance", later),
         pick("ai_unsched_factor", "Random traffic", later),
@@ -2540,6 +2548,40 @@ pub(crate) fn options_tab(app: &App, title: &str) -> usize {
     pages_of(app, &ListKind::Options(0)).and_then(|(pages, _)| pages.iter().position(|p| p.0 == title)).unwrap_or(0)
 }
 
+/// The map's timetable, read when the game started without it (the launcher's "Timetable buses"
+/// off): the lists of lines and tours, and a duty chosen from them, need its data. Only the data
+/// is made - the timetable buses on the road stay off (see `args.schedule`), as that choice made them.
+pub(crate) fn ensure_schedule(app: &mut App) {
+    if app.schedule.is_some() {
+        return;
+    }
+    let Some(w) = app.world.clone() else { return };
+    let sch = crate::schedule::Schedule::new(&app.args.root, &w, &app.clock);
+    app.schedule = Some(sch);
+}
+
+/// Which tab of the World window (time, weather ...) is the one titled `title` (the first if none is).
+pub(crate) fn world_tab(app: &App, title: &str) -> usize {
+    pages_of(app, &ListKind::World(0)).and_then(|(pages, _)| pages.iter().position(|p| p.0 == title)).unwrap_or(0)
+}
+
+/// Whether one of the menu's switches (by the id its line has, as `nav_arrows`) is on now.
+pub(crate) fn switch_on(app: &App, id: &str) -> bool {
+    toggle_now(app, id).unwrap_or(false)
+}
+
+/// Flip one of the menu's switches as a click on its line does (the quick menu's route arrows).
+/// False when `id` is no switch.
+pub(crate) fn flip_switch(app: &mut App, id: &str) -> bool {
+    let Some(cur) = toggle_now(app, id) else { return false };
+    if let Some((k, v)) = toggle_set(app, id, !cur) {
+        remember_setting(k, &v);
+    }
+    sync_live(app);
+    LIST_DIRTY.store(true, std::sync::atomic::Ordering::Relaxed);
+    true
+}
+
 type TitlesCache = Option<(ListKind, bool, std::time::Instant, (Vec<String>, usize))>;
 
 thread_local! {
@@ -2776,9 +2818,9 @@ pub(crate) fn start_duty_at(app: &mut App, line: &str, tour: &str, trip: usize, 
     // (no teleport: the stop chosen is the one the bus drives to next)
     d.start_at_here(k, j);
     if let Some(p) = app.player.as_mut() {
+        // (the line and destination displays are the driver's to set, as in OMSI: choosing a
+        // timetable types nothing into the IBIS or the roller blind)
         d.update(&mut p.vehicle, now);
-        let (trip, stop) = d.trip_for_ibis();
-        p.set_duty_destination(trip, stop);
         if let Some(w) = app.world.as_ref() {
             let mut fonts = w.fonts.lock();
             if let Err(e) = crate::schedule_paper::update_vehicle(&mut p.vehicle, &d, &mut fonts) {
@@ -2798,9 +2840,9 @@ fn start_duty(app: &mut App, line: &str, tour: &str) {
     match sch.player_duty(&w, line, tour, now, None, false) {
         Ok(mut d) => {
             if let Some(p) = app.player.as_mut() {
+                // (the line and destination displays are the driver's to set, as in OMSI:
+                // choosing a timetable types nothing into the IBIS or the roller blind)
                 d.update(&mut p.vehicle, now);
-                let (trip, stop) = d.trip_for_ibis();
-                p.set_duty_destination(trip, stop);
                 let mut fonts = w.fonts.lock();
                 if let Err(e) = crate::schedule_paper::update_vehicle(
                     &mut p.vehicle,

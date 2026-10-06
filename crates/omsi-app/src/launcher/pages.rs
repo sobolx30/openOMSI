@@ -975,6 +975,7 @@ fn gameplay_tab(ui: &mut Ui, s: &mut Value, dirty: &mut f32, cols: [Rect; 2]) ->
     let mut c = Col::new(ui, cols[0], "Passengers");
     sel_setting(ui, s, dirty, "s-board", c.row(), "Boarding", "boarding", &[("auto", "Pay and take the ticket"), ("pay", "The driver sells the ticket"), ("walk", "Just walk in")]);
     toggle_setting(ui, s, dirty, c.row(), "Passengers pay the exact fare", "exact_fare");
+    toggle_setting(ui, s, dirty, c.row(), "Show a summary after each trip", "trip_summary");
     let mut pd = get(s, "pax_density").as_f64().unwrap_or(1.0) as f32;
     if ui.slider("s-pax", c.row(), &mut pd, 0.0, 2.0, 0.1, "How many passengers", &|v| format!("{:.0}%", v * 100.0)) {
         s["pax_density"] = json!((pd * 100.0).round() / 100.0);
@@ -2675,7 +2676,7 @@ mod settings_tests {
         // (the radio stations: one, see `frame`)
         let sound = vec!["s-vol", "s-volai", "s-volsc", "set-doppler", "s-voices", "radio-name-0", "radio-url-0", "radio-del-0", "radio-add"];
         let gameplay = vec![
-            "s-board", "set-exact_fare", "s-pax", "set-get_up", "s-unsched", "s-maxsched", "s-maxpark",
+            "s-board", "set-exact_fare", "set-trip_summary", "s-pax", "set-get_up", "s-unsched", "s-maxsched", "s-maxpark",
             "s-maint", "set-collision_vehicles", "set-collision_objects", "set-collision_pedestrians", "set-use_real_time", "set-use_real_date", "set-time_sync", "set-metar_sync", "s-timespeed",
         ];
         let general = vec![
