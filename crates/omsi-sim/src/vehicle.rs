@@ -954,6 +954,9 @@ pub struct VehicleInstance {
     /// followed with the light's `timeconst` (63 % of the way in that time when switched on,
     /// down to 27 % when switched off, as the stock files document it).
     pub light_fade: Vec<f32>,
+    /// How far each `[spotlight_cookie]` of the model (in order) has come on: its switching variable
+    /// followed with the lamp's time constant (`crate::cookie::fade_step`).
+    pub cookie_fade: Vec<f32>,
     /// The meshes' transforms in the modelled pose, for `[smoothskin]` (made when needed).
     skin_rest: Vec<Mat4>,
     /// Static obstacles; the vehicle's `[boundingbox]` is kept out of them.
@@ -1227,6 +1230,7 @@ impl VehicleInstance {
             a_trans: OmsiFrames::default(),
             particles: ParticleSet::new(ty.model.particle_systems(), std::ptr::addr_of!(host) as u64 ^ 0x9e37_79b9),
             light_fade: Vec::new(),
+            cookie_fade: Vec::new(),
             v_springfactor,
             rest_sag,
             ai_lift,
@@ -2668,6 +2672,8 @@ impl VehicleInstance {
         // the lamps come on and go out with their `timeconst`
         let mut lf = std::mem::take(&mut self.light_fade);
         let mut part_fades: Vec<Vec<f32>> = self.trailers.iter_mut().map(|t| std::mem::take(&mut t.light_fade)).collect();
+        let mut cf = std::mem::take(&mut self.cookie_fade);
+        let mut part_cookie: Vec<Vec<f32>> = self.trailers.iter_mut().map(|t| std::mem::take(&mut t.cookie_fade)).collect();
         let value = |n: &str| -> f32 { n.trim().parse::<f32>().ok().or_else(|| self.var(n.trim())).unwrap_or(0.0) };
         let fade = |model: &omsi_model::Model, fades: &mut Vec<f32>| {
             let mut k = 0;
@@ -2697,9 +2703,28 @@ impl VehicleInstance {
         for (t, f) in self.trailers.iter().zip(part_fades.iter_mut()) {
             fade(&t.ty.model, f);
         }
+        // the `[spotlight_cookie]` lamps come on and go out with their time constant too
+        let cookie = |model: &omsi_model::Model, fades: &mut Vec<f32>| {
+            for (k, sp) in model.spotlights_cookie.iter().enumerate() {
+                let target = value(&sp.variable).clamp(0.0, 1.0);
+                let target = if target.is_finite() { target } else { 0.0 };
+                if fades.len() <= k {
+                    fades.push(target);
+                }
+                fades[k] = crate::cookie::fade_step(fades[k], target, dt, sp.time_const);
+            }
+        };
+        cookie(&self.ty.model, &mut cf);
+        for (t, f) in self.trailers.iter().zip(part_cookie.iter_mut()) {
+            cookie(&t.ty.model, f);
+        }
         self.light_fade = lf;
+        self.cookie_fade = cf;
         for (t, f) in self.trailers.iter_mut().zip(part_fades) {
             t.light_fade = f;
+        }
+        for (t, f) in self.trailers.iter_mut().zip(part_cookie) {
+            t.cookie_fade = f;
         }
         // the particle systems ([smoke]: exhaust, boiling coolant, wheel spray) of the
         // vehicle and its coupled parts, which read the same scripts' variables
@@ -3242,6 +3267,8 @@ pub struct TrailerPart {
     pub particles: ParticleSet,
     /// Its lights' brightness as they come on and go out (see `VehicleInstance::light_fade`).
     pub light_fade: Vec<f32>,
+    /// Its `[spotlight_cookie]` lamps' brightness (see `VehicleInstance::cookie_fade`).
+    pub cookie_fade: Vec<f32>,
     animators: Vec<MeshAnimator>,
     pub mesh_transforms: Vec<Mat4>,
     pub mesh_props: Vec<MeshProps>,
@@ -3574,6 +3601,7 @@ impl TrailerPart {
         TrailerPart {
             particles: ParticleSet::new(ty.model.particle_systems(), first_axle as u64 * 7919 + 17),
             light_fade: Vec::new(),
+            cookie_fade: Vec::new(),
             rest,
             v_brakes,
             ground_lift: 0.0,

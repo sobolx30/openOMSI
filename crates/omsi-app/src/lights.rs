@@ -131,6 +131,9 @@ pub fn vehicle_lights(
     // def index → loaded mesh index (animation transform)
     let value_of = |name: &str| -> f32 {
         let t = name.trim();
+        if t.is_empty() {
+            return 0.0;
+        }
         if let Ok(x) = t.parse::<f32>() {
             return x;
         }
@@ -238,14 +241,58 @@ pub fn vehicle_lights(
     // and its sections', where it is declared - a pair mirrored across the vehicle's axis
     // unless its flag keeps the one lamp - and as bright as a [spotlight] of its colour,
     // shared between the pair, times the variable (0..1)
-    let parts = std::iter::once((&ty.model, v.position, body))
-        .chain(v.trailers.iter().map(|t| (&t.ty.model, t.position, t.body_rotation())));
-    for (model, origin, rot) in parts {
+    let parts: Vec<(&omsi_model::Model, DVec3, glam::Mat4, &[f32])> = std::iter::once((&ty.model, v.position, body, &v.cookie_fade[..]))
+        .chain(v.trailers.iter().map(|t| (&t.ty.model, t.position, t.body_rotation(), &t.cookie_fade[..])))
+        .collect();
+    for &(model, origin, rot, _) in &parts {
         for sp in &model.spotlights_2 {
             for (pos, dir, share) in spotlight_2_lamps(sp, value_of(sp.variable.as_str())) {
                 let at = origin + rot.transform_point3(pos).as_dvec3();
                 let d = rot.transform_vector3(dir).normalize_or_zero();
                 push_spot(lights, at, d, &sp.values, share, night);
+            }
+        }
+    }
+    // [spotlight_cookie] (openOMSI): a lamp whose light by direction, and its colour, is a picture
+    // in the vehicle's texture folder (a beam cookie). Placed as a [spotlight_2] is, a twin
+    // across the axis unless its flag keeps the one lamp - a vehicle that wants its modules
+    // apart declares each as a lamp of its own - but the picture is the same on both sides,
+    // with the vehicle's up for its frame: an asymmetric beam is asymmetric the same way
+    // twice. Its brightness follows its variable with its time constant (the sim keeps how far
+    // it has come on in `cookie_fade`) and its two offset variables turn the beam in degrees.
+    for &(model, origin, rot, fades) in &parts {
+        if model.spotlights_cookie.is_empty() {
+            continue;
+        }
+        let model_dir = model.path.parent().map(|p| p.to_path_buf()).unwrap_or_default();
+        let up = rot.transform_vector3(Vec3::Z).normalize_or_zero();
+        for (idx, sp) in model.spotlights_cookie.iter().enumerate() {
+            // (a vehicle the sim has not stepped yet has no fade: the lamp is as the variable says)
+            let k = fades.get(idx).copied().unwrap_or_else(|| value_of(sp.variable.as_str()).clamp(0.0, 1.0));
+            let slot = if sp.texture.is_empty() { 0 } else { cookie_slot(&model_dir, &sp.texture) };
+            let (h_deg, v_deg) = (value_of(sp.h_offset.as_str()), value_of(sp.v_offset.as_str()));
+            // (the colour and the cones are the picture's and the plain spot's it shines as where the
+            // picture is missing; the wide cone is the lamp shadow map's field of view too)
+            let vals = [
+                sp.position[0], sp.position[1], sp.position[2], sp.direction[0], sp.direction[1], sp.direction[2],
+                COOKIE_PLAIN_COLOUR[0], COOKIE_PLAIN_COLOUR[1], COOKIE_PLAIN_COLOUR[2], sp.range, COOKIE_CONE_INNER_DEG, COOKIE_CONE_OUTER_DEG,
+            ];
+            for (pos, dir, share) in omsi_sim::cookie::lamps(sp, k, h_deg, v_deg) {
+                let at = origin + rot.transform_point3(pos).as_dvec3();
+                let d = rot.transform_vector3(dir).normalize_or_zero();
+                let pushed = lights.len();
+                push_spot(lights, at, d, &vals, share, night);
+                for l in lights[pushed..].iter_mut().filter(|l| l.mode == LightMode::Enhanced) {
+                    l.cookie = slot;
+                    l.cookie_up = up;
+                    if slot > 0 {
+                        // (the picture's own colour, white the lamp)
+                        l.color = [1.0, 1.0, 1.0];
+                    }
+                    // (it reaches as far as its range says, not the 60 m a plain spot's
+                    // light is cut at: the picture shapes the beam, the range ends it)
+                    l.radius = sp.range.clamp(0.5, 300.0);
+                }
             }
         }
     }
@@ -276,6 +323,15 @@ fn spotlight_2_lamps(sp: &omsi_model::Spotlight2, k: f32) -> Vec<(Vec3, Vec3, f3
         .map(|s| (Vec3::new(v[0] * s, v[1], v[2]), Vec3::new(v[3] * s, v[4], v[5]), k / sides.len() as f32))
         .collect()
 }
+
+/// What a `[spotlight_cookie]` has of a `[spotlight]`'s numbers that its picture does not give: the
+/// colour of the plain spot it shines as where its picture is missing (the picture's own colour
+/// is the lamp's otherwise) and the cone (full angles, degrees) of that spot, wide because the
+/// picture reaches 60 degrees to either side and the lamp shadow map takes its field of view
+/// from it.
+const COOKIE_PLAIN_COLOUR: [f32; 3] = [255.0, 255.0, 233.0];
+const COOKIE_CONE_INNER_DEG: f32 = 30.0;
+const COOKIE_CONE_OUTER_DEG: f32 = 100.0;
 
 /// The lights of one headlamp at `at` shining along `d`, with a `[spotlight]`'s numbers
 /// (`vals`: colour 6-8, range 9, inner and outer cone 10 and 11) and `share` of its light.
@@ -313,6 +369,7 @@ fn push_spot(lights: &mut Vec<PointLight>, at: DVec3, d: Vec3, vals: &[f32; 12],
         beam: full_beam_gain(vals[9]),
         mode: LightMode::Enhanced,
         shadow: false,
+        ..Default::default()
     });
 }
 
@@ -678,6 +735,90 @@ pub fn set_corona_root(root: &std::path::Path) {
     t.root = Some(root.to_path_buf());
 }
 
+/// The beam cookies' pictures (`[spotlight_cookie]`): slot `i + 1` is `slots[i]`, up to
+/// `omsi_render::COOKIE_SLOTS`, uploaded by `upload_cookie_pictures` as they come.
+#[derive(Default)]
+struct CookiePictures {
+    slots: Vec<std::path::PathBuf>,
+    pending: Vec<(u8, std::path::PathBuf)>,
+    failed: std::collections::HashSet<std::path::PathBuf>,
+    full_warned: bool,
+}
+static COOKIE_PICTURES: std::sync::Mutex<Option<CookiePictures>> = std::sync::Mutex::new(None);
+
+/// The slot of the beam cookie `name` of the vehicle in `model_dir`, looked up in its texture
+/// folders like a `[light_enh_2]`'s picture: 1 and up, or 0 (the lamp shines as a plain spot)
+/// where the picture is not there, would not load, or there are no more slots.
+pub fn cookie_slot(model_dir: &std::path::Path, name: &str) -> u8 {
+    // (every lit lamp of every vehicle asks every frame: looked up once)
+    static KNOWN: std::sync::Mutex<Option<std::collections::HashMap<(std::path::PathBuf, String), Option<std::path::PathBuf>>>> = std::sync::Mutex::new(None);
+    let key = (model_dir.to_path_buf(), name.trim().to_string());
+    let cached = KNOWN.lock().unwrap_or_else(|e| e.into_inner()).as_ref().and_then(|m| m.get(&key).cloned());
+    let path = match cached {
+        Some(p) => p,
+        None => {
+            let root = CORONA_TEXTURES.lock().unwrap_or_else(|e| e.into_inner()).as_ref().and_then(|t| t.root.clone()).unwrap_or_default();
+            let found = crate::scene::texture_dirs(&root, model_dir)
+                .into_iter()
+                .map(|d| omsi_cfg::resolve_path(&d, &key.1))
+                .find(|p| omsi_cfg::vfs::is_file(p));
+            if found.is_none() {
+                log::warn!("beam cookie {}: not in the texture folders of {}", key.1, model_dir.display());
+            }
+            KNOWN.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(Default::default).insert(key, found.clone());
+            found
+        }
+    };
+    let Some(path) = path else {
+        return 0;
+    };
+    let mut g = COOKIE_PICTURES.lock().unwrap_or_else(|e| e.into_inner());
+    let c = g.get_or_insert_with(Default::default);
+    if c.failed.contains(&path) {
+        return 0;
+    }
+    if let Some(i) = c.slots.iter().position(|p| *p == path) {
+        return (i + 1) as u8;
+    }
+    if c.slots.len() >= omsi_render::COOKIE_SLOTS {
+        if !c.full_warned {
+            c.full_warned = true;
+            log::warn!("beam cookies: {} at a time at most; {} shines as a plain spot", omsi_render::COOKIE_SLOTS, path.display());
+        }
+        return 0;
+    }
+    c.slots.push(path.clone());
+    let slot = c.slots.len() as u8;
+    c.pending.push((slot, path));
+    slot
+}
+
+/// Decode the beam cookies that have not gone up yet and give them to the renderer.
+fn upload_cookie_pictures(renderer: &mut omsi_render::Renderer) {
+    let pending = {
+        let mut g = COOKIE_PICTURES.lock().unwrap_or_else(|e| e.into_inner());
+        match g.as_mut() {
+            Some(c) if !c.pending.is_empty() => std::mem::take(&mut c.pending),
+            _ => return,
+        }
+    };
+    for (slot, path) in pending {
+        match omsi_texture::decode_file_rgb16(&path) {
+            Ok(img) => {
+                if renderer.set_cookie_rgb16(slot, img.width, img.height, &img.data) {
+                    log::info!("beam cookie {} in slot {slot}", path.display());
+                } else {
+                    log::info!("beam cookie {}: this graphics device has no room for cookies, the lamp shines as a plain spot", path.display());
+                }
+            }
+            Err(e) => {
+                log::warn!("beam cookie {}: {e}", path.display());
+                COOKIE_PICTURES.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(Default::default).failed.insert(path);
+            }
+        }
+    }
+}
+
 fn texture_id_of(path: std::path::PathBuf) -> u16 {
     let mut g = CORONA_TEXTURES.lock().unwrap_or_else(|e| e.into_inner());
     let t = g.get_or_insert_with(|| CoronaTextures { ids: Default::default(), pending: Vec::new(), root: None });
@@ -747,6 +888,7 @@ pub fn star_texture_id() -> u16 {
 
 /// Upload the pictures asked for since the last frame.
 pub fn upload_corona_textures(renderer: &mut omsi_render::Renderer) {
+    upload_cookie_pictures(renderer);
     let pending = {
         let mut g = CORONA_TEXTURES.lock().unwrap_or_else(|e| e.into_inner());
         match g.as_mut() {

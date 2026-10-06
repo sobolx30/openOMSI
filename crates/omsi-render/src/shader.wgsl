@@ -312,6 +312,7 @@ struct PointLight {
     color: vec4<f32>, // rgb, w intensity
     dir: vec4<f32>,   // spot direction, w cosine of the outer cone (< -1.5: a point light)
     extra: vec4<f32>, // enhanced path: cosine of the inner cone, core radius, beam gain, radius
+    cookie: vec4<f32>, // enhanced path: x the beam cookie's layer plus one (0: none), yzw the vehicle's up
 };
 @group(0) @binding(3) var<storage, read> lights: array<PointLight>;
 // per cell CELL_CAP light indices, 0xffffffff = empty

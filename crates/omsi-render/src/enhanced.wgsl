@@ -203,6 +203,80 @@ fn lamp_shadow(world: vec3<f32>, n: vec3<f32>, to_lamp: vec3<f32>) -> f32 {
     return sum / 9.0;
 }
 
+// A beam cookie (`[spotlight_cookie]`): the lamp's picture of how it shines in each direction
+// and in what colour (beam_cookies/FORMAT.md): 1280 x 1024, 0.09375 degrees a texel, x from -60
+// to +60 degrees (right is +), y from +36 down to -60 degrees about the lamp's horizontal. The
+// texture holds linear light (lib.rs `cookie_texels`), read with a cubic B-spline filter (four
+// bilinear fetches) so that the picture's texels, which at the far end of the road are metres
+// wide, show neither as blocks nor as steps in a fall of light.
+// Beyond the picture there is no light, and the picture's own four edges fade out over
+// `COOKIE_FADE_*` degrees whatever it holds, so that a beam never ends in a hard edge: the
+// sides and the top and the bottom (the ground right under the lamp).
+// `COOKIE_GAIN` is what white is worth against a plain spot's centre: a low beam's foreground is
+// a tenth of its hot spot, which a plain spot's centre has to match, so the picture's white
+// is some fourteen times a spot's. `COOKIE_FALLOFF` is the power of the distance the light
+// falls off with beyond ten metres (the square up to there, as a plain spot's): 2 is the
+// physics, which in this picture's exposure lets the far road go dark; less keeps it lit
+// further. The lamp's own frame: forward its direction, right across that and the vehicle's
+// up (the same way for a twin lamp: the picture is not mirrored).
+// Lines marked CK are for devices that have a texture unit for it (lib.rs `cookies_on`); NOCK
+// stands in for them where there is none.
+const COOKIE_GAIN: f32 = 14.0;
+const COOKIE_FALLOFF: f32 = 1.2;
+const COOKIE_FADE_SIDE: f32 = 12.0;
+const COOKIE_FADE_TOP: f32 = 8.0;
+const COOKIE_FADE_BOTTOM: f32 = 12.0;
+//CK @group(0) @binding(20) var t_cookie: texture_2d_array<f32>;
+
+// The picture at `uv` (0..1 over its width and height) with the cubic B-spline filter.
+//CK fn cookie_fetch(uv: vec2<f32>, layer: i32) -> vec3<f32> {
+//CK     let size = vec2<f32>(textureDimensions(t_cookie));
+//CK     let tc = uv * size - vec2<f32>(0.5);
+//CK     let base = floor(tc);
+//CK     let f = tc - base;
+//CK     let f2 = f * f;
+//CK     let f3 = f2 * f;
+//CK     let w0 = (vec2<f32>(1.0) - f) * (vec2<f32>(1.0) - f) * (vec2<f32>(1.0) - f) / 6.0;
+//CK     let w1 = (3.0 * f3 - 6.0 * f2 + vec2<f32>(4.0)) / 6.0;
+//CK     let w2 = (-3.0 * f3 + 3.0 * f2 + 3.0 * f + vec2<f32>(1.0)) / 6.0;
+//CK     let w3 = f3 / 6.0;
+//CK     let g0 = w0 + w1;
+//CK     let g1 = w2 + w3;
+//CK     let p0 = (base - vec2<f32>(0.5) + w1 / g0) / size;
+//CK     let p1 = (base + vec2<f32>(1.5) + w3 / g1) / size;
+//CK     let c00 = textureSampleLevel(t_cookie, s_lin, vec2<f32>(p0.x, p0.y), layer, 0.0).rgb;
+//CK     let c10 = textureSampleLevel(t_cookie, s_lin, vec2<f32>(p1.x, p0.y), layer, 0.0).rgb;
+//CK     let c01 = textureSampleLevel(t_cookie, s_lin, vec2<f32>(p0.x, p1.y), layer, 0.0).rgb;
+//CK     let c11 = textureSampleLevel(t_cookie, s_lin, vec2<f32>(p1.x, p1.y), layer, 0.0).rgb;
+//CK     return g0.y * (g0.x * c00 + g1.x * c10) + g1.y * (g0.x * c01 + g1.x * c11);
+//CK }
+
+// The light (linear colour) the lamp sends in the direction of the surface.
+fn cookie_color(to_surface: vec3<f32>, f: vec3<f32>, up: vec3<f32>, layer: i32) -> vec3<f32> {
+//CK     var r = cross(f, up);
+//CK     if (dot(r, r) < 1e-6) {
+//CK         return vec3<f32>(1.0);
+//CK     }
+//CK     r = normalize(r);
+//CK     let u = cross(r, f);
+//CK     let x = dot(to_surface, f);
+//CK     if (x <= 0.001) {
+//CK         return vec3<f32>(0.0);
+//CK     }
+//CK     let y = dot(to_surface, r);
+//CK     let z = dot(to_surface, u);
+//CK     let h = degrees(atan2(y, x));
+//CK     let v = degrees(atan2(z, sqrt(x * x + y * y)));
+//CK     let uv = vec2<f32>((h + 60.0) / 120.0, (36.0 - v) / 96.0);
+//CK     if (uv.x <= 0.0 || uv.x >= 1.0 || uv.y <= 0.0 || uv.y >= 1.0) {
+//CK         return vec3<f32>(0.0);
+//CK     }
+//CK     let fade = smoothstep(0.0, COOKIE_FADE_SIDE / 120.0, uv.x) * smoothstep(0.0, COOKIE_FADE_SIDE / 120.0, 1.0 - uv.x)
+//CK         * smoothstep(0.0, COOKIE_FADE_TOP / 96.0, uv.y) * smoothstep(0.0, COOKIE_FADE_BOTTOM / 96.0, 1.0 - uv.y);
+//CK     return fade * cookie_fetch(uv, clamp(layer, 0, 7));
+//NOCK     return vec3<f32>(1.0);
+}
+
 // The point and spot lights of the pixel's grid cell: diffuse and specular.
 // `thin`: foliage, lit from whichever side the lamp is on (see the sun below).
 fn lamp_light(p: vec3<f32>, n: vec3<f32>, v: vec3<f32>, sf: Surface, thin: bool) -> vec3<f32> {
@@ -245,7 +319,19 @@ fn lamp_light(p: vec3<f32>, n: vec3<f32>, v: vec3<f32>, sf: Surface, thin: bool)
         let q = dist2 / (range * range);
         let window = (1.0 - q * q) * (1.0 - q * q);
         var e = core * core / sqrt(dist2 * dist2 + core * core * core * core) * window;
-        if (l.dir.w > -1.5) {
+        // (the colour a beam cookie gives the light; white for any other lamp)
+        var tint = vec3<f32>(1.0);
+        if (l.cookie.x > 0.5) {
+            // a beam cookie takes the cone's place, with its own distance law beyond ten metres
+            if (dist > 10.0) {
+                e = pow(10.0 / dist, COOKIE_FALLOFF) * 0.01 * window;
+            }
+            tint = COOKIE_GAIN * cookie_color(-ld, l.dir.xyz, l.cookie.yzw, i32(l.cookie.x + 0.5) - 1);
+            // (no light that way: no need of the shadow map either)
+            if (max(tint.r, max(tint.g, tint.b)) <= 0.0) {
+                continue;
+            }
+        } else if (l.dir.w > -1.5) {
             let cd = dot(-ld, l.dir.xyz);
             e = e * smoothstep(l.dir.w, l.extra.x, cd);
             if (l.extra.z > 0.0) {
@@ -275,7 +361,7 @@ fn lamp_light(p: vec3<f32>, n: vec3<f32>, v: vec3<f32>, sf: Surface, thin: bool)
                 continue;
             }
         }
-        let irr = l.color.rgb * l.color.w * enh.lights.y * e;
+        let irr = l.color.rgb * tint * l.color.w * enh.lights.y * e;
         let nl = dot(n, ld);
         if (thin) {
             sum = sum + irr * (0.45 + 0.25 * nl) * sf.albedo / PI;

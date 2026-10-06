@@ -192,6 +192,18 @@ pub struct Spotlight {
     pub values: [f32; 12],
 }
 
+/// The next line of a block that may end early, trimmed; None when a keyword is next (it is
+/// left alone for the parser to read).
+fn optional_line(r: &mut CfgReader) -> Option<String> {
+    let mut ahead = r.clone();
+    let line = ahead.line();
+    if omsi_cfg::keyword_of(line).is_some() {
+        return None;
+    }
+    *r = ahead;
+    Some(line.trim().to_string())
+}
+
 /// `[spotlight_2]` (openOMSI): a `[spotlight]`'s twelve numbers, then the variable that
 /// switches it (0 off, 1 full, a constant too) and a flag: 0 (or none) puts a twin lamp on
 /// the other side of the vehicle, mirrored across its axis, 1 keeps the one lamp.
@@ -200,6 +212,31 @@ pub struct Spotlight2 {
     pub values: [f32; 12],
     pub variable: String,
     pub mirrored: bool,
+}
+
+/// `[spotlight_cookie]` (openOMSI): a lamp whose light by direction (and colour) is a picture
+/// in the vehicle's texture folder, a beam cookie (see `beam_cookies/FORMAT.md`). The lines:
+/// the lamp's position (x, y, z), its direction (x, y, z), its range, the variable that
+/// switches it (0 off, 1 full, a constant too), a flag (0 or none: a twin lamp on the other
+/// side of the vehicle, mirrored across its axis; 1: the one lamp), the picture's name, the
+/// time constant of switching on and off (seconds to 63 % of the way, as a `[light_enh_2]`'s;
+/// 0 or none: at once) and two optional variables that turn the lamp: its vertical angle
+/// offset and its horizontal one (degrees; empty: none; a number is a constant). The
+/// twin's position and direction are mirrored; the picture and the offsets are not: an
+/// asymmetric beam is asymmetric the same way on both sides, and both turn the same way.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct SpotlightCookie {
+    pub position: [f32; 3],
+    pub direction: [f32; 3],
+    pub range: f32,
+    pub variable: String,
+    pub mirrored: bool,
+    pub texture: String,
+    pub time_const: f32,
+    /// The variable that raises (+) or lowers (-) the lamp's beam, in degrees.
+    pub v_offset: String,
+    /// The variable that turns the lamp's beam to the right (+) or the left (-), in degrees.
+    pub h_offset: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -402,6 +439,7 @@ pub struct Model {
     pub particle_emitters: Vec<ParticleEmitter>,
     pub spotlights: Vec<Spotlight>,
     pub spotlights_2: Vec<Spotlight2>,
+    pub spotlights_cookie: Vec<SpotlightCookie>,
     pub interior_lights: Vec<InteriorLight>,
     /// `[light]` legacy lights (raw).
     pub lights: Vec<Vec<String>>,
@@ -764,6 +802,46 @@ impl Model {
                 };
                 self.spotlights_2.push(Spotlight2 { values, variable, mirrored });
             }
+            "spotlight_cookie" => {
+                let position = r.f32s::<3>();
+                let direction = r.f32s::<3>();
+                let range = r.f32();
+                let variable = r.str().to_string();
+                // (everything after the variable may be left out: a keyword next ends the block)
+                let mut mirrored = true;
+                let mut texture = String::new();
+                let mut time_const = 0.0f32;
+                let (mut v_offset, mut h_offset) = (String::new(), String::new());
+                // the flag (a number), else the line is already the picture
+                let mut line = optional_line(r);
+                if let Some(t) = line.as_deref() {
+                    if t.parse::<f32>().is_ok() {
+                        mirrored = omsi_cfg::parse_f32(t) < 0.5;
+                        line = optional_line(r);
+                    }
+                }
+                if let Some(t) = line {
+                    texture = t;
+                    // the time constant (a number or an empty line), else the first offset variable
+                    if let Some(t) = optional_line(r) {
+                        if t.is_empty() || t.parse::<f32>().is_ok() {
+                            time_const = if t.is_empty() { 0.0 } else { omsi_cfg::parse_f32(&t).max(0.0) };
+                            if let Some(v) = optional_line(r) {
+                                v_offset = v;
+                                if let Some(h) = optional_line(r) {
+                                    h_offset = h;
+                                }
+                            }
+                        } else {
+                            v_offset = t;
+                            if let Some(h) = optional_line(r) {
+                                h_offset = h;
+                            }
+                        }
+                    }
+                }
+                self.spotlights_cookie.push(SpotlightCookie { position, direction, range, variable, mirrored, texture, time_const, v_offset, h_offset });
+            }
             "interiorlight" => {
                 let variable = r.str().to_string();
                 let range = r.f32();
@@ -1119,6 +1197,31 @@ mod tests {
         assert_eq!((s[0].variable.as_str(), s[0].mirrored), ("lights_fern", true));
         assert_eq!((s[1].variable.as_str(), s[1].mirrored), ("door_light", false));
         assert_eq!((s[2].variable.as_str(), s[2].mirrored), ("lights_nebel", true));
+        assert_eq!(m.meshes.len(), 1);
+    }
+
+    /// `[spotlight_cookie]`: position, direction, range, the variable, then the flag, the picture,
+    /// the time constant and the two offset variables - each of those may be left out.
+    #[test]
+    fn a_spotlight_cookie_reads_its_lines() {
+        let pd = "0.95\n5.95\n0.652\n0\n1\n-0.01\n120\n";
+        let text = format!(
+            "[spotlight_cookie]\n{pd}lights_fern\n1\nlow_beam.png\n0.3\npitch_var\nyaw_var\n\n\
+             [spotlight_cookie]\n{pd}lights_fern\n0\nhigh_beam.png\n\n[spotlight_cookie]\n{pd}lights_nebel\nfog.png\n0.5\n\nyaw_var\n\
+             [spotlight_cookie]\n{pd}lights_x\nx.png\npitch_only\n[spotlight_cookie]\n{pd}lights_y\n[spotlight_cookie]\n{pd}lights_z\n0\nz.png\n0.2\n\n[mesh]\nbody.o3d\n");
+        let m = super::Model::parse(&omsi_cfg::CfgFile::from_str("model.cfg", &text));
+        let s = &m.spotlights_cookie;
+        assert_eq!(s.len(), 6);
+        assert_eq!(s[0].position, [0.95, 5.95, 0.652]);
+        assert_eq!(s[0].direction, [0.0, 1.0, -0.01]);
+        assert_eq!(s[0].range, 120.0);
+        let line = |i: usize| (s[i].variable.as_str(), s[i].mirrored, s[i].texture.as_str(), s[i].time_const, s[i].v_offset.as_str(), s[i].h_offset.as_str());
+        assert_eq!(line(0), ("lights_fern", false, "low_beam.png", 0.3, "pitch_var", "yaw_var"));
+        assert_eq!(line(1), ("lights_fern", true, "high_beam.png", 0.0, "", ""));
+        assert_eq!(line(2), ("lights_nebel", true, "fog.png", 0.5, "", "yaw_var"));
+        assert_eq!(line(3), ("lights_x", true, "x.png", 0.0, "pitch_only", ""));
+        assert_eq!(line(4), ("lights_y", true, "", 0.0, "", ""));
+        assert_eq!(line(5), ("lights_z", true, "z.png", 0.2, "", ""));
         assert_eq!(m.meshes.len(), 1);
     }
 

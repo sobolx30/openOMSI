@@ -254,6 +254,8 @@ struct GpuPointLight {
     /// radius (`pos.w` is 0 on a light only the enhanced path draws, which the vanilla
     /// shader then passes by).
     extra: [f32; 4],
+    /// x the beam cookie's layer plus one (0: none), yzw the vehicle's up (see `PointLight`).
+    cookie: [f32; 4],
 }
 
 #[repr(C)]
@@ -292,6 +294,12 @@ pub struct PointLight {
     /// what stands in front of the lamps keeps the light off the road behind it. See
     /// `LampShadow`.
     pub shadow: bool,
+    /// A beam cookie (`[spotlight_cookie]`; enhanced path): which of the `COOKIE_SLOTS` pictures
+    /// says how this lamp shines by direction (1 to `COOKIE_SLOTS`, 0 none: the cone), and
+    /// the vehicle's up, which with the lamp's direction gives the picture's frame (the
+    /// same way for a twin lamp: the picture is not mirrored).
+    pub cookie: u8,
+    pub cookie_up: Vec3,
 }
 
 impl Default for PointLight {
@@ -307,6 +315,8 @@ impl Default for PointLight {
             beam: 0.0,
             mode: LightMode::Both,
             shadow: false,
+            cookie: 0,
+            cookie_up: Vec3::Z,
         }
     }
 }
@@ -1596,7 +1606,7 @@ fn array_layout_entry_on(path: ArrayPath, binding: u32, stage: wgpu::ShaderStage
 
 /// The camera group's textures only the enhanced path reads: the reflection probe, the sky
 /// table and the sky cube.
-const ENHANCED_CAMERA_TEXTURES: [u32; 3] = [12, 14, 17];
+const ENHANCED_CAMERA_TEXTURES: [u32; 4] = [12, 14, 17, COOKIE_BINDING];
 
 /// wgpu's OpenGL backend has sixteen texture units for a pipeline - for all its groups and
 /// both its shaders together (wgpu-hal's `MAX_TEXTURE_SLOTS`, whatever the chip has) - while
@@ -1613,8 +1623,9 @@ fn sixteen_texture_units() -> bool {
 }
 
 /// The camera group's entries on a device whose arrays take `path`, without the enhanced
-/// path's textures where it has `sixteen` texture units (see `sixteen_texture_units`).
-fn camera_layout_entries(path: ArrayPath, sixteen: bool) -> Vec<wgpu::BindGroupLayoutEntry> {
+/// path's textures where it has `sixteen` texture units (see `sixteen_texture_units`), and
+/// with the beam cookies' only where the device has a unit for it (`cookies`, see `cookies_on`).
+fn camera_layout_entries(path: ArrayPath, sixteen: bool, cookies: bool) -> Vec<wgpu::BindGroupLayoutEntry> {
     let mut camera_entries = vec![
             wgpu::BindGroupLayoutEntry {
                 binding: 0,
@@ -1739,6 +1750,17 @@ fn camera_layout_entries(path: ArrayPath, sixteen: bool) -> Vec<wgpu::BindGroupL
                 },
                 count: None,
             },
+            // the beam cookies (only where `cookies_on`, see below)
+            wgpu::BindGroupLayoutEntry {
+                binding: COOKIE_BINDING,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                    view_dimension: wgpu::TextureViewDimension::D2Array,
+                    multisampled: false,
+                },
+                count: None,
+            },
     ];
     // the point lights and their grid (see `ArrayPath::NoStorage`)
     if path != ArrayPath::NoStorage {
@@ -1747,6 +1769,8 @@ fn camera_layout_entries(path: ArrayPath, sixteen: bool) -> Vec<wgpu::BindGroupL
     }
     if sixteen {
         camera_entries.retain(|e| !ENHANCED_CAMERA_TEXTURES.contains(&e.binding));
+    } else if !cookies {
+        camera_entries.retain(|e| e.binding != COOKIE_BINDING);
     }
     camera_entries
 }
@@ -1986,6 +2010,10 @@ pub struct Renderer {
     /// The coronas' pictures besides the standard glow (index = `Corona::texture`; entry 0
     /// unused).
     corona_textures: Vec<Option<wgpu::BindGroup>>,
+    /// The beam cookies' pictures (`COOKIE_SLOTS` layers) where the device has a texture unit
+    /// for them (`cookies_on`).
+    cookie_tex: Option<wgpu::Texture>,
+    cookie_view: Option<wgpu::TextureView>,
     corona_layout: wgpu::BindGroupLayout,
     corona_sampler: wgpu::Sampler,
     sky_layout: wgpu::BindGroupLayout,
@@ -2305,6 +2333,24 @@ fn rt_gbuf() -> bool {
 }
 const HDR_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
 
+/// The beam cookies (`[spotlight_cookie]`, beam_cookies/FORMAT.md): pictures of how a lamp shines
+/// in each direction and in what colour, in linear light (`Rg11b10Ufloat`: no banding in the dark
+/// falls of the beam, a colour, four bytes a texel), one layer each of a 2-D array texture that
+/// is the camera group's binding 20. That makes
+/// a seventeenth texture of the scene's pipelines, one more than the WebGPU default allows:
+/// where the device allows it the limit is raised (`COOKIE_TEXTURE_UNITS`), where it does not
+/// (OpenGL, some phones) the cookies are left out and a lamp shines as a plain spot.
+static COOKIES: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+fn cookies_on() -> bool {
+    COOKIES.load(std::sync::atomic::Ordering::Relaxed)
+}
+const COOKIE_TEXTURE_UNITS: u32 = 17;
+const COOKIE_BINDING: u32 = 20;
+/// How many different cookie pictures a scene can hold at once.
+pub const COOKIE_SLOTS: usize = 8;
+const COOKIE_W: u32 = 1280;
+const COOKIE_H: u32 = 1024;
+
 /// The colour targets of a pipeline drawing into `format`: Enhanced and classic puddle
 /// shading draw into `HDR_FORMAT` with the screen mask beside it,
 /// written by the scene's own shader only (`mask`), coverage-blended where the colour is.
@@ -2593,6 +2639,19 @@ impl Renderer {
             ArrayPath::VertexTextures => log::warn!("{}: no storage buffers in vertex shaders; the scene's arrays are read from textures", info.name),
             ArrayPath::NoStorage => log::warn!("{}: no storage buffers; the scene's arrays are read from textures and the lamps light no pixels of their own", info.name),
         }
+        // the beam cookies' texture is a unit more than the WebGPU default's sixteen: asked for
+        // where the device has it (not on OpenGL, whose units are sixteen for good)
+        if omsi_cfg::env::var("OMSI_GPU_LIMITS").is_err()
+            && limits.max_sampled_textures_per_shader_stage < COOKIE_TEXTURE_UNITS
+            && adapter.limits().max_sampled_textures_per_shader_stage >= COOKIE_TEXTURE_UNITS
+        {
+            limits.max_sampled_textures_per_shader_stage = COOKIE_TEXTURE_UNITS;
+        }
+        let cookies_ok = !sixteen_texture_units()
+            && limits.max_sampled_textures_per_shader_stage >= COOKIE_TEXTURE_UNITS
+            && omsi_cfg::env::var_os("OMSI_NO_COOKIES").is_none();
+        COOKIES.store(cookies_ok, std::sync::atomic::Ordering::Relaxed);
+        log::info!("beam cookies ([spotlight_cookie]): {}", if cookies_ok { "on".to_string() } else { format!("off ({} texture units, {} needed; OMSI_NO_COOKIES set: {})", limits.max_sampled_textures_per_shader_stage, COOKIE_TEXTURE_UNITS, omsi_cfg::env::var_os("OMSI_NO_COOKIES").is_some()) });
         log::info!("opening graphics device: {} ({:?}, vendor {:#06x}, device {:#06x}), features {:?}, max buffer {} MB, max storage binding {} MB", info.name, info.backend, info.vendor, info.device, required_features, limits.max_buffer_size / 1_000_000, limits.max_storage_buffer_binding_size as u64 / 1_000_000);
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
@@ -2786,7 +2845,7 @@ impl Renderer {
                 array_layout_entry(10, wgpu::ShaderStages::VERTEX, false),
             ],
         });
-        let camera_entries = camera_layout_entries(array_path(), sixteen_texture_units());
+        let camera_entries = camera_layout_entries(array_path(), sixteen_texture_units(), cookies_on());
         let camera_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("camera"),
             entries: &camera_entries,
@@ -2944,6 +3003,23 @@ impl Renderer {
             out
         };
         let hdr_format = wgpu::TextureFormat::Rgba16Float;
+        // the beam cookies (`[spotlight_cookie]`): a layer for each picture, linear light
+        let (cookie_tex, cookie_view) = if cookies_on() {
+            let t = device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("beam cookies"),
+                size: wgpu::Extent3d { width: COOKIE_W, height: COOKIE_H, depth_or_array_layers: COOKIE_SLOTS as u32 },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::Rg11b10Ufloat,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                view_formats: &[],
+            });
+            let v = t.create_view(&wgpu::TextureViewDescriptor { dimension: Some(wgpu::TextureViewDimension::D2Array), ..Default::default() });
+            (Some(t), Some(v))
+        } else {
+            (None, None)
+        };
         // sun shadow map: depth only, from the light's orthographic camera
         let shadow_tex = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("shadow map"),
@@ -4488,6 +4564,8 @@ impl Renderer {
             corona_bind_group,
             smoke_bind_group,
             corona_textures: Vec::new(),
+            cookie_tex,
+            cookie_view,
             corona_layout,
             corona_sampler,
             sky_layout,
@@ -7423,6 +7501,9 @@ impl Renderer {
             entries.push(wgpu::BindGroupEntry { binding: 3, resource: light_buf.binding() });
             entries.push(wgpu::BindGroupEntry { binding: 4, resource: grid_buf.binding() });
         }
+        if let Some(view) = &self.cookie_view {
+            entries.push(wgpu::BindGroupEntry { binding: COOKIE_BINDING, resource: wgpu::BindingResource::TextureView(view) });
+        }
         if sixteen_texture_units() {
             entries.retain(|e| !ENHANCED_CAMERA_TEXTURES.contains(&e.binding));
         }
@@ -7522,6 +7603,7 @@ impl Renderer {
                 color: [0.0; 4],
                 dir: [0.0; 4],
                 extra: [0.0; 4],
+                cookie: [0.0; 4],
             });
         }
         let lbytes: &[u8] = bytemuck::cast_slice(&gpu_lights);
@@ -7746,6 +7828,35 @@ impl Renderer {
 
     /// Register picture `id` for coronas (`Corona::texture`): a light's own bitmap, whose
     /// brightness is the glow's shape.
+    /// Whether this device has a texture unit for beam cookies (`[spotlight_cookie]`); where it
+    /// has not, a lamp with a cookie shines as a plain spot.
+    pub fn cookies_supported(&self) -> bool {
+        self.cookie_tex.is_some()
+    }
+
+    /// Put a beam cookie's picture into `slot` (1 to `COOKIE_SLOTS`): 16-bit RGB (`rgb`: three
+    /// values a pixel, row-major, top-left origin) taken as coded like the beam cookie files are
+    /// (the light to the power 1 / 2.2; a gray picture is white light), scaled to
+    /// 1280 x 1024 whatever its own size and kept as linear light. False where the device has no
+    /// room for cookies or the picture is not what it says.
+    pub fn set_cookie_rgb16(&mut self, slot: u8, width: u32, height: u32, rgb: &[u16]) -> bool {
+        let Some(tex) = self.cookie_tex.as_ref() else {
+            return false;
+        };
+        let layer = (slot as u32).wrapping_sub(1);
+        if layer >= COOKIE_SLOTS as u32 || width == 0 || height == 0 || rgb.len() < width as usize * height as usize * 3 {
+            return false;
+        }
+        let data = cookie_texels(width as usize, height as usize, rgb);
+        self.queue.write_texture(
+            wgpu::TexelCopyTextureInfo { texture: tex, mip_level: 0, origin: wgpu::Origin3d { x: 0, y: 0, z: layer }, aspect: wgpu::TextureAspect::All },
+            bytemuck::cast_slice(&data),
+            wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(COOKIE_W * 4), rows_per_image: Some(COOKIE_H) },
+            wgpu::Extent3d { width: COOKIE_W, height: COOKIE_H, depth_or_array_layers: 1 },
+        );
+        true
+    }
+
     pub fn set_corona_texture(&mut self, id: u16, img: &omsi_texture::Image) {
         let t = upload_texture(&self.device, &self.queue, img, true);
         let bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -11131,11 +11242,14 @@ fn gpu_light(l: &PointLight, p: Vec3) -> GpuPointLight {
     } else {
         l.radius
     };
+    let up = l.cookie_up;
+    let cookie = if l.cookie > 0 && spot && cookies_on() { [l.cookie as f32, up.x, up.y, up.z] } else { [0.0; 4] };
     GpuPointLight {
         pos: [p.x, p.y, p.z, vanilla_radius],
         color: [l.color[0], l.color[1], l.color[2], l.intensity],
         dir,
         extra: [l.cone[0], l.core, l.beam, l.radius],
+        cookie,
     }
 }
 
@@ -11480,7 +11594,7 @@ fn arrays_as_textures(src: &str, path: ArrayPath) -> String {
     if path == ArrayPath::NoStorage {
         swap(
             "@group(0) @binding(3) var<storage, read> lights: array<PointLight>;",
-            "fn lights_at(i: u32) -> PointLight { return PointLight(vec4<f32>(0.0), vec4<f32>(0.0), vec4<f32>(0.0), vec4<f32>(0.0)); }".to_string(),
+            "fn lights_at(i: u32) -> PointLight { return PointLight(vec4<f32>(0.0), vec4<f32>(0.0), vec4<f32>(0.0), vec4<f32>(0.0), vec4<f32>(0.0)); }".to_string(),
             "lights",
             "lights_at",
         );
@@ -11529,6 +11643,12 @@ fn indexing_as_calls(src: &str, name: &str, call: &str) -> String {
 }
 
 fn scene_shader_text(gl: bool) -> String {
+    scene_shader_text_with(gl, cookies_on())
+}
+
+/// The scene module, with the beam cookies' lines (`//CK `) in where the device has a texture unit
+/// for them, and their stand-ins (`//NOCK `) where it has not.
+fn scene_shader_text_with(gl: bool, cookies: bool) -> String {
     let src = [
         include_str!("colour.wgsl"),
         include_str!("shader.wgsl"),
@@ -11537,6 +11657,7 @@ fn scene_shader_text(gl: bool) -> String {
         include_str!("enhanced.wgsl"),
     ]
     .join("\n");
+    let src = if cookies { src.replace("//CK ", "") } else { src.replace("//NOCK ", "") };
     // Enhanced+: the enhanced pass writes the reflections' surfaces as well (`GBUF_FORMAT`)
     let src = if rt_gbuf() { src.replace("//RT ", "") } else { src };
     if !gl {
@@ -11552,6 +11673,69 @@ fn scene_shader_text(gl: bool) -> String {
         .replace("textureSample(t_trans, s_tile, uv)", &clamped("t_trans"))
         .replace("textureSample(t_night, s_tile, uv)", &clamped("t_night"));
     debug_assert!(!out.contains("s_tile, uv)"));
+    out
+}
+
+/// An unsigned float of `mant` mantissa bits and 5 exponent bits (bias 15), as the channels of
+/// `Rg11b10Ufloat` are (6 bits for red and green, 5 for blue); no sign, no infinity.
+fn pack_ufloat(v: f32, mant: u32) -> u32 {
+    if !(v > 0.0) {
+        return 0;
+    }
+    let max = if mant == 6 { 65024.0 } else { 64512.0 };
+    let v = v.min(max);
+    let e = ((v.to_bits() >> 23) & 0xff) as i32 - 127;
+    let scale = (1u32 << mant) as f32;
+    if e < -14 {
+        // (a denormal: a multiple of 2^-14 / 2^mant; one that rounds up to the least normal is that)
+        return ((v * 16384.0 * scale).round() as u32).min(1 << mant);
+    }
+    let frac = (v / 2f32.powi(e) - 1.0) * scale;
+    let (mut m, mut e) = (frac.round() as u32, e);
+    if m >= 1 << mant {
+        m = 0;
+        e += 1;
+    }
+    if e > 15 {
+        return (30 << mant) | ((1 << mant) - 1);
+    }
+    (((e + 15) as u32) << mant) | m
+}
+
+fn pack_r11g11b10(r: f32, g: f32, b: f32) -> u32 {
+    pack_ufloat(r, 6) | (pack_ufloat(g, 6) << 11) | (pack_ufloat(b, 5) << 22)
+}
+
+/// A beam cookie's picture as the texels of a layer: its 16-bit codes (the light to the power
+/// 1 / 2.2) turned into linear light, bilinear-scaled to `COOKIE_W` x `COOKIE_H` and packed.
+fn cookie_texels(sw: usize, sh: usize, rgb: &[u16]) -> Vec<u32> {
+    let lin = |i: usize| (rgb[i] as f32 / 65535.0).powf(2.2);
+    let (dw, dh) = (COOKIE_W as usize, COOKIE_H as usize);
+    let mut out = Vec::with_capacity(dw * dh);
+    let same = sw == dw && sh == dh;
+    for y in 0..dh {
+        let fy = ((y as f32 + 0.5) * sh as f32 / dh as f32 - 0.5).clamp(0.0, sh as f32 - 1.0);
+        let (y0, ty) = (fy.floor() as usize, fy.fract());
+        let y1 = (y0 + 1).min(sh - 1);
+        for x in 0..dw {
+            if same {
+                let i = (y * sw + x) * 3;
+                out.push(pack_r11g11b10(lin(i), lin(i + 1), lin(i + 2)));
+                continue;
+            }
+            let fx = ((x as f32 + 0.5) * sw as f32 / dw as f32 - 0.5).clamp(0.0, sw as f32 - 1.0);
+            let (x0, tx) = (fx.floor() as usize, fx.fract());
+            let x1 = (x0 + 1).min(sw - 1);
+            let mut c = [0.0f32; 3];
+            for (k, ck) in c.iter_mut().enumerate() {
+                let at = |xx: usize, yy: usize| lin((yy * sw + xx) * 3 + k);
+                let top = at(x0, y0) * (1.0 - tx) + at(x1, y0) * tx;
+                let bottom = at(x0, y1) * (1.0 - tx) + at(x1, y1) * tx;
+                *ck = top * (1.0 - ty) + bottom * ty;
+            }
+            out.push(pack_r11g11b10(c[0], c[1], c[2]));
+        }
+    }
     out
 }
 
@@ -14355,6 +14539,8 @@ mod tests {
             ("xr_ui", include_str!("xr_ui.wgsl").to_string()),
             // Enhanced+: the scene's pass with its reflection targets, the ray tracing
             ("scene (Enhanced+)", scene_shader_source(false).replace("//RT ", "")),
+            ("scene (beam cookies)", arrays_as_textures(&scene_shader_text_with(false, true), ArrayPath::Storage)),
+            ("scene (no beam cookies)", arrays_as_textures(&scene_shader_text_with(false, false), ArrayPath::Storage)),
             ("ray-traced lighting", rt::lighting_source()),
             ("ray-traced reflections", rt::reflect_source()),
             ("texture means", include_str!("rt_avg.wgsl").to_string()),
@@ -14557,6 +14743,61 @@ mod tests {
         assert_eq!(indexing_as_calls("a = my_models[1]; b = models[models[i + 1u] .x];", "models", "f"), "a = my_models[1]; b = f(f(i + 1u) .x);");
     }
 
+    fn unpack_ufloat(bits: u32, mant: u32) -> f32 {
+        let e = (bits >> mant) as i32;
+        let m = (bits & ((1 << mant) - 1)) as f32 / (1u32 << mant) as f32;
+        if e == 0 { m * 2f32.powi(-14) } else { (1.0 + m) * 2f32.powi(e - 15) }
+    }
+
+    /// The beam cookies' texels keep the light to within a few per cent over the whole range from
+    /// a hot spot down to the faintest glow (11 and 10 bit floats), and never go negative or mad.
+    #[test]
+    fn packed_cookie_texels_keep_the_light() {
+        for mant in [6u32, 5] {
+            let tol = 1.0 / (1u32 << mant) as f32; // half a step either way, with a margin
+            let mut v = 1.0e-4f32;
+            while v < 8.0 {
+                let back = unpack_ufloat(pack_ufloat(v, mant), mant);
+                assert!(((back - v) / v).abs() <= tol, "mant {mant}: {v} -> {back}");
+                v *= 1.37;
+            }
+            assert_eq!(pack_ufloat(0.0, mant), 0);
+            assert_eq!(pack_ufloat(-3.0, mant), 0);
+            assert_eq!(pack_ufloat(f32::NAN, mant), 0);
+            let top = unpack_ufloat(pack_ufloat(1.0e9, mant), mant);
+            assert!(top > 60000.0 && top.is_finite(), "{top}");
+            // below the denormals nothing but a tiny number
+            assert!(unpack_ufloat(pack_ufloat(1.0e-9, mant), mant) < 1.0e-5);
+        }
+        // the three channels sit in their own bits
+        let packed = pack_r11g11b10(1.0, 0.5, 0.25);
+        assert_eq!(unpack_ufloat(packed & 0x7ff, 6), 1.0);
+        assert_eq!(unpack_ufloat((packed >> 11) & 0x7ff, 6), 0.5);
+        assert_eq!(unpack_ufloat(packed >> 22, 5), 0.25);
+    }
+
+    /// A picture of any size becomes a layer of the cookies' size, its codes turned into light.
+    #[test]
+    fn a_cookie_picture_is_scaled_and_decoded_into_light() {
+        // a 2 x 1 picture: black on the left, white on the right (16-bit codes)
+        let rgb = [0u16, 0, 0, 65535, 65535, 65535];
+        let texels = cookie_texels(2, 1, &rgb);
+        assert_eq!(texels.len(), (COOKIE_W * COOKIE_H) as usize);
+        let at = |x: usize| unpack_ufloat(texels[x] & 0x7ff, 6);
+        assert!(at(0) < 1.0e-4 && (at(COOKIE_W as usize - 1) - 1.0).abs() < 0.02);
+        // gray codes: 0.5 coded is the light 0.5^2.2
+        let half = [32768u16; 3];
+        let t = cookie_texels(1, 1, &half);
+        let want = (32768.0f32 / 65535.0).powf(2.2);
+        for k in 0..2 {
+            assert!((unpack_ufloat((t[7] >> (11 * k)) & 0x7ff, 6) - want).abs() / want < 0.02);
+        }
+        // a picture of the cookies' own size is taken texel for texel
+        let n = (COOKIE_W * COOKIE_H) as usize;
+        let same = vec![65535u16; n * 3];
+        assert_eq!(unpack_ufloat(cookie_texels(COOKIE_W as usize, COOKIE_H as usize, &same)[12345] & 0x7ff, 6), 1.0);
+    }
+
     /// wgpu's OpenGL backend numbers the textures of all a pipeline's groups into sixteen
     /// units: the scene's camera and material groups stay within them on every array path
     /// there, and what is left out of the camera group for it no pipeline made there reads
@@ -14568,11 +14809,15 @@ mod tests {
         let material = textures(&material_layout_entries());
         for path in [ArrayPath::Storage, ArrayPath::VertexTextures, ArrayPath::NoStorage] {
             let sixteen = path != ArrayPath::Storage;
-            let n = textures(&camera_layout_entries(path, sixteen)) + material;
+            let n = textures(&camera_layout_entries(path, sixteen, false)) + material;
             assert!(n <= 16, "{path:?}: {n} textures");
+            // (OpenGL never gets the beam cookies' unit: sixteen leaves it out whatever is asked)
+            assert_eq!(textures(&camera_layout_entries(path, sixteen, true)) + material, n.max(if sixteen { 0 } else { 17 }));
         }
-        // (and nothing is left out where storage buffers carry the arrays)
-        assert_eq!(textures(&camera_layout_entries(ArrayPath::Storage, false)) + material, 16);
+        // (and nothing is left out where storage buffers carry the arrays; the beam cookies'
+        // texture is the one more, asked for from the device by `COOKIE_TEXTURE_UNITS`)
+        assert_eq!(textures(&camera_layout_entries(ArrayPath::Storage, false, false)) + material, 16);
+        assert_eq!(textures(&camera_layout_entries(ArrayPath::Storage, false, true)) + material, COOKIE_TEXTURE_UNITS as usize);
         // the entry points that read a texture left out are the enhanced path's, the
         // probe's, the puddles' and the reflection pass's - none made there
         let left_out = |src: &str| -> Vec<String> {

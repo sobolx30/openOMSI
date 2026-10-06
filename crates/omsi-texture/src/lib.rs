@@ -98,6 +98,34 @@ pub fn decode_file(path: &Path) -> Result<Image, TextureError> {
     decode_bytes(&bytes, path)
 }
 
+/// A picture as 16-bit RGB, for pictures that are data rather than looks (a lamp's beam cookie):
+/// row-major, top-left origin, three values a pixel.
+pub struct Rgb16 {
+    pub width: u32,
+    pub height: u32,
+    pub data: Vec<u16>,
+}
+
+/// Decode an image file into 16-bit RGB: a PNG keeps all its precision (gray or colour, 8 or 16
+/// bits), any other format is read as `decode_file` reads it and widened.
+pub fn decode_file_rgb16(path: &Path) -> Result<Rgb16, TextureError> {
+    let bytes = omsi_cfg::vfs::read(path).map_err(|e| TextureError::Decode(path.to_path_buf(), e.to_string()))?;
+    decode_bytes_rgb16(&bytes, path)
+}
+
+pub fn decode_bytes_rgb16(bytes: &[u8], path: &Path) -> Result<Rgb16, TextureError> {
+    if bytes.starts_with(b"\x89PNG") {
+        if let Ok(img) = image::load_from_memory_with_format(bytes, image::ImageFormat::Png) {
+            let rgb = img.into_rgb16();
+            let (width, height) = (rgb.width(), rgb.height());
+            return Ok(Rgb16 { width, height, data: rgb.into_raw() });
+        }
+    }
+    let img = decode_bytes(bytes, path)?;
+    let data = img.rgba.chunks_exact(4).flat_map(|p| [p[0] as u16 * 257, p[1] as u16 * 257, p[2] as u16 * 257]).collect();
+    Ok(Rgb16 { width: img.width, height: img.height, data })
+}
+
 pub fn decode_bytes(bytes: &[u8], path: &Path) -> Result<Image, TextureError> {
     let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
     // The original loads by content (D3DX), so files are often misnamed: a `.dds` that is a

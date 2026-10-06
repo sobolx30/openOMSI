@@ -82,10 +82,58 @@ Normal, roughness, metalness and occlusion maps beside a texture, up to 4096 × 
   With the flag 0 (or left out) the lamp is where it says and a twin of it stands on the
   other side of the vehicle, mirrored across its axis (x and the x of the direction turned
   round): put the position on one headlamp. With 1 there is just the one lamp, for a
-  light over a door or a cornering lamp. A pair is as bright as a `[spotlight]` of the same
+  light over a door or a cornering lamp. In the enhanced picture at night, the player's lamps
+  that shine along the road cast the shadows of what stands in front of them (one shadow map
+  for all of them). A range under 10 m is a short reach as declared and a weaker light, the
+  square of the range over ten (a range of 1 is a faint glow); the colour (0-255) dims a lamp as
+  well. A pair is as bright as a `[spotlight]` of the same
   colour, shared between its two lamps. The position is used as written: unlike a
   `[spotlight]`'s, it is not moved onto the vehicle's front. A rear section's model may have
   its own; their variables are the bus's.
+- `[spotlight_cookie]` (enhanced picture) is a lamp whose light by direction **and colour** is a
+  picture, a beam cookie, instead of a cone: the cut-off of a low beam, the hot spot under it,
+  the spread, the tint of its fringes. The picture carries the colour, so there are no colour
+  numbers and no cone angles. The lines, in order (each from the position to the picture's name
+  is read as a number or a name on a line of its own):
+
+  ```
+  [spotlight_cookie]
+  0.95            position x
+  5.95            position y
+  0.652           position z
+  0               direction x
+  1               direction y
+  0               direction z
+  200             range (m, up to 300)
+  lights_fern     the variable that switches it (0 off, 1 full; a number is a constant)
+  0               flag: 0 or none: a twin lamp across the vehicle's axis, 1: the one lamp
+  low_beam.png    the picture, in the vehicle's texture folder (searched like a [light_enh_2]'s bitmap)
+  0.3             time constant (s): 63 % of the way on in that time when switched on, down to 27 %
+                  when switched off, as a [light_enh_2]'s timeconst; 0 or none: at once
+  lamp_pitch      variable: the beam's vertical offset in degrees (+ up); optional, may be empty
+  lamp_yaw        variable: the beam's horizontal offset in degrees (+ right); optional, may be empty
+  ```
+
+  Everything after the variable may be left out, and a keyword ends the block. A number in place
+  of an offset variable is a constant offset. The flag works as in `[spotlight_2]`, but the
+  picture is **not** mirrored: both lamps shine with the beam the same way round, so an
+  asymmetric low beam (the cut-off higher on the right) is asymmetric the same way on both
+  sides, and an offset turns both lamps the same way (a twin's position and direction are
+  mirrored, the offsets are not). **The two modules can be had apart**: declare each as a
+  `[spotlight_cookie]` of its own with the flag 1 - each has its own switching variable,
+  offsets, picture and time constant, so a script can steer cornering modules, a left and a
+  right one, by itself. The picture's frame follows the lamp's direction (with the offsets)
+  and the vehicle's up.
+
+  The picture is 1280 x 1024, 0.09375 degrees a pixel (-60 to +60 degrees across, +36 to -60
+  degrees down, 0 at row 384), sRGB-coded gray or RGB, 8 or 16 bits (any other size is scaled),
+  with white the beam's peak; a gray picture shines white. Beyond the picture there is no
+  light, and its four edges fade out (12 degrees at the sides and the bottom, 8 at the top, the
+  `COOKIE_FADE_*` constants of `enhanced.wgsl`) whatever it holds. The lamp's `range` is how far
+  it reaches (up to 300 m): see `beam_cookies/FORMAT.md`. Up to eight pictures at a time; a
+  lamp whose picture is missing, or on a device with no room for cookies, shines as a plain
+  warm-white spot. The shadow of the player's lamps works with it as before.
+  `OMSI_NO_COOKIES=1` leaves cookies out.
 
 ## Screens: static cameras
 

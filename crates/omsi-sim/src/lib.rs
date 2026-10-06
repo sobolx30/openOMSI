@@ -4,6 +4,7 @@ pub mod ai_motion;
 pub mod anim;
 pub mod clock;
 pub mod collision;
+pub mod cookie;
 pub mod crowd;
 pub mod daylight;
 pub mod host;
