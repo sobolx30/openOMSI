@@ -15,6 +15,9 @@ if errorlevel 1 (
   echo Install Rust from https://rustup.rs using the MSVC toolchain, then run this script again.
   exit /b 1
 )
+rem Always rebuild from scratch (cargo is incremental by default)
+cargo clean --release --target %TARGET%
+if errorlevel 1 goto :failed
 cargo build --locked --release --target %TARGET% -p omsi-app -p omsi-launcher-core
 if errorlevel 1 goto :failed
 if not exist "dist\windows" mkdir "dist\windows"

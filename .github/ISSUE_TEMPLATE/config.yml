@@ -5,7 +5,7 @@ contact_links:
     about: How do I...? Setting up, mods, or a chat with other players - ask on our Discord server.
   - name: Security problem
     url: https://github.com/openOMSI-Project/openOMSI/security/advisories/new
-    about: A vulnerability in the game, the server or the updater - report it privately, not as an issue (see SECURITY.md).
+    about: A vulnerability in the game or the server - report it privately, not as an issue (see SECURITY.md).
   - name: User guide
     url: https://github.com/openOMSI-Project/openOMSI/blob/main/docs/USER_GUIDE.md
     about: Settings, controls, multiplayer and common problems explained.

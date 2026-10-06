@@ -7,8 +7,7 @@
 
 <p align="center">
   <a href="https://github.com/sobolx30/openOMSI/releases/latest"><img alt="Version" src="https://img.shields.io/github/v/release/sobolx30/openOMSI?label=version&color=f47f30&style=for-the-badge"></a>
-  <a href="https://github.com/sobolx30/openOMSI/actions/workflows/release.yml"><img alt="Build" src="https://img.shields.io/github/actions/workflow/status/sobolx30/openOMSI/release.yml?branch=main&style=for-the-badge&label=build"></a>
-  <a href="https://github.com/sobolx30/openOMSI/tree/main/docs"><img alt="Docs" src="https://img.shields.io/badge/docs-website-2d3138?style=for-the-badge"></a>
+  <a href="https://github.com/sobolx30/openOMSI/tree/main/docs"><img alt="Docs" src="https://img.shields.io/badge/docs-in%20the%20repo-2d3138?style=for-the-badge"></a>
   <a href="https://discord.gg/FQpVKtVJxD"><img alt="Discord" src="https://img.shields.io/badge/discord-join%20us-5865F2?style=for-the-badge&logo=discord&logoColor=white"></a>
   <a href="LICENSE"><img alt="License" src="https://img.shields.io/github/license/sobolx30/openOMSI?style=for-the-badge"></a>
 </p>
@@ -30,25 +29,23 @@ and fully compatible with the existing maps, buses, scenery and mods.
 
 ## Download
 
-Every commit to `main` is built by GitHub Actions and published on the
+Releases are built by hand and published on the
 [**Releases**](https://github.com/sobolx30/openOMSI/releases) page:
 
 | Platform | File |
 | --- | --- |
-| Windows x64 / ARM64 | `openOMSI-<version>-windows-x64.zip` / `-windows-arm64.zip` - run `openomsi.exe` |
-| macOS (Apple silicon / Intel) | `openOMSI-<version>-macos-arm64.zip` / `-macos-x64.zip` - open `openOMSI.app` |
-| Linux x64 / ARM64 | `openOMSI-<version>-linux-x64.zip` / `-linux-arm64.zip` - run `openomsi` |
-| Android (arm64, 8.0+) | `openOMSI-<version>-android-arm64.apk` - see [docs/ANDROID.md](docs/ANDROID.md) |
-| Dedicated server | `openOMSI-<version>-server-linux-x64.zip` (also `-linux-arm64`, `-windows-x64`, `-windows-arm64`) - see [docs/SERVER.md](docs/SERVER.md) |
+| Windows x64 | `openOMSI-<version>-windows-x64.zip` - run `openomsi.exe` |
+
+Other systems (macOS, Linux, Android, the dedicated server): build from source, see
+[Building from source](#building-from-source) and [docs/BUILDING.md](docs/BUILDING.md).
 
 Start the game, point the launcher to your OMSI 2 folder once, pick a map, a bus and a duty,
 and drive. Mods go into the folder next to the game (or through the launcher's **Mods**
 page); the original installation is never written to.
 
-From 0.1.7 on the launcher updates itself: when a newer release is out it asks at the start
-and, with your yes, downloads it, replaces the program and starts again (on Android through
-the system's installer). Settings → General → Updates switches the check off or installs without
-asking.
+**This build does not update itself.** It never looks for a newer version and downloads no
+program by itself. To update, download a newer release from the Releases page and unpack it
+over the old folder: your settings, mods and content stay.
 
 ## Installation
 
@@ -57,9 +54,9 @@ the maps Grundorf and Berlin-Spandau and the stock buses (MAN SD200/SD202, NL). 
 brings no game content of its own; it plays the original's maps, buses and mods.
 
 1. **Download** the file for your system from
-   [Releases](https://github.com/sobolx30/openOMSI/releases) (table above) and unpack it
+   [Releases](https://github.com/sobolx30/openOMSI/releases) and unpack it
    into a folder of its own that you can write to - your Documents, a games folder, or the
-   OMSI 2 folder itself. Not `Program Files`: the launcher could not update itself there.
+   OMSI 2 folder itself. Not `Program Files` (a normal user cannot write there).
 2. **Start it.**
    * **Windows:** `openomsi.exe`. Windows SmartScreen may warn about an unknown app: *More
      info* → *Run anyway*.
@@ -102,6 +99,27 @@ to.
   and *Report on GitHub*. The logs are in `~/.openomsi` (Windows: `C:\Users\<you>\.openomsi`),
   `game.log` for the last game.
 
+## Network and privacy
+
+This build does not check for updates and sends no usage data or statistics anywhere. The
+network is used only by features you start or switch on:
+
+* **Multiplayer** (when you host or join): public STUN servers (Google, Cloudflare) to find your
+  address, an automatic port forward in your router (UPnP), and the public relay `ntfy.sh`
+  to exchange addresses with the other player. When you host, the game may fetch and run
+  Cloudflare's `cloudflared` for an internet tunnel (`OMSI_NO_TUNNEL=1` or `OMSI_NO_BRIDGE=1`
+  switch these off). The Multiplayer page asks the servers in your list for their status.
+* **Internet radio** (when you play a station) and **real weather** (METAR from
+  aviationweather.gov, off by default).
+* **Machine translation** of the interface (off by default): the language model (about 620 MB)
+  is downloaded once from Hugging Face.
+* **Discord Rich Presence**: talks only to the Discord program on your computer, which shows
+  the map, bus and duty on your profile; Settings → General switches it off.
+* **Voice chat** connects only to a GreenTeaSpeak plugin on your own computer (`127.0.0.1`).
+
+The crash window's *Report on GitHub* and the links in Settings only open a page in your own
+browser when you press them.
+
 ## Goals
 
 1. **1:1 behaviour.** Every content format of the original - maps, splines, scenery objects,
@@ -129,7 +147,7 @@ The documentation lives in [`docs/`](docs):
 | [Routes](docs/ROUTES.md) | how the original runs timetables, chrono, HOF, IBIS |
 | [Plugins](docs/PLUGINS.md) | Lua plugins (API and examples), OMSI plugin DLLs and the 32-bit plugin host |
 | [Dedicated server](docs/SERVER.md) | hosting a session without a window |
-| [Versioning & releases](docs/VERSIONING.md) | the `MAJOR.MINOR.COMMIT` scheme and the CI |
+| [Versioning & releases](docs/VERSIONING.md) | the `MAJOR.MINOR.COMMIT` scheme and how releases are made |
 | [Changelog](CHANGELOG.md) | what changed in each version |
 
 ## Building from source
@@ -164,9 +182,8 @@ openOMSI/
 ├── tools/             developer tools: omsi-check (format coverage)
 ├── scripts/           build scripts for every platform, version.sh, packaging files
 ├── assets/            fonts, Material icons, app icons (assets/icons/app), logos (assets/logos)
-├── docs/              documentation (also published as the website)
-├── site/              the GitHub Pages website
-└── .github/workflows/ CI: release builds for every commit, the website
+├── docs/              documentation
+└── site/              source of a website for the documentation
 ```
 
 ## Contributing

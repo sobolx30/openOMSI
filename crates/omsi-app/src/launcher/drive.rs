@@ -522,6 +522,8 @@ fn book_handle(l: &mut Launcher, map: Rect) -> Rect {
 fn foot(l: &mut Launcher, f: Rect, tab: usize) {
     l.ui.panel(f);
     let running = l.state.instances.iter().filter(|i| i.running).count();
+    // (a game runs, or is on its way: the launcher stays usable, only starting a session waits)
+    let busy = l.state.in_game();
     let pad = 16.0;
     let by = f.y + (f.h - GO_H) * 0.5;
     // the buttons, from the right
@@ -534,14 +536,15 @@ fn foot(l: &mut Launcher, f: Rect, tab: usize) {
             l.drive.tab = tab + 1;
         }
     } else {
-        let label = if running > 0 && l.state.second_armed.map(|t| t.elapsed().as_secs() < 6).unwrap_or(false) {
-            "Start another game"
-        } else if (l.state.choice.free || l.state.choice.line.is_none()) && l.state.joined_server.is_none() {
+        let label = if (l.state.choice.free || l.state.choice.line.is_none()) && l.state.joined_server.is_none() {
             "Drive"
         } else {
             "Start the duty"
         };
-        if l.ui.button("launch", go, label, Some("play_arrow"), ButtonKind::Primary) {
+        if busy {
+            l.ui.button_off(go, label, Some("play_arrow"), ButtonKind::Primary);
+            l.ui.tooltip(go, "A game is running: you can start the next one when it ends");
+        } else if l.ui.button("launch", go, label, Some("play_arrow"), ButtonKind::Primary) {
             start(l);
         }
     }
@@ -558,18 +561,28 @@ fn foot(l: &mut Launcher, f: Rect, tab: usize) {
             if l.ui.select("continue-which", s, &mut pick, &saves) {
                 l.state.save_pick = pick;
             }
-            if l.ui.button("continue", b, if narrow { "" } else { "Continue" }, Some("history"), ButtonKind::Normal) {
-                l.state.launch_last_situation();
+            if busy {
+                l.ui.button_off(b, if narrow { "" } else { "Continue" }, Some("history"), ButtonKind::Normal);
+                l.ui.tooltip(b, "A game is running: you can start the next one when it ends");
+            } else {
+                if l.ui.button("continue", b, if narrow { "" } else { "Continue" }, Some("history"), ButtonKind::Normal) {
+                    l.state.launch_last_situation();
+                }
+                l.ui.tooltip(b, "Continue where you left off");
             }
-            l.ui.tooltip(b, "Continue where you left off");
             left_of = s.x;
         } else {
             let bw = if narrow { GO_H } else { 196.0 };
             let b = Rect::new(left_of - 10.0 - bw, by, bw, GO_H);
-            if l.ui.button("continue", b, if narrow { "" } else { "Continue last game" }, Some("history"), ButtonKind::Normal) {
-                l.state.launch_last_situation();
+            if busy {
+                l.ui.button_off(b, if narrow { "" } else { "Continue last game" }, Some("history"), ButtonKind::Normal);
+                l.ui.tooltip(b, "A game is running: you can start the next one when it ends");
+            } else {
+                if l.ui.button("continue", b, if narrow { "" } else { "Continue last game" }, Some("history"), ButtonKind::Normal) {
+                    l.state.launch_last_situation();
+                }
+                l.ui.tooltip(b, "Continue where you left off on this map");
             }
-            l.ui.tooltip(b, "Continue where you left off on this map");
             left_of = b.x;
         }
     }
@@ -1524,15 +1537,11 @@ fn start(l: &mut Launcher) {
         l.state.set_status(format!("LAN: {t}"), true);
         return;
     }
-    let running = l.state.instances.iter().filter(|i| i.running).count();
-    // a second game on one computer is for testing LAN play, not something to do by
-    // accident: with one running, the button asks for a second click
-    if running > 0 && l.state.second_armed.map(|t| t.elapsed().as_secs() >= 6).unwrap_or(true) {
-        l.state.second_armed = Some(std::time::Instant::now());
-        l.state.set_status("A game is running already (its window may be behind this one - see Sessions). Click again to start another one anyway.", true);
+    // (the buttons are faded while a game runs; this is for a key or a script that asks anyway)
+    if l.state.in_game() {
+        l.state.set_status("A game is running (its window may be behind this one - see Sessions): start the next one when it ends.", true);
         return;
     }
-    l.state.second_armed = None;
     l.state.choice.save();
     l.state.launch();
     if l.state.choice.lan_mode != "off" {

@@ -104,14 +104,10 @@ installs over the previous one.
 
 ## Updates
 
-The launcher looks for a newer GitHub release when it starts (Settings → General → Updates) and offers
-it; **Update now** downloads the APK and hands it to Android's package installer. The first
-time Android asks to allow openOMSI to install apps. Then Android asks "Do you want to update
-this app?": **Update** replaces openOMSI and starts it again, **Cancel** comes back to the
-launcher as "not updated". The APK must be signed with the same key as the installed app
-(release builds are).
+The app does not update itself and asks for no permission to install apps. To update, install the
+newer APK over the old one by hand (it must be signed with the same key as the installed app;
+release builds are).
 
 `openOMSI/env.txt` on the shared storage takes the `OMSI_*` switches a computer takes from its
-environment (one `NAME=value` a line), for example `OMSI_UPDATE_URL=file:///sdcard/…/release.json`
-to try an update from a local release description.
+environment (one `NAME=value` a line), for example `OMSI_NO_TUNNEL=1`.
 

@@ -1048,17 +1048,7 @@ Reverse engineered from Omsi.exe and put in place of our own guesses:
   tile version 12, strings from version 4 (0x792ee7, 0x794892).
 * **Touch wheel**: turns with the finger round its centre (120° of rim = full lock); the old
   drag across ran off the screen at about 0.4 of the lock to the left.
-* **Updates** (`updater.rs`, `launcher/update.rs`): the GitHub API's latest release, the
-  platform's asset by `release.yml`'s names, SHA-256 from the asset's `digest`. A computer
-  unpacks into `.openomsi-update` beside the program and swaps each top-level item (old one
-  renamed `*.old-update`, all undone on a failure; `.openomsi-files` lists what an update
-  installed, so files a release drops go too; nothing else in the folder is touched), then
-  starts the program file again and ends; the next start deletes `*.old-update`. Android: a
-  PackageInstaller session (`OmsiActivity.installApk`), the status PendingIntent comes back
-  to the activity (cancel → error in the launcher, success → the system starts the new app);
-  "Install unknown apps" is asked for first. `openOMSI/env.txt` gives a phone `OMSI_*`
-  switches. The JNI calls now go to the real NativeActivity (`AndroidApp::activity_as_ptr`):
+* **Android JNI**: the calls go to the real NativeActivity (`AndroidApp::activity_as_ptr`):
   ndk_context's context is the Application - the buttons' vibration never reached Java.
-  Checked: desktop end to end on macOS (update, not now, auto, damaged file, read-only
-  folder), Android end to end on the emulator (permission, cancel, update and restart),
-  Windows `cargo check`.
+  `openOMSI/env.txt` gives a phone `OMSI_*` switches. (There is no updater and no package
+  installer: a newer build is installed by hand.)

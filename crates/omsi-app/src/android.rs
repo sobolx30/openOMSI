@@ -578,30 +578,6 @@ fn with_activity<R>(f: impl FnOnce(&mut jni::JNIEnv, &jni::objects::JObject) -> 
     r.ok()
 }
 
-/// Hand the downloaded APK to the system's package installer (`OmsiActivity.installApk`):
-/// the system asks the player, `install_status` tells what they answered.
-pub(crate) fn install_apk(path: &std::path::Path) -> anyhow::Result<()> {
-    let p = path.to_string_lossy().to_string();
-    with_activity(|env, activity| {
-        let s = env.new_string(&p)?;
-        env.call_method(activity, "installApk", "(Ljava/lang/String;)V", &[(&s).into()])?;
-        Ok(())
-    })
-    .ok_or_else(|| anyhow::anyhow!("the system's package installer could not be reached"))
-}
-
-/// The package installer's answer so far: 0 nothing yet, 1 asking the player, 2 installed,
-/// 3 cancelled, 4 failed (with the system's message), 5 waiting for "Install unknown apps",
-/// 6 that permission refused.
-pub(crate) fn install_status() -> Option<(i32, String)> {
-    with_activity(|env, activity| {
-        let code = env.call_method(activity, "getInstallStatus", "()I", &[])?.i()?;
-        let msg = env.call_method(activity, "getInstallMessage", "()Ljava/lang/String;", &[])?.l()?;
-        let msg: String = if msg.is_null() { String::new() } else { env.get_string(&jni::objects::JString::from(msg))?.into() };
-        Ok((code, msg))
-    })
-}
-
 /// A web page in the phone's browser.
 pub(crate) fn open_url(url: &str) {
     let u = url.to_string();

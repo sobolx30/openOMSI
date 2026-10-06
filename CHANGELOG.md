@@ -4,6 +4,29 @@ Every push to `main` is released as `MAJOR.MINOR.COMMIT` (see
 [docs/VERSIONING.md](docs/VERSIONING.md)); the downloads are on the
 [Releases](https://github.com/openOMSI-Project/openOMSI/releases) page.
 
+## Unreleased
+
+### Removed
+
+* The updater, completely: the launcher no longer asks GitHub for a newer release when it starts
+  or every half hour, the game no longer looks for one during a session and downloads nothing in
+  the background, and nothing replaces the program (no `.openomsi-update` swap, no relaunch).
+  Gone with it: the settings *Look for updates when the launcher starts*, *Install updates
+  without asking* and *Tell me about a new version during a session* (an old `settings.cfg`'s
+  `update_*` lines are ignored), the switches `OMSI_NO_UPDATE` and `OMSI_UPDATE_URL`, the update
+  dialog and cards, and on Android the APK installer and the `REQUEST_INSTALL_PACKAGES`
+  permission. A newer build is installed by hand.
+* The "playing now" counter: the game no longer tells a Cloudflare Worker
+  (`openomsi.savvabestbrother.workers.dev`) every ten minutes that it is being played. Gone with
+  it: the setting *Count me in the website's "playing now"*, `OMSI_NO_PRESENCE` and
+  `OMSI_PRESENCE_URL`, `services/presence/` and the counter on the website and in the README.
+* The launcher no longer rests while a game runs: it keeps its window and its graphics device and
+  stays usable (the setting *The launcher rests while a game runs* and the dark cover over the
+  window are gone; an old `launcher_rest` line in `settings.cfg` is ignored). Instead the buttons
+  that start a session (Start the duty / Drive, Continue, Start the lesson) are faded while a
+  game runs or is starting, and work again when it ends. A second game from the launcher (the
+  second click on the start button, for testing LAN play on one computer) is no longer offered.
+
 ## 0.1.1726 - 2026-10-05
 
 ### Merged pull requests

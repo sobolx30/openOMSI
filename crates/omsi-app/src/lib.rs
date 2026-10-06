@@ -26,9 +26,7 @@ mod platform;
 mod touch;
 mod placing;
 mod mt;
-mod updater;
-mod update_watch;
-mod presence;
+mod version;
 mod ambience;
 mod camera_arm;
 mod career;
@@ -436,7 +434,6 @@ pub(crate) fn make_app(mut args: Args, server_cfg: Option<server::ServerCfg>) ->
     let clock_note = args.clock_moved.clone();
     // (as the last session left it, #1164)
     let info_bar = settings.info_bar;
-    let is_server = args.server.is_some();
     let mut app = App {
         args,
         instance: graphics_instance(),
@@ -587,9 +584,6 @@ pub(crate) fn make_app(mut args: Args, server_cfg: Option<server::ServerCfg>) ->
         fps_t: Instant::now(),
         service_msg: clock_note.map(|m| (m, 10.0)),
         notices: Vec::new(),
-        update_watch: crate::update_watch::UpdateWatch::new(),
-        // (a server counts its players by their own games, not itself)
-        presence: if is_server { None } else { crate::presence::Presence::start() },
         log_state: Default::default(),
         plugins: None,
         career: Default::default(),

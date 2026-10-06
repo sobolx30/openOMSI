@@ -12,8 +12,6 @@
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
     <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
     <uses-permission android:name="android.permission.CHANGE_WIFI_MULTICAST_STATE" />
-    <!-- updates: the APK of a newer GitHub release handed to the system's installer -->
-    <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
     <!-- the on-screen buttons' feedback -->
     <uses-permission android:name="android.permission.VIBRATE" />
     <!-- the copy of OMSI 2 and the mods on the shared storage, read by path -->

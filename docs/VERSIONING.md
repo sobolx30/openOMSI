@@ -45,7 +45,7 @@ A pull request's builds are test builds for anyone who wants to try the change:
 
 * their version names the pull request, `<version>-pr<number>` (e.g. `0.1.1313-pr1192`),
   in the launcher's side bar, `game.log` and crash reports;
-* the updater never offers them a release, so a test build stays until it is deleted;
+* nothing updates them (there is no updater), so a test build stays until it is deleted;
 * the Android one is an app of its own, *openOMSI PR #N* (`org.openomsi.game.pr`), that
   installs beside the release and shares its `openOMSI` folder;
 * [`.github/workflows/pr_builds.yml`](../.github/workflows/pr_builds.yml) comments on the

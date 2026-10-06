@@ -564,6 +564,23 @@ impl Ui {
         clicked
     }
 
+    /// A button that is not to be pressed now (a game is running): faded, with no hover and no
+    /// click, laid out as `button` lays it out.
+    pub fn button_off(&mut self, r: Rect, label: &str, icon: Option<&str>, kind: ButtonKind) {
+        let text_c = TEXT_DIM.alpha(0.45);
+        self.p().rounded(r, 6.0, FIELD.alpha(0.55));
+        self.p().rounded_border(r, 6.0, 1.0, EDGE.alpha(0.5));
+        let px = if r.h >= 44.0 { 14.5 } else { 13.0 };
+        let weight = if kind == ButtonKind::Primary { Weight::Bold } else { Weight::Medium };
+        let tw = self.width(label, px, weight);
+        let iw = if icon.is_some() { px * 1.3 + if label.is_empty() { 0.0 } else { 6.0 } } else { 0.0 };
+        let x0 = r.center().x - (tw + iw) * 0.5;
+        if let Some(i) = icon {
+            self.icon(i, Vec2::new(x0 + px * 0.65, r.center().y), px * 1.3, text_c);
+        }
+        self.text_in(label, Rect::new(x0 + iw, r.y, tw + 2.0, r.h), px, weight, text_c, Align::Left);
+    }
+
     /// A round button with only an icon.
     pub fn icon_button(&mut self, name: &str, c: Vec2, r: f32, icon: &str, tip: &str) -> bool {
         let id = id_of(name);
