@@ -3591,6 +3591,9 @@ pub struct PlayerDuty {
     /// The way the bus faces (degrees clockwise from north), from the last update: it says
     /// which of two stops a few metres apart the bus is at (see `StopDir`).
     heading: f64,
+    /// Where the bus was at the last update: OMSI's delay is the time against the plan at the
+    /// bus's own place between the stops (see `delay`).
+    pos: Option<glam::DVec3>,
 }
 
 impl Schedule {
@@ -3946,6 +3949,7 @@ impl Schedule {
             picked: trip.map(|t| !t.trim().is_empty()).unwrap_or(false),
             first_update: None,
             heading: 0.0,
+            pos: None,
         })
     }
 
@@ -4648,6 +4652,24 @@ impl PlayerDuty {
         if self.at_stop {
             return now - stop.dep;
         }
+        // On the way between two stops OMSI's `GetTTDelay` is the time against the plan at the
+        // bus's own place: the plan's time there is taken between the departure from the
+        // stop behind and the arrival at the stop ahead, by the distances of the bus to
+        // the two (`(arr*d_prev + dep*d_next) / (d_prev + d_next)`), and both times are cut
+        // to whole seconds. A bus that makes up time sees its delay fall as it goes.
+        if self.next_stop > 0 {
+            if let (Some(prev), Some(pos)) = (trip.stops.get(self.next_stop - 1), self.pos) {
+                if let (Some(pp), Some(np)) = (prev.position, stop.position) {
+                    let d_prev = (pos - pp).length();
+                    let d_next = (pos - np).length();
+                    let total = d_prev + d_next;
+                    if total > 1.0 {
+                        let planned = (stop.arr * d_prev + prev.dep * d_next) / total;
+                        return now.trunc() - planned.trunc();
+                    }
+                }
+            }
+        }
         let due = now - stop.arr;
         self.left_late.map(|l| l.max(due)).unwrap_or(due)
     }
@@ -4802,6 +4824,7 @@ impl PlayerDuty {
 
     /// The duty's progress with the bus at `pos` (see [`PlayerDuty::update`]).
     fn advance(&mut self, pos: glam::DVec3, day_time: f64) -> Option<(f64, f64)> {
+        self.pos = Some(pos);
         if !self.placed {
             // (stops beyond the loaded tiles have no place yet: a few seconds for the
             // navigator's map, unless the bus stands at a stop of its trip)
@@ -5526,6 +5549,7 @@ pub(crate) mod tests {
             picked: true,
             first_update: None,
             heading: 90.0,
+            pos: None,
         }
     }
 
@@ -5637,6 +5661,7 @@ pub(crate) mod tests {
             picked: false,
             first_update: None,
             heading: 90.0,
+            pos: None,
         };
         // The same name appears twice. Its saved ordinal, rather than its name or the
         // bus's position far from any stop, selects the second occurrence.
@@ -5720,6 +5745,7 @@ pub(crate) mod tests {
             picked: true,
             first_update: None,
             heading: 90.0,
+            pos: None,
         };
         d.advance(glam::DVec3::new(0.0, 0.0, 0.0), 0.0);
         d.advance(glam::DVec3::new(100.0, 0.0, 0.0), 10.0);
@@ -5759,6 +5785,7 @@ pub(crate) mod tests {
             picked: true,
             first_update: None,
             heading: 90.0,
+            pos: None,
         };
         d.advance(glam::DVec3::new(0.0, 0.0, 0.0), 0.0);
         d.advance(glam::DVec3::new(100.0, 0.0, 0.0), 10.0);
@@ -5794,6 +5821,7 @@ pub(crate) mod tests {
             picked: true,
             first_update: None,
             heading: 90.0,
+            pos: None,
         };
         d.advance(glam::DVec3::new(800.0, 0.0, 0.0), 345.0);
         assert_eq!(d.trip_index, 0);
@@ -5804,7 +5832,7 @@ pub(crate) mod tests {
     fn the_next_stop_can_be_skipped() {
         let trip = planned(0.0, &[(0.0, 0.0, 0.0), (100.0, 60.0, 60.0), (500.0, 120.0, 120.0), (1000.0, 200.0, 200.0)]);
         let next = planned(400.0, &[(1040.0, 400.0, 400.0), (1500.0, 500.0, 500.0)]);
-        let mut d = PlayerDuty { line: "5".into(), tour: "1".into(), trips: vec![trip, next], trip_index: 0, first_trip: 0, next_stop: 0, at_stop: false, arrived_late: None, done: false, served_terminus: None, left_late: None, held_back: false, placed: true, trip_changed: false, skipped: None, picked: true, first_update: None, heading: 90.0 };
+        let mut d = PlayerDuty { line: "5".into(), tour: "1".into(), trips: vec![trip, next], trip_index: 0, first_trip: 0, next_stop: 0, at_stop: false, arrived_late: None, done: false, served_terminus: None, left_late: None, held_back: false, placed: true, trip_changed: false, skipped: None, picked: true, first_update: None, heading: 90.0, pos: None };
         // at the first stop and away from it: the next is s1
         d.advance(glam::DVec3::new(0.0, 0.0, 0.0), 0.0);
         d.advance(glam::DVec3::new(50.0, 0.0, 0.0), 10.0);
@@ -5855,6 +5883,7 @@ pub(crate) mod tests {
             picked: true,
             first_update: None,
             heading: 90.0,
+            pos: None,
         };
         assert!(d.skip_to(2));
         assert_eq!(d.next_stop, 2);
@@ -5906,6 +5935,7 @@ pub(crate) mod tests {
             picked: true,
             first_update: None,
             heading: 90.0,
+            pos: None,
         };
         // at stop 0, then leaving east
         d.advance(glam::DVec3::new(0.0, 0.0, 0.0), 0.0);
@@ -5940,6 +5970,7 @@ pub(crate) mod tests {
             picked: true,
             first_update: None,
             heading: 90.0,
+            pos: None,
         };
         d.advance(glam::DVec3::new(0.0, 0.0, 0.0), 0.0);
         d.advance(glam::DVec3::new(60.0, 0.0, 0.0), 30.0);
@@ -6009,6 +6040,7 @@ pub(crate) mod tests {
             picked: false,
             first_update: None,
             heading: 0.0,
+            pos: None,
         };
         // 200 m from the first stop two minutes before the departure: early, next stop the first
         assert_eq!(d.advance(glam::DVec3::new(300.0, 0.0, 0.0), now), None);
@@ -6022,9 +6054,12 @@ pub(crate) mod tests {
             Some(60.0)
         );
         assert_eq!(d.next_stop, 1);
-        // on the way the delay is what it left with until the next stop is overdue
-        assert!((d.delay(55000.0) - 60.0).abs() < 1e-9);
-        assert!((d.delay(56600.0) - 200.0).abs() < 1e-9);
+        // on the way the delay is the time against the plan at the bus's place, as in OMSI:
+        // 60 m from the stop behind (500 m, left 54420) and 440 m from the one ahead (1000 m, 56400)
+        assert!((d.delay(55000.0) - 343.0).abs() < 1e-9);
+        // halfway the plan says 55410: a bus there at 55400 is ten seconds early, however late it left
+        d.advance(glam::DVec3::new(750.0, 0.0, 0.0), 55400.0);
+        assert!((d.delay(55400.0) + 10.0).abs() < 1e-9);
         // the next trip does not take over while this one is driven ...
         d.advance(glam::DVec3::new(800.0, 0.0, 0.0), 57620.0);
         assert_eq!(d.trip_index, 1);
@@ -6061,6 +6096,7 @@ pub(crate) mod tests {
             picked: false,
             first_update: None,
             heading: 0.0,
+            pos: None,
         };
         // 4 km away two minutes before the 15:07 leaves: the duty begins with the 16:01
         let mut d = duty(trips.clone());
@@ -6104,6 +6140,7 @@ pub(crate) mod tests {
             picked: false,
             first_update: None,
             heading: 0.0,
+            pos: None,
         };
         let (trip, stop) = d.trip_for_ibis();
         assert_eq!(trip.line, "5E");

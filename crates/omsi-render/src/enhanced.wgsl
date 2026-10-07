@@ -31,6 +31,17 @@ fn f_schlick(f0: vec3<f32>, c: f32) -> vec3<f32> {
     return f0 + (vec3<f32>(1.0) - f0) * f;
 }
 
+// Schlick's Fresnel for the sun's highlight, held down by roughness. On a rough surface
+// the microfacets scatter the grazing light all ways, and its reflectance at a grazing angle
+// stays far under 1 (the plain Schlick curve runs up to 1 whatever the surface): under a low
+// sun, looking along a road, asphalt wore a smooth white veil, like plastic. Only surfaces
+// rougher than 0.45 are held down; paint, chrome and glass keep the full curve.
+fn f_schlick_sun(f0: vec3<f32>, rough: f32, c: f32) -> vec3<f32> {
+    let f = pow(1.0 - clamp(c, 0.0, 1.0), 5.0);
+    let top = mix(vec3<f32>(1.0), max(vec3<f32>(1.0 - rough), f0), smoothstep(0.45, 0.8, rough));
+    return f0 + (top - f0) * f;
+}
+
 // The split-sum environment term (Karis' analytic fit).
 fn env_brdf(f0: vec3<f32>, rough: f32, nv: f32) -> vec3<f32> {
     let c0 = vec4<f32>(-1.0, -0.0275, -0.572, 0.022);
@@ -435,6 +446,16 @@ struct EnhancedOut {
 var<private> rt_gbuf: vec4<f32>;
 var<private> rt_aux: vec4<f32>;
 
+// The LED glow (`MaterialExtra::led`) rides in the material's emissive.w: -2 the renderer's
+// own guess (a `\S:n` mask over an all-white light map), -4..-3 the author's word, the
+// material's `[led_glow_effect]` (w + 4 is how strongly it burns, 0..1).
+fn led_on() -> bool { return material.emissive.w < -1.5; }
+fn led_forced() -> bool { return material.emissive.w < -2.5; }
+fn led_level() -> f32 { return select(1.0, clamp(material.emissive.w + 4.0, 0.0, 1.0), led_forced()); }
+// whose dots are sampled at the held mip level: a panel's, not a plain material's that was
+// asked to glow (its picture keeps the ordinary filtering)
+fn led_dots() -> bool { return led_on() && (!led_forced() || material.params.z > 0.5); }
+
 @fragment
 fn fs_enhanced(in: FsIn) -> EnhancedOut {
     var puddle_weight = vec2<f32>(0.0);
@@ -442,7 +463,8 @@ fn fs_enhanced(in: FsIn) -> EnhancedOut {
     let screen = material.flags.x > 0.5;
     // an LED panel's dots stay in the glow's source (`post.wgsl`), the other screens'
     // letters stay out of it
-    let led = select(0.0, 1.0, material.emissive.w < -1.5);
+    // (g: 0.5 + half the strength, `post.wgsl` takes the strength from it)
+    let led = select(0.0, 0.5 + 0.5 * led_level(), led_on());
     var out: EnhancedOut;
     out.color = c;
     // The sub-0.5 range of g carries water's occluded sky weight; LED detection uses
@@ -450,7 +472,7 @@ fn fs_enhanced(in: FsIn) -> EnhancedOut {
     // A vehicle's shadow is light blocked from the road, not a new dry surface. Its
     // colour still blends normally, but it must preserve the road's reflection mask.
     let coverage = select(select(c.a, 1.0, screen), 0.0, in.params2.w > 1.5);
-    out.mask = vec4<f32>(select(0.0, 1.0, screen), max(led, puddle_weight.y * 0.49), puddle_weight.x, coverage);
+    out.mask = vec4<f32>(select(0.0, 1.0, screen || led_on()), max(led, puddle_weight.y * 0.49), puddle_weight.x, coverage);
     //RT out.gbuf = rt_gbuf;
     //RT out.aux = rt_aux;
     return out;
@@ -506,7 +528,7 @@ fn shade_enhanced(in: FsIn, puddle_weight: ptr<function, vec2<f32>>, capture: bo
     if (TERRAIN_PAINT && material.params.x > 1.5 && material.params.z > 0.5
         && material.params.w > 0.5 && enh.debug.x <= 0.5 && material.ambient.w <= 1.5) {
         var coverage = sample_transmap(buv).a;
-        if (material.emissive.w < -1.5 && enh.led.y < msk_lod) {
+        if (led_dots() && enh.led.y < msk_lod) {
             coverage = textureSampleLevel(t_trans, s_diffuse, buv, enh.led.y).a;
         }
         coverage = smoothstep(0.32, 0.68, coverage);
@@ -522,7 +544,7 @@ fn shade_enhanced(in: FsIn, puddle_weight: ptr<function, vec2<f32>>, capture: bo
     // setting does not bite, the plain (anisotropic) sample of the hardware is the better
     // one and stays.
     let pic_lod = led_lod(duv, vec2<f32>(textureDimensions(t_diffuse)));
-    let led_pic = material.emissive.w < -1.5 && enh.led.y < pic_lod;
+    let led_pic = led_dots() && enh.led.y < pic_lod;
     var tex = diffuse_border(textureSample(t_diffuse, s_diffuse, duv), duv);
     if (led_pic) {
         tex = diffuse_border(textureSampleLevel(t_diffuse, s_diffuse, duv, enh.led.y), duv);
@@ -536,7 +558,7 @@ fn shade_enhanced(in: FsIn, puddle_weight: ptr<function, vec2<f32>>, capture: bo
         // (an LED panel's `\S:n` mask is taken the same way: the dots stay dots when the
         // panel is small, without the full-resolution shimmer)
         var tm = sample_transmap(buv);
-        if (material.emissive.w < -1.5 && enh.led.y < msk_lod) {
+        if (led_dots() && enh.led.y < msk_lod) {
             tm = textureSampleLevel(t_trans, s_diffuse, buv, enh.led.y);
         }
         tex.a = select(1.0, tm.a, material.params.w > 0.5);
@@ -664,11 +686,20 @@ fn shade_enhanced(in: FsIn, puddle_weight: ptr<function, vec2<f32>>, capture: bo
     }
     var albedo = tex.rgb * material.color.rgb;
     var detail_factor = 1.0;
+    // how the sun's highlight varies over the ground: the road's grain and its patches take
+    // the highlight apart (1 = even, as it was: a plain white veil)
+    var spec_var = 1.0;
     if (camera.flags.x > 0.5 && (terrain || in.params2.w > 0.5)) {
         let k = clamp(1.0 - (dist - 25.0) / 120.0, 0.0, 1.0);
         let pattern_xy = world_pattern_xy(in.world);
         detail_factor = 1.0 + (detail_noise(pattern_xy) - 0.5) * 0.42 * k;
         albedo = albedo * detail_factor;
+        // (a grain of 6 cm, faded out where a pixel no longer resolves it; its mean is 1, so
+        // the highlight keeps its energy and only breaks up)
+        let wg = max(fwidth(pattern_xy).x, fwidth(pattern_xy).y);
+        let fg = 1.0 - smoothstep(0.3, 1.2, wg * 17.0);
+        let grain = mix(1.0, 0.45 + 1.1 * vnoise_f(pattern_xy, 17.0, vec2<f32>(0.0)), fg);
+        spec_var = clamp(detail_factor * detail_factor * grain, 0.35, 1.9);
     }
     // --- the material in physical terms
     var refl = 0.0;
@@ -720,6 +751,8 @@ fn shade_enhanced(in: FsIn, puddle_weight: ptr<function, vec2<f32>>, capture: bo
     // `foo_orm`: see omsi_texture::pbr): the normal map bends the normal, the packed map
     // gives the occlusion, roughness and metalness in place of the guesses above
     var pbr_ao = 1.0;
+    // (a PBR set's own roughness is the author's: left as it is)
+    let pbr_set = (material.pbr.z > 0.5 || material.pbr.w > 0.5) && !terrain;
     if (material.pbr.x > 0.5 && !terrain) {
         var tn = textureSample(t_pbr_normal, s_diffuse, duv).xyz * 2.0 - vec3<f32>(1.0);
         // (an OpenGL-style map, green up: `_gl` in its name)
@@ -807,6 +840,16 @@ fn shade_enhanced(in: FsIn, puddle_weight: ptr<function, vec2<f32>>, capture: bo
         let spread = min((dot(dndx, dndx) + dot(dndy, dndy)) * 2.0, 0.4);
         rough = sqrt(min(rough * rough + spread, 1.0));
     }
+    // A plain rough surface (no mirror, no wet sheen) goes rougher with the distance and at
+    // a grazing view, where its unresolved grain and the road's texture scatter the highlight
+    // wider than any one normal says: a flat road far down the street kept the sharp lobe of
+    // the near one (its normal never varies, so the specular antialiasing below sees no
+    // curvature to widen it with). Only ever rougher, never smoother.
+    if (!reflective_env && !glass && !is_water && !thin && rough > 0.45 && wet_road < 0.01 && puddle < 0.01 && !pbr_set) {
+        let nv_g = clamp(dot(n, v), 1e-4, 1.0);
+        let wide = max(smoothstep(80.0, 320.0, dist) * 0.6, (1.0 - smoothstep(0.03, 0.2, nv_g)) * 0.5);
+        rough = mix(rough, max(rough, 0.96), wide);
+    }
     var sf: Surface;
     sf.albedo = albedo * (1.0 - metal);
     sf.f0 = f0;
@@ -850,7 +893,7 @@ fn shade_enhanced(in: FsIn, puddle_weight: ptr<function, vec2<f32>>, capture: bo
             // the sun is a disc, not a point: no highlight sharper than it
             let a = max(rough * rough, 0.012);
             let h = normalize(s + v);
-            let spec = d_ggx(max(dot(n, h), 0.0), a) * v_smith(nv, nl, a) * f_schlick(f0, dot(v, h));
+            let spec = d_ggx(max(dot(n, h), 0.0), a) * v_smith(nv, nl, a) * f_schlick_sun(f0, rough, dot(v, h)) * mix(spec_var, 1.0, clamp(wet_road, 0.0, 1.0));
             direct = e_sun * nl * (sf.albedo / PI * (vec3<f32>(1.0) - f_schlick(f0, nl)) + spec);
         }
     }
@@ -1039,7 +1082,7 @@ fn shade_enhanced(in: FsIn, puddle_weight: ptr<function, vec2<f32>>, capture: bo
         let night = clamp(camera.sun_color.w, 0.0, 1.0);
         let left = (vec3<f32>(1.0) - clamp(cabin_light, vec3<f32>(0.0), vec3<f32>(1.0))) * (0.12 + 0.88 * night);
         let w = lm * left * clamp(in.params2.x, 0.0, 1.0);
-        if (material.emissive.w < -1.5) {
+        if (led_dots()) {
             emit = emit + tex.rgb * w * max(enh.exposure.z * 2.0, 0.6);
         } else {
             // ... and as there it lifts the surface to its texture's own colour at the
@@ -1061,7 +1104,20 @@ fn shade_enhanced(in: FsIn, puddle_weight: ptr<function, vec2<f32>>, capture: bo
         // white light map's, so it goes out with that map's variable (the busbar, the
         // lights) as the Omsi.exe stage does.
         let lm_gate = select(1.0, clamp(in.params2.x, 0.0, 1.0), material.params2.x > 0.5);
-        emit = emit + tex.rgb * enh.led.x * alpha * lm_gate * max(enh.exposure.z * 2.0, 0.8);
+        // (a material that was asked to glow by hand burns where its own light map or
+        // night map is lit; with neither, all over)
+        var lw = 1.0;
+        if (led_forced() && !terrain) {
+            if (material.params2.x > 0.5) {
+                let lmc = textureSample(t_light, s_diffuse, buv).rgb;
+                lw = max(lmc.r, max(lmc.g, lmc.b));
+            } else if (material.extra.w > 0.5) {
+                let sw = material.extra.w > 1.5;
+                let nmc = sample_nightmap(buv).rgb * select(camera.sun_color.w, 1.0, sw) * select(clamp(in.params2.y, 0.0, 1.0), 1.0, sw);
+                lw = max(nmc.r, max(nmc.g, nmc.b));
+            }
+        }
+        emit = emit + tex.rgb * enh.led.x * alpha * lm_gate * led_level() * lw * max(enh.exposure.z * 2.0, 0.8);
     } else if (material.emissive.w < -0.5) {
         // a display's text (see MaterialExtra::display)
         emit = emit + tex.rgb * 0.35 * max(enh.exposure.z * 2.0, 0.8);

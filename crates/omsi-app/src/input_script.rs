@@ -1818,6 +1818,10 @@ impl App {
 
     pub(crate) fn close_game_menu(&mut self) {
         self.key_capture = None;
+        // (a field of the destination window left half typed)
+        if self.dest_form.field.take().is_some() {
+            self.menu_edit = None;
+        }
         if self.menu_edit_icao {
             if let Some(w)=self.window.as_ref(){w.set_ime_allowed(false);}
             self.menu_edit_icao=false; self.menu_edit=None;
@@ -1943,15 +1947,83 @@ impl App {
         self.refresh_list();
     }
 
+    /// A click on box `i` of the destination form: typing starts in it.
+    pub(crate) fn dest_field_click(&mut self, i: usize) {
+        crate::game_lists::dest_begin(self, i.min(2) as u8);
+        log::info!("destination form: box {i} clicked (typing: {:?})", self.dest_form.field);
+        self.refresh_list();
+    }
+
+    /// The open list and the menu under it are closed: back to the game (what a pick from
+    /// the list does when it is done).
+    pub(crate) fn close_list_menu(&mut self) {
+        self.chooser = None;
+        self.admin_list = None;
+        self.list_kind = None;
+        self.close_game_menu();
+    }
+
+    /// A click on button `j` of the destination form: Select, Clear display, Close.
+    pub(crate) fn dest_button_click(&mut self, j: usize) {
+        log::info!("destination form: button {j} clicked");
+        match j {
+            0 => {
+                if crate::game_lists::dest_select(self) {
+                    self.close_list_menu();
+                } else {
+                    self.refresh_list();
+                }
+            }
+            1 => {
+                crate::game_lists::dest_clear(self);
+                self.close_list_menu();
+            }
+            _ => self.close_list_menu(),
+        }
+    }
+
+    /// Whether the open list has text typed into it by `route_edit_key` / `route_edit_text`:
+    /// the route numbers and the destination window's fields.
+    pub(crate) fn route_edit_list(&self) -> bool {
+        matches!(self.list_kind, Some(crate::game_lists::ListKind::RouteNumbers | crate::game_lists::ListKind::Destinations))
+    }
+
+    /// Most characters of what is typed: a route number is short, a line of the custom
+    /// destination as long as a display takes.
+    fn route_edit_limit(&self) -> usize {
+        match (&self.list_kind, self.dest_form.field) {
+            (Some(crate::game_lists::ListKind::Destinations), Some(1 | 2)) => 40,
+            _ => 8,
+        }
+    }
+
     /// A key while a route number is typed in the destination list (#836). Printable
     /// text comes through `route_edit_text` so keyboard layouts and symbols are preserved;
     /// physical key codes remain a fallback for platforms that do not provide text.
     fn route_edit_key(&mut self, code: KeyCode) {
         match code {
-            KeyCode::Escape => self.menu_edit = None,
+            KeyCode::Escape => {
+                self.menu_edit = None;
+                self.dest_form.field = None;
+            }
             KeyCode::Backspace | KeyCode::Delete => {
                 if let Some(t) = self.menu_edit.as_mut() {
                     t.pop();
+                }
+            }
+            KeyCode::Tab if matches!(self.list_kind, Some(crate::game_lists::ListKind::Destinations)) => {
+                crate::game_lists::dest_next_field(self);
+            }
+            KeyCode::Enter | KeyCode::NumpadEnter if matches!(self.list_kind, Some(crate::game_lists::ListKind::Destinations)) => {
+                // a field of the destination form: the next one is typed in; Enter in the last
+                // one is the "Select" button
+                if self.dest_form.field == Some(2) {
+                    if crate::game_lists::dest_select(self) {
+                        self.close_list_menu();
+                        return;
+                    }
+                } else {
+                    crate::game_lists::dest_next_field(self);
                 }
             }
             KeyCode::Enter | KeyCode::NumpadEnter => {
@@ -1962,8 +2034,9 @@ impl App {
                 return;
             }
             _ => {
+                let limit = self.route_edit_limit();
                 if let (Some(c), Some(t)) = (route_char(code), self.menu_edit.as_mut()) {
-                    if t.chars().count() < 8 {
+                    if t.chars().count() < limit {
                         t.push(c);
                     }
                 }
@@ -1975,12 +2048,13 @@ impl App {
     /// Text entered in OMSI's free route-number field. It is intentionally not restricted
     /// to letters and digits: add-on displays use values such as `-10` and other symbols.
     pub(crate) fn route_edit_text(&mut self, text: &str) {
-        if !matches!(self.list_kind, Some(crate::game_lists::ListKind::RouteNumbers)) || self.menu_edit.is_none() {
+        if !self.route_edit_list() || self.menu_edit.is_none() {
             return;
         }
+        let limit = self.route_edit_limit();
         if let Some(t) = self.menu_edit.as_mut() {
             for c in text.chars().filter(|c| !c.is_control()) {
-                if t.chars().count() >= 8 {
+                if t.chars().count() >= limit {
                     break;
                 }
                 t.push(c);
@@ -2178,11 +2252,17 @@ impl App {
         if self.menu_edit.is_some() {
             if self.menu_edit_icao {
                 self.icao_edit_key(code);
-            } else if matches!(self.list_kind, Some(crate::game_lists::ListKind::RouteNumbers)) {
+            } else if self.route_edit_list() {
                 self.route_edit_key(code);
             } else {
                 self.time_edit_key(code);
             }
+            return;
+        }
+        // (the destination list: Tab goes to the form's first box)
+        if matches!(code, KeyCode::Tab) && matches!(self.list_kind, Some(crate::game_lists::ListKind::Destinations)) {
+            crate::game_lists::dest_begin(self, 0);
+            self.refresh_list();
             return;
         }
         let n = self.admin_list.as_ref().unwrap_or(&self.vehicle_list).len().max(1);
@@ -3030,7 +3110,11 @@ impl App {
                 self.set_info_bar(!self.info_bar);
                 self.close_game_menu();
             }
-            "refuel" | "wash" | "repair" => {
+            "refuel" => {
+                self.close_game_menu();
+                self.toggle_pump();
+            }
+            "wash" | "repair" => {
                 self.close_game_menu();
                 self.run_service(id);
             }
@@ -3430,13 +3514,40 @@ impl App {
         }
     }
 
+    /// The menu's Refuel button: a switch, as in OMSI. On, the pump runs every frame (see
+    /// `services::pump_frame`) until it is pressed again or the bus leaves the station.
+    pub(crate) fn toggle_pump(&mut self) {
+        if self.pump {
+            self.pump = false;
+            self.service_msg = Some((omsi_ui::tr("Refuelling stopped").into_owned(), 3.0));
+            return;
+        }
+        let (Some(w), Some(p)) = (self.world.as_ref(), self.player.as_ref()) else { return };
+        if !at_petrol_station(w, &p.vehicle) {
+            self.service_msg = Some((omsi_ui::tr("Refuel and wash only at a petrol station or in the depot's wash yard").into_owned(), 4.0));
+            return;
+        }
+        self.pump = true;
+        self.service_msg = Some((omsi_ui::tr("Refuelling").into_owned(), 2.0));
+    }
+
     /// One of the depot services of the game menu: "refuel", "wash" or "repair" (and the quick
     /// menu's "washfuel": both refuelling and washing).
     pub(crate) fn run_service(&mut self, kind: &str) {
+        // Refuelling is never a one-shot: it is the per-frame `veh_tank` pump toggle, so the
+        // vehicle script does its own tanking (and whatever else it does) at its own pace.
+        if kind == "refuel" {
+            self.toggle_pump();
+            return;
+        }
+        if kind == "washfuel" && self.pump {
+            self.toggle_pump(); // second click: stop
+            return;
+        }
         let Some(w) = self.world.clone() else { return };
         let Some(p) = self.player.as_mut() else { return };
         let one = Args {
-            refuel: kind == "refuel" || kind == "washfuel",
+            refuel: false,
             wash: kind == "wash" || kind == "washfuel",
             repair: kind == "repair",
             ..self.args.clone()
@@ -3459,6 +3570,9 @@ impl App {
         let shown = if kind == "washfuel" { msg.iter().take(2).cloned().collect::<Vec<_>>().join(" · ") } else { msg.first().cloned().unwrap_or_default() };
         if !shown.is_empty() {
             self.service_msg = Some((shown, 6.0));
+        }
+        if kind == "washfuel" {
+            self.toggle_pump(); // starts the pump (shows the station message if not at one)
         }
     }
 
@@ -4183,6 +4297,8 @@ impl App {
             || u.menu_pane.iter().any(|r| inside(r))
             || u.menu_pane_go.as_ref().is_some_and(|r| inside(r))
             || u.menu_time.iter().any(|r| inside(r))
+            || u.menu_form_fields.iter().any(|r| inside(r))
+            || u.menu_form_buttons.iter().any(|r| inside(r))
             || u.menu_ctl.iter().flatten().any(|r| inside(r))
             || u.menu_rects.iter().enumerate().any(|(i, r)| inside(r) && !self.menu_item_off(i + u.menu_start));
         if clickable {

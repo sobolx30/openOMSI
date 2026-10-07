@@ -150,6 +150,8 @@ pub(crate) struct App {
     /// The digits of a time being typed in the world page of the game menu (None: not typing).
     pub(crate) menu_edit: Option<String>,
     pub(crate) menu_edit_icao: bool,
+    /// The destination window's fields (route number, the custom destination's two lines).
+    pub(crate) dest_form: crate::game_lists::DestForm,
     /// The vehicle being chosen in "Place a vehicle" takes the place of the one driven
     /// (the game menu's "Swap for another vehicle", #728).
     pub(crate) swap_pending: bool,
@@ -307,6 +309,8 @@ pub(crate) struct App {
     pub(crate) fps_t: Instant,
     /// Last workshop / fuel pump / wash message, and how long it still shows.
     pub(crate) service_msg: Option<(String, f32)>,
+    /// The fuel pump is switched on (see `services::pump_frame`).
+    pub(crate) pump: bool,
     /// The server's notifications on the screen (`notify`), oldest first.
     pub(crate) notices: Vec<crate::ui::Notice>,
     /// What the log has said (see applog.rs).

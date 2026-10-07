@@ -8,6 +8,12 @@ Every push to `main` is released as `MAJOR.MINOR.COMMIT` (see
 
 ### Added
 
+* **`[led_glow_effect]`** (0-1, in a `[matl]` block): the material's lit parts glow like an LED
+  panel's dots in the enhanced picture, at that fraction of the *LED glow* setting; 0 keeps the glow
+  off it. It works on any material of a vehicle or a scenery object - with a light map it glows where
+  that is lit, with a night map by that, with neither all over. See MODDING.md. (`omsi-model`,
+  `scene.rs`, `enhanced.wgsl`, `post.wgsl`)
+
 * A **trip summary** window when a trip is over (the bus stopped at its last stop with a passenger
   door open): the line and the tour's number and a table of the stops - planned and real arrival,
   difference, planned and real departure, difference and the bus's odometer, `---` where a stop was
@@ -25,6 +31,10 @@ Every push to `main` is released as `MAJOR.MINOR.COMMIT` (see
   game drives free as *Free drive* in the list of lines does. (`quick_menu.rs`)
 
 ### Changed
+
+* The LED glow is no longer given automatically to every material with a `\S:n` transmap and a
+  white light map: only a material with `[led_glow_effect]` glows. A panel of a mod that should
+  keep its glow needs the key in its `model.cfg`.
 
 * The tour's next trip begins as soon as the bus has stopped at the last stop of a trip with a
   passenger door open, as in OMSI 2 (before: only after the bus had left the terminus by 60 m, within

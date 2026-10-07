@@ -392,6 +392,14 @@ pub struct Preview {
 }
 
 
+/// The form beside the list of destinations: a title, the text boxes (label, text, being
+/// typed in) and the buttons under them.
+pub struct FormView {
+    pub title: String,
+    pub fields: Vec<(String, String, bool)>,
+    pub buttons: Vec<String>,
+}
+
 /// A drop-down open over a row of a settings window: the entries, the one the keyboard is
 /// on, the first one shown and the one in force now.
 pub struct DropdownView<'a> {
@@ -459,6 +467,8 @@ pub struct Frame<'a> {
     pub menu_head: Option<(String, String)>,
     /// The timetable of the chosen line or tour, beside the list.
     pub menu_preview: Option<Preview>,
+    /// The form beside the destinations (the route number, the two lines of a destination).
+    pub menu_form: Option<FormView>,
     /// The first stop shown of the timetable beside the tours, when the wheel has scrolled it
     /// (`None`: the stop chosen is kept in view).
     pub pane_first: Option<usize>,
@@ -500,6 +510,9 @@ pub struct Ui {
     pub menu_pane_scroll: Option<([f32; 4], [f32; 4], usize, usize)>,
     /// The two arrows beside the time of a tour: the trip before, the next one.
     pub menu_time: Vec<[f32; 4]>,
+    /// The text boxes and the buttons of the destination form, where they were drawn.
+    pub menu_form_fields: Vec<[f32; 4]>,
+    pub menu_form_buttons: Vec<[f32; 4]>,
     /// The colours and positions of the menu's parts that ease to their new state (a line's
     /// light, a switch's knob ...), by what they belong to.
     anim: std::collections::HashMap<u64, f32>,
@@ -577,6 +590,8 @@ impl Ui {
             .chain(self.menu_side.iter_mut())
             .chain(self.menu_pane.iter_mut())
             .chain(self.menu_time.iter_mut())
+            .chain(self.menu_form_fields.iter_mut())
+            .chain(self.menu_form_buttons.iter_mut())
             .chain(self.dd_rects.iter_mut())
             .chain(self.menu_ctl.iter_mut().flatten())
             .chain(self.menu_scroll_thumb.iter_mut())
@@ -608,7 +623,7 @@ impl Ui {
         self.chat.rect[2] += x;
     }
     pub fn new() -> Option<Ui> {
-        Some(Ui { origin_x: 0.0, text: TextCache::new()?, chat: ChatWidget::default(), menu_rects: Vec::new(), menu_arrows: Vec::new(), menu_scroll_thumb: None, menu_scroll_track: None, menu_ctl: Vec::new(), dd_rects: Vec::new(), dd_top: 0, dd_rows: 8, dd_scroll: None, menu_side: Vec::new(), menu_pane: Vec::new(), menu_pane_start: 0, menu_pane_go: None, menu_pane_box: None, menu_pane_scroll: None, menu_time: Vec::new(), anim: Default::default(), anim_dt: 0.0, menu_overlay_range: 0..0, vr_cursor_overlay: None, vr_tooltip_overlay: None, menu_start: 0, menu_rows: 0, menu_row_h: 1.0, images: Default::default(), info_rect: None })
+        Some(Ui { origin_x: 0.0, text: TextCache::new()?, chat: ChatWidget::default(), menu_rects: Vec::new(), menu_arrows: Vec::new(), menu_scroll_thumb: None, menu_scroll_track: None, menu_ctl: Vec::new(), dd_rects: Vec::new(), dd_top: 0, dd_rows: 8, dd_scroll: None, menu_side: Vec::new(), menu_pane: Vec::new(), menu_pane_start: 0, menu_pane_go: None, menu_pane_box: None, menu_pane_scroll: None, menu_time: Vec::new(), menu_form_fields: Vec::new(), menu_form_buttons: Vec::new(), anim: Default::default(), anim_dt: 0.0, menu_overlay_range: 0..0, vr_cursor_overlay: None, vr_tooltip_overlay: None, menu_start: 0, menu_rows: 0, menu_row_h: 1.0, images: Default::default(), info_rect: None })
     }
 
     /// Draw the frame's interface: its overlays go after the HUD's in `scene.overlays`.
@@ -1448,6 +1463,8 @@ impl Ui {
         self.menu_pane_box = None;
         self.menu_pane_scroll = None;
         self.menu_time.clear();
+        self.menu_form_fields.clear();
+        self.menu_form_buttons.clear();
         self.menu_scroll_thumb = None;
         self.menu_scroll_track = None;
         self.dd_rects.clear();
@@ -1476,7 +1493,14 @@ impl Ui {
         // the timetable beside the list, where the window is wide enough
         let preview = f.menu_preview.as_ref().filter(|_| !f.vr && f.width >= 760.0 * s);
         let timetable_kind = matches!(kind, MenuKind::Lines | MenuKind::Tours);
-        let pane_w = if preview.is_some() { (if timetable_kind { 320.0 } else { 340.0 }) * s } else { 0.0 };
+        let form = f.menu_form.as_ref();
+        let pane_w = if preview.is_some() {
+            (if timetable_kind { 320.0 } else { 340.0 }) * s
+        } else if form.is_some() {
+            300.0 * s
+        } else {
+            0.0
+        };
         let want = if timetable_kind { 360.0 * s } else { 380.0 * s };
         let w = (want + pane_w).min(f.width - 24.0 * s).max(200.0 * s);
         let list_w = w - pane_w;
@@ -1854,6 +1878,52 @@ impl Ui {
                 }
             }
         }
+        // the destination display's form beside its list: boxes for the route number and the
+        // two lines of a destination, and the buttons under them
+        if let Some(fv) = form {
+            let (px0, py0) = (list_r + 4.0 * s, y + header_h);
+            let (px1, py1) = (x + w - pad, y + h - pad);
+            self.text.rounded(r, scene, [px0 - 1.0, py0 - 1.0, px1 + 1.0, py1 + 1.0], CARD_R * s + 1.0, BORDER);
+            self.text.rounded(r, scene, [px0, py0, px1, py1], CARD_R * s, PANEL_ALT);
+            let ipad = tin;
+            let inner = px1 - px0 - ipad * 2.0;
+            let mut top = py0 + 18.0 * s;
+            let head = clip_to(&self.text, &fv.title, 16.0 * s, inner);
+            self.put(r, scene, &head, (16.0 * s) as u32, WHITE, px0 + ipad, top + 8.0 * s);
+            top += 30.0 * s;
+            let lpx = (11.0 * s) as u32;
+            let vpx = (15.0 * s) as u32;
+            let box_h = 36.0 * s;
+            for (i, (label, value, active)) in fv.fields.iter().enumerate() {
+                let lab = clip_to(&self.text, label, lpx as f32, inner);
+                self.put(r, scene, &lab, lpx, MUTED, px0 + ipad, top + 6.0 * s);
+                top += 16.0 * s;
+                let rect = [px0 + ipad, top, px1 - ipad, top + box_h];
+                let a = self.easeq((15, "form", i), if *active { 1.0 } else if over(rect) { 0.45 } else { 0.0 }, 1.0 / FADE_SECS);
+                self.text.rounded(r, scene, [rect[0] - 1.0, rect[1] - 1.0, rect[2] + 1.0, rect[3] + 1.0], ROW_R * s + 1.0, mix([62, 62, 62, 255], ACCENT, a));
+                self.text.rounded(r, scene, rect, ROW_R * s, PANEL);
+                let room = rect[2] - rect[0] - 20.0 * s;
+                let shown = if *active { tail_to(&self.text, &format!("{value}_"), vpx as f32, room) } else { clip_to(&self.text, value, vpx as f32, room) };
+                self.put(r, scene, &shown, vpx, if *active { WHITE } else { SOFT }, rect[0] + 10.0 * s, (rect[1] + rect[3]) * 0.5);
+                self.menu_form_fields.push(rect);
+                top += box_h + 12.0 * s;
+            }
+            let bh = 34.0 * s;
+            let gap_b = 8.0 * s;
+            let nb = fv.buttons.len();
+            let mut by = py1 - 12.0 * s - bh * nb as f32 - gap_b * nb.saturating_sub(1) as f32;
+            for (j, label) in fv.buttons.iter().enumerate() {
+                let rect = [px0 + ipad, by, px1 - ipad, by + bh];
+                let a = self.easeq((17, "formbtn", j), if over(rect) { 1.0 } else { 0.0 }, 1.0 / FADE_SECS);
+                let (fill, ink) = if j == 0 { (mix(ACCENT, ACCENT_HOT, a), ON_ACCENT) } else { (mix(LIT, SELECTED, a), mix(SOFT, WHITE, a)) };
+                self.text.rounded(r, scene, rect, ROW_R * s, fill);
+                let l = self.text.label(r, scene, label, (14.0 * s) as u32 | BOLD, ink);
+                let (gx, gy) = (rect[0] + (rect[2] - rect[0] - l.w as f32) * 0.5, (rect[1] + rect[3]) * 0.5 - l.h as f32 * 0.5);
+                scene.overlays.push((l.tex, [gx, gy, gx + l.w as f32, gy + l.h as f32]));
+                self.menu_form_buttons.push(rect);
+                by += bh + gap_b;
+            }
+        }
         self.menu_overlay_range = overlay_start..scene.overlays.len();
     }
 }
@@ -2161,6 +2231,16 @@ fn wrap(tc: &TextCache, text: &str, px: f32, width: f32) -> Vec<String> {
         out.push(line);
     }
     out
+}
+
+/// The end of `text` that fits `width` pixels (what is typed in a box: its cursor stays in view).
+fn tail_to(tc: &TextCache, text: &str, px: f32, width: f32) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    let mut start = 0;
+    while start < chars.len() && tc.width(&chars[start..].iter().collect::<String>(), px) > width {
+        start += 1;
+    }
+    chars[start..].iter().collect()
 }
 
 /// `text` cut at the end to fit `width` pixels ("…").

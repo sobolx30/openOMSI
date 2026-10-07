@@ -131,7 +131,7 @@ impl ApplicationHandler for App {
                 if event.state == ElementState::Pressed
                     && self.menu_edit.is_some()
                     && !self.menu_edit_icao
-                    && matches!(self.list_kind, Some(crate::game_lists::ListKind::RouteNumbers))
+                    && self.route_edit_list()
                 {
                     if let Some(text) = event.text.as_deref() {
                         if text.chars().any(|c| !c.is_control()) {
@@ -963,6 +963,10 @@ impl ApplicationHandler for App {
                         if let Some(w) = self.world.as_ref() {
                             crate::rail_drive::frame(p, self.traffic.as_ref().map(|t| &t.net), w, dt);
                         }
+                    }
+                    // the fuel pump, when it is switched on: its trigger once a frame
+                    if self.pump && !self.paused {
+                        crate::services::pump_frame(&mut self.pump, self.world.as_deref(), &mut p.vehicle, dt as f32, &mut self.service_msg);
                     }
                     // a script that set the time of day (`(S.S.Time)`) moves the game's clock
                     if let Some(t) = p.vehicle.host.time_written.take() {
@@ -1972,6 +1976,7 @@ impl ApplicationHandler for App {
                     if let Some(wt) = &self.weather {
                         let (kind, rate) = precip_of(wt);
                         self.rain.set(kind, rate);
+                        self.rain.set_light(crate::rain::flake_light(&daylight));
                         // [wind] direction (deg) speed (m/s)
                         let wind = Vec3::new(
                             wt.wind.0.to_radians().sin() * wt.wind.1,
@@ -2303,6 +2308,7 @@ impl ApplicationHandler for App {
                             }
                         }
                     }
+                    let menu_form = crate::game_lists::dest_form_view(self.player.as_ref(), self.menu_edit.as_ref(), &self.dest_form, self.list_kind.as_ref());
                     if let (Some(ui), Some(s)) = (self.ui.as_mut(), self.surface.as_ref()) {
                         let scale = self.window.as_ref().map(|w| w.scale_factor() as f32).unwrap_or(1.0);
                         let (w, h) = (hud[2], hud[3]);
@@ -2399,6 +2405,7 @@ impl ApplicationHandler for App {
                             menu_kind,
                             menu_head,
                             menu_preview,
+                            menu_form,
                             pane_first: self.pane_scroll.filter(|p| Some(p.0) == chooser_sel).map(|p| p.1),
                             menu_tabs,
                             dropdown,
@@ -3269,6 +3276,25 @@ impl App {
                     });
                     if let Some(i) = pane {
                         self.tour_pane_click(i);
+                        return;
+                    }
+                }
+
+                // The destination form beside the list: a text box, or one of its buttons.
+                if self.chooser.is_some() {
+                    let form = self.ui.as_ref().and_then(|u| {
+                        let inside = |r: &[f32; 4]| self.cursor.0 >= r[0] && self.cursor.0 <= r[2] && self.cursor.1 >= r[1] && self.cursor.1 <= r[3];
+                        if let Some(j) = u.menu_form_buttons.iter().position(inside) {
+                            return Some((false, j));
+                        }
+                        u.menu_form_fields.iter().position(inside).map(|i| (true, i))
+                    });
+                    if let Some((is_field, i)) = form {
+                        if is_field {
+                            self.dest_field_click(i);
+                        } else {
+                            self.dest_button_click(i);
+                        }
                         return;
                     }
                 }

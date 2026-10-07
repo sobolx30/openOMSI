@@ -91,6 +91,42 @@ Normal, roughness, metalness and occlusion maps beside a texture, up to 4096 × 
   `[spotlight]`'s, it is not moved onto the vehicle's front. A rear section's model may have
   its own; their variables are the bus's.
 
+## LED glow: set by hand, per material
+
+In the enhanced picture a material can glow like the dots of an LED destination panel: its lit
+parts burn above their colour and the glow draws a halo around them. Nothing is guessed from the
+material any more - a `\S:n` script mask does not make a panel glow by itself. Give the material the
+key `[led_glow_effect]` and a number from 0 to 1 on the next line, inside its `[matl]` block:
+
+```
+[matl]
+vmatrix_led.bmp
+0
+[matl_transmap]
+\S:1
+[matl_lightmap]
+vmatrix_leer_led_LM.png
+elec_busbar_main
+[led_glow_effect]
+1
+```
+
+- `0` keeps the glow off the material; `1` is a panel at the strength of the player's *LED glow*
+  setting; a number between scales that strength and the halo with it. The halo is strong - a
+  large surface is best given 0.1-0.4.
+- Without the key the material does not glow, whatever it carries. This is a change from earlier
+  versions, where every `\S:n` panel with a white light map glowed: add the key to a panel that
+  should.
+- It works on any material of a vehicle or a scenery object, not only on a script's display. A
+  material with a `[matl_lightmap]` glows where its light map is lit (and its variable switches
+  it); one with only a `[matl_nightmap]` glows by the night map, at night or when the night map is
+  switched on; with neither, all over, in the colour of its texture.
+- A material with a `\S:n` transmap keeps its dots sharp as the *LED mip strength* setting says.
+  A material without one is filtered as usual.
+- The glow follows the player's *LED glow* setting (0 = off for every material), and a
+  `[matl_item]` takes the key of its base material unless it has its own.
+- OMSI 2 ignores the key.
+
 ## Screens: static cameras
 
 `[add_camera_reflexion_static]` in the `.bus` adds a camera for a screen - a CCTV monitor

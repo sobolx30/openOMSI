@@ -219,6 +219,7 @@ fn is_white_lightmap(rgba: &[u8]) -> bool {
 
 /// [`is_white_lightmap`] of the light map `name` (found in `dirs`, read once per file);
 /// `None` when the file is not there.
+#[allow(dead_code)]
 fn lightmap_is_white(name: &str, dirs: &[&Path]) -> Option<bool> {
     static WHITE: std::sync::OnceLock<Mutex<HashMap<PathBuf, bool>>> = std::sync::OnceLock::new();
     let path = omsi_texture::find_texture(name, dirs)?;
@@ -7424,7 +7425,8 @@ impl World {
                                         .cloned()
                                         .unwrap_or_default();
                                     let alpha = text_alpha(o3d_mats, slot, overrides);
-                                    let key = scenery_text_key(tt, &text, alpha);
+                                    let emissive = text_emissive(o3d_mats, slot, overrides);
+                                    let key = scenery_text_key(tt, &text, alpha, emissive);
                                     if let Some(e) = gpu.text_textures.get_mut(&key) {
                                         e.2 += 1;
                                         let mat = e.1;
@@ -7447,12 +7449,17 @@ impl World {
                                     let tex = gpu.add_image(renderer, scene, &image, true);
                                     // (lit like the rest of the object: Omsi.exe only swaps
                                     // the slot's texture, a sign does not shine at night)
-                                    let mat = renderer.add_material(
+                                    let mat = renderer.add_material_all(
                                         scene,
                                         Some(tex),
                                         alpha,
                                         [1.0; 4],
                                         false,
+                                        None,
+                                        None,
+                                        None,
+                                        None,
+                                        emissive,
                                     );
                                     let mat = gpu.material(renderer, scene, mat);
                                     gpu.text_textures.insert(key.clone(), (tex, mat, 1));
@@ -8111,7 +8118,8 @@ impl World {
                 };
                 let text = tt.variable.trim().parse::<usize>().ok().and_then(|k| strings.get(k)).cloned().unwrap_or_default();
                 let alpha = text_alpha(o3d_mats, slot, overrides);
-                let key = scenery_text_key(tt, &text, alpha);
+                let emissive = text_emissive(o3d_mats, slot, overrides);
+                                    let key = scenery_text_key(tt, &text, alpha, emissive);
                 if let Some(e) = gpu.text_textures.get_mut(&key) {
                     e.2 += 1;
                     let mat = e.1;
@@ -8122,7 +8130,7 @@ impl World {
                 let atlas = self.fonts.lock().get(&tt.font, &|p| omsi_texture::decode_file(p).ok().map(|i| (i.width, i.height, i.rgba)));
                 let image = helper_text_image(tt, atlas.as_deref(), &text).unwrap_or_else(|| scenery_text_image(tt, atlas, &text));
                 let tex = gpu.add_image(renderer, scene, &image, true);
-                let mat = renderer.add_material(scene, Some(tex), alpha, [1.0; 4], false);
+                let mat = renderer.add_material_all(scene, Some(tex), alpha, [1.0; 4], false, None, None, None, None, emissive);
                 let mat = gpu.material(renderer, scene, mat);
                 gpu.text_textures.insert(key.clone(), (tex, mat, 1));
                 tg.texts.push(key);
@@ -10071,7 +10079,21 @@ fn sync_interior_lamps(
         let mut sets: Vec<(usize, Vec<usize>)> = Vec::new();
         for (i, _) in render.instances.iter().enumerate() {
             let Some(vm) = ty.meshes.get(i) else { continue };
-            let set = lamp_set(&ty.model.meshes[vm.def_index].illumination_interior, n);
+            let def = &ty.model.meshes[vm.def_index];
+            let set = lamp_set(&def.illumination_interior, n);
+            // a list that names a lamp the vehicle does not have, or one twice, shades its
+            // mesh by what is left of it: say so once, for the model's author
+            for problem in omsi_model::lamp_list_problems(&def.illumination_interior, n) {
+                // (once for a model, not for every car of it)
+                static WARNED: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+                let key = format!("{}|{}|{problem}", ty.def.path.display(), def.file);
+                let mut warned = WARNED.lock().unwrap_or_else(|e| e.into_inner());
+                if warned.contains(&key) {
+                    continue;
+                }
+                warned.push(key);
+                log::warn!("{}: mesh {} [illumination_interior] {:?}: {problem}; lit by lamps {set:?}", ty.def.path.display(), def.file, def.illumination_interior);
+            }
             if !set.is_empty() {
                 sets.push((i, set));
             }
@@ -10136,7 +10158,8 @@ fn sync_interior_lamps(
                     radius: 100.0,
                     core: il.range.max(0.01),
                     color: [il.color[0] / 255.0, il.color[1] / 255.0, il.color[2] / 255.0],
-                    intensity: if on { 1.0 } else { 0.0 },
+                    // (diagnostic: OMSI_INTERIOR_LAMPS_OFF=1 - every saloon lamp dark)
+                    intensity: if on && !*LAMPS_OFF.get_or_init(|| omsi_cfg::env::var_os("OMSI_INTERIOR_LAMPS_OFF").is_some()) { 1.0 } else { 0.0 },
                     ..Default::default()
                 },
             );
@@ -10144,16 +10167,18 @@ fn sync_interior_lamps(
     }
 }
 
+static LAMPS_OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
 /// The lamps (indices into the model's `[interiorlight]`s) a mesh's or a seat's
 /// `[illumination_interior]` names: those that exist, each once, as many as a mesh may have.
 fn lamp_set(indices: &[i32], n: usize) -> Vec<usize> {
-    let mut set: Vec<usize> = Vec::new();
-    for &k in indices {
-        if k >= 0 && (k as usize) < n && !set.contains(&(k as usize)) && set.len() < omsi_render::MAX_LAMPS_PER_MESH as usize {
-            set.push(k as usize);
-        }
+    // (diagnostic: OMSI_NO_INTERIOR_SETS=1 - no mesh is lit by named lamps, as if every
+    // `[illumination_interior]` were four -1)
+    static NONE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *NONE.get_or_init(|| omsi_cfg::env::var_os("OMSI_NO_INTERIOR_SETS").is_some()) {
+        return Vec::new();
     }
-    set
+    omsi_model::lamp_indices(indices, n, omsi_render::MAX_LAMPS_PER_MESH as usize)
 }
 
 impl VehicleRender {
@@ -10356,7 +10381,11 @@ fn material_extra(
         water: false,
         display: false,
         screen: false,
-        led: false,
+        // (by hand only here; a vehicle's `\S:n` panels are guessed at by the caller)
+        led: ov.iter().rev().find_map(|o| o.led_glow).is_some_and(|v| v > 0.0),
+        // `[led_glow_effect]`: the author's word on the glow, the last one of the slot's blocks
+        led_forced: ov.iter().any(|o| o.led_glow.is_some()),
+        led_level: ov.iter().rev().find_map(|o| o.led_glow).unwrap_or(1.0),
         no_map_lights: false,
         tree: false,
         moisture: 0.0,
@@ -10491,11 +10520,20 @@ fn text_alpha(materials: &[omsi_o3d::Material], slot: usize, overrides: &[Materi
     }
 }
 
+/// The emissive colour of the slot a text texture is drawn on (its o3d material's, or a
+/// `[matl_allcolor]`'s): the text's own material is made anew, and without this a helper
+/// whose arrow glows (an emissive route arrow) had a dark name on its lit plate.
+fn text_emissive(materials: &[omsi_o3d::Material], slot: usize, overrides: &[MaterialDef]) -> [f32; 3] {
+    let Some(m) = materials.get(slot) else { return [0.0; 3] };
+    let allcolor = overrides.iter().filter(|o| !o.item && omsi_sim::vehicle::override_slot(materials, o) == Some(slot)).find_map(|o| o.allcolor);
+    d3d_material(m, allcolor, true).1
+}
+
 /// Placement is part of the picture: otherwise a centred sign can lend its cached
 /// texture to a left-aligned one showing the same words.
-fn scenery_text_key(tt: &omsi_model::TextTexture, text: &str, alpha: AlphaMode) -> String {
+fn scenery_text_key(tt: &omsi_model::TextTexture, text: &str, alpha: AlphaMode, emissive: [f32; 3]) -> String {
     format!(
-        "{}|{}|{}x{}|{}|{:?}|{:?}|{}|{}",
+        "{}|{}|{}x{}|{}|{:?}|{:?}|{}|{}|{:?}",
         tt.font.to_ascii_lowercase(),
         text,
         tt.width.max(1),
@@ -10505,6 +10543,7 @@ fn scenery_text_key(tt: &omsi_model::TextTexture, text: &str, alpha: AlphaMode) 
         alpha,
         tt.orientation,
         tt.grid,
+        emissive,
     )
 }
 
@@ -10533,8 +10572,10 @@ fn scenery_text_image(
 /// centred, and narrowed to the texture's width. None when the font draws every letter:
 /// that text keeps OMSI's own look.
 fn helper_text_image(tt: &omsi_model::TextTexture, atlas: Option<&omsi_content::font::FontAtlas>, text: &str) -> Option<Image> {
-    let drawable = |c: char| c.is_whitespace() || atlas.is_some_and(|a| a.font.glyph(c).is_some());
-    if text.trim().is_empty() || text.chars().all(drawable) {
+    // '@' is OMSI's line break (`\n`) in a label's string, not a letter: the .oft fonts have
+    // no glyph for it, so it must not count as "undrawable", nor be drawn as a character
+    let drawable = |c: char| c == '@' || c.is_whitespace() || atlas.is_some_and(|a| a.font.glyph(c).is_some());
+    if text.replace('@', "").trim().is_empty() || text.chars().all(drawable) {
         return None;
     }
     static FONTS: std::sync::OnceLock<omsi_ui::Fonts> = std::sync::OnceLock::new();
@@ -10544,28 +10585,38 @@ fn helper_text_image(tt: &omsi_model::TextTexture, atlas: Option<&omsi_content::
     // are 0.7 of its size, so nearly the line height gives letters of the same height)
     let line = atlas.map(|a| a.font.height.max(8) as f32).unwrap_or(h as f32 * 0.2);
     let px = (line * 0.95).min(h as f32);
-    let bmp = fonts.render(text.trim(), px, omsi_ui::Weight::Medium);
-    // too long for the texture: narrowed to fit (columns sampled), the height kept
-    let scale = (w as f32 / bmp.w as f32).min(1.0);
-    let out_w = ((bmp.w as f32 * scale).floor() as u32).max(1);
-    let x0 = (w - out_w.min(w)) / 2;
-    let y0 = (h as i32 - bmp.h as i32) / 2;
     let rgb = if tt.full_color { [255u8; 3] } else { [tt.color[0] as u8, tt.color[1] as u8, tt.color[2] as u8] };
     let mut rgba = vec![0u8; (w * h * 4) as usize];
-    for y in 0..bmp.h as i32 {
-        let dy = y0 + y;
-        if dy < 0 || dy >= h as i32 {
+    // one line per '@', stacked one line height apart and centred as a block, like the
+    // .oft path does (`FontAtlas::render_aligned`)
+    let lines: Vec<&str> = text.split('@').map(str::trim).collect();
+    let lh = if lines.len() > 1 { line.round().max(1.0) as i32 } else { 0 };
+    let block = lh * (lines.len() as i32 - 1);
+    for (i, l) in lines.iter().enumerate() {
+        if l.is_empty() {
             continue;
         }
-        for x in 0..out_w.min(w) {
-            let sx = ((x as f32 + 0.5) / scale) as u32;
-            let a = bmp.alpha[(y as u32 * bmp.w + sx.min(bmp.w - 1)) as usize];
-            if a == 0 {
+        let bmp = fonts.render(l, px, omsi_ui::Weight::Medium);
+        // too long for the texture: narrowed to fit (columns sampled), the height kept
+        let scale = (w as f32 / bmp.w as f32).min(1.0);
+        let out_w = ((bmp.w as f32 * scale).floor() as u32).max(1);
+        let x0 = (w - out_w.min(w)) / 2;
+        let y0 = (h as i32 - bmp.h as i32 - block) / 2 + i as i32 * lh;
+        for y in 0..bmp.h as i32 {
+            let dy = y0 + y;
+            if dy < 0 || dy >= h as i32 {
                 continue;
             }
-            let i = ((dy as u32 * w + x0 + x) * 4) as usize;
-            rgba[i..i + 3].copy_from_slice(&rgb);
-            rgba[i + 3] = a;
+            for x in 0..out_w.min(w) {
+                let sx = ((x as f32 + 0.5) / scale) as u32;
+                let a = bmp.alpha[(y as u32 * bmp.w + sx.min(bmp.w - 1)) as usize];
+                if a == 0 {
+                    continue;
+                }
+                let i = ((dy as u32 * w + x0 + x) * 4) as usize;
+                rgba[i..i + 3].copy_from_slice(&rgb);
+                rgba[i + 3] = rgba[i + 3].max(a);
+            }
         }
     }
     Some(Image { width: w, height: h, rgba, has_alpha: true })
@@ -12098,9 +12149,9 @@ impl World {
                 // a script's screen (matrix displays, the IBIS's picture, LCDs) likewise
                 let mut extra = d.extra;
                 extra.screen = d.script.is_some() || d.script_trans.is_some();
-                // ... and a `\S:n` mask makes it an LED panel: its lit dots are its own
-                // light, which the enhanced picture blooms (see `MaterialExtra::led`)
-                extra.led = d.script_trans.is_some() && d.extra.led;
+                // ... and the author's `[led_glow_effect]` makes it glow (see `MaterialExtra::led`),
+                // as the slot's own material was given it
+                extra.led = d.extra.led;
                 let m = renderer.add_material_extra(
                     scene,
                     tex,
@@ -12459,11 +12510,6 @@ impl World {
                     let lightmap = ov.iter().find_map(|o| o.lightmap.clone()).and_then(|(t, _)| {
                         tex!(&subst(&t), &dirs_ref)
                     });
-                    // (a `\S:n` panel lit all over by its light map is an LED panel; one
-                    // whose light map is a picture is a flipdot: see `is_white_lightmap`)
-                    let lm_white = |ov: &[&MaterialDef]| -> bool {
-                        ov.iter().find_map(|o| o.lightmap.as_ref()).and_then(|(t, _)| lightmap_is_white(&subst(t), &dirs_ref)).unwrap_or(true)
-                    };
                     // [matl_envmap] tex factor: reflectivity = factor (saturating at 1) x the
                     // reflection mask, which is the [matl_envmap_mask]'s alpha or else the
                     // diffuse alpha - 1 for a texture without an alpha channel, as D3D samples
@@ -12506,7 +12552,10 @@ impl World {
                     // without the flags on this `extra` the K++ and Krueger panels showed
                     // their dots but never glowed.
                     extra.screen = script_slot.is_some() || script_trans.is_some();
-                    extra.led = script_trans.is_some() && lm_white(&ov);
+                    // (the glow is the author's to give, with `[led_glow_effect]` on the material:
+                    // 0 off, up to 1 how strongly it burns. A `\S:n` mask no longer makes a panel
+                    // glow by itself)
+                    extra.led = extra.led_forced && extra.led_level > 0.0;
                     if dirt_overlay {
                         extra.no_z_write = true;
                     }
@@ -12605,7 +12654,12 @@ impl World {
                         it_extra.screen = script_item.is_some() || it_script_trans.is_some();
                         // (the item's `\S:n`, or the one it inherits from its base, keeps it
                         // an LED panel: see `MaterialExtra::led`)
-                        it_extra.led = it_script_trans.is_some() && if ov_item.iter().any(|o| o.lightmap.is_some()) { lm_white(ov_item) } else { lm_white(&ov) };
+                        if !it_extra.led_forced {
+                            // (an item without a word of its own keeps its base's)
+                            it_extra.led_forced = extra.led_forced;
+                            it_extra.led_level = extra.led_level;
+                        }
+                        it_extra.led = it_extra.led_forced && it_extra.led_level > 0.0;
                         it_extra.no_z_write |= extra.no_z_write;
                         it_extra.no_z_check |= extra.no_z_check;
                         it_extra.glass |= extra.glass;
@@ -13082,6 +13136,16 @@ mod tests {
         }
         // no font at all (missing from the installation): still readable
         assert!(helper_text_image(&tt, None, "Bauernhof").is_some());
+        // '@' is a line break, never a drawn character: two lines, one above the other
+        assert!(helper_text_image(&tt, Some(&atlas), "Bauernhof@Nord").is_none());
+        assert!(helper_text_image(&tt, Some(&atlas), "@").is_none());
+        let img = helper_text_image(&tt, Some(&atlas), "Улица@Ленина").expect("drawn with the interface font");
+        let rows: Vec<usize> = (0..128 * 128).filter(|&p| img.rgba[p * 4 + 3] > 128).map(|p| p / 128).collect();
+        let (top, bottom) = (*rows.iter().min().unwrap(), *rows.iter().max().unwrap());
+        let one = helper_text_image(&tt, Some(&atlas), "Улица").unwrap();
+        let one_rows: Vec<usize> = (0..128 * 128).filter(|&p| one.rgba[p * 4 + 3] > 128).map(|p| p / 128).collect();
+        assert!(bottom - top > (one_rows.iter().max().unwrap() - one_rows.iter().min().unwrap()) + 15, "two lines are taller than one");
+        assert!(top > 20 && bottom < 108, "block centred: rows {top}..{bottom}");
     }
 
     #[test]

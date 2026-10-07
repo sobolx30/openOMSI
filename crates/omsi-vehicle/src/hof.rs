@@ -75,6 +75,11 @@ pub struct Hof {
     pub info_trips: Vec<InfoTrip>,
     pub info_busstop_lists: Vec<Vec<String>>,
     pub info_busstops: Vec<Vec<String>>,
+    /// Where the virtual termini begin (see [`Hof::with_custom_terminus`]); None: the file
+    /// has none. Never read from a file: they exist only in memory.
+    pub custom_from: Option<usize>,
+    /// Which of the two virtual termini was filled last (0 or 1).
+    pub custom_last: usize,
 }
 
 impl Hof {
@@ -211,6 +216,56 @@ impl Hof {
             }
         }
         h
+    }
+
+    /// The termini the file itself lists (without the virtual ones of
+    /// [`Hof::with_custom_terminus`]): what a destination menu offers.
+    pub fn real_termini(&self) -> &[Terminus] {
+        let end = self.custom_from.unwrap_or(self.termini.len()).min(self.termini.len());
+        &self.termini[..end]
+    }
+
+    /// A copy of this depot file with a destination of the driver's own text, and its
+    /// index: a virtual terminus the bus scripts find by `GetTerminusString` /
+    /// `GetTerminusCode` / `GetTerminusIndex` like any other of the file (the file on disk is
+    /// not touched). `top` is string 1 (the upper line), `bottom` string 2 (the lower one);
+    /// string 0 and the rest stay empty.
+    ///
+    /// Two virtual termini (the codes after the highest of the file, one and two above it)
+    /// are filled in turn: scripts refresh a display when the terminus index or code they
+    /// last saw changes, so a second custom text must not come under the code of the first.
+    /// Each call fills the one not shown now and answers its index.
+    pub fn with_custom_terminus(&self, top: &str, bottom: &str) -> (Hof, usize) {
+        let mut h = self.clone();
+        let slots_there = h.custom_from.is_some_and(|f| h.termini.len() >= f + 2);
+        if !slots_there {
+            // (a file replaced or edited since leaves no stale slots: start from its own termini)
+            let from = h.custom_from.filter(|f| *f <= h.termini.len()).unwrap_or(h.termini.len());
+            h.termini.truncate(from);
+            let base = h.termini.iter().map(|t| t.code).max().unwrap_or(0).max(0);
+            for k in 1..=2 {
+                h.termini.push(Terminus { code: base.saturating_add(k), ..Default::default() });
+            }
+            h.custom_from = Some(from);
+            h.custom_last = 1;
+        }
+        let from = h.custom_from.unwrap_or(0);
+        let slot = 1 - h.custom_last.min(1);
+        let count = h.string_count_terminus.max(3);
+        // As in the depot files (code, ident, then: a full text, the upper line, the lower
+        // line, and what other displays take - pictures, signs): strings 1 and 2 are the
+        // two lines and every other string is empty.
+        let mut strings = vec![String::new(); count];
+        strings[1] = top.to_string();
+        strings[2] = bottom.to_string();
+        let ident = if top.trim().is_empty() { bottom.trim() } else { top.trim() }.to_string();
+        let t = &mut h.termini[from + slot];
+        t.texture_id = ident.clone();
+        t.terminus_stop = Some(ident);
+        t.all_exit = false;
+        t.strings = strings;
+        h.custom_last = slot;
+        (h, from + slot)
     }
 
     pub fn terminus_by_code(&self, code: i32) -> Option<&Terminus> {
@@ -397,6 +452,28 @@ mod tests {
 
         omsi_cfg::remove_content_root(&root);
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn custom_terminus_alternates_two_virtual_slots() {
+        let text = "stringcount_terminus\n3\n[addterminus_list]\n\t10\tA\tAAA\tTOP\tAAA\n\t282\tB\tBBB\t\t\n[end]\n";
+        let h = Hof::parse(&CfgFile::from_str("t.hof", text));
+        assert_eq!(h.termini.len(), 2);
+        let (h1, i1) = h.with_custom_terminus("Upper", "Lower");
+        assert_eq!((i1, h1.termini[i1].code), (2, 283));
+        assert_eq!(h1.termini[i1].strings, vec!["", "Upper", "Lower"]);
+        assert_eq!(h1.real_termini().len(), 2);
+        // the next text goes under the other code, the first one stays as it was
+        let (h2, i2) = h1.with_custom_terminus("X", "Y");
+        assert_eq!((i2, h2.termini[i2].code), (3, 284));
+        assert_eq!(h2.termini[i1].strings[1], "Upper");
+        // and the third back under the first slot: never the same code twice in a row
+        let (h3, i3) = h2.with_custom_terminus("P", "Q");
+        assert_eq!(i3, i1);
+        assert_eq!(h3.termini.len(), 4);
+        assert_eq!(h3.termini[i3].strings, vec!["", "P", "Q"]);
+        // the file's own data is untouched
+        assert_eq!(h3.real_termini(), h.termini.as_slice());
     }
 
     #[test]

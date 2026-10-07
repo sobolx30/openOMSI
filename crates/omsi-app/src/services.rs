@@ -47,6 +47,40 @@ pub(crate) fn at_petrol_station(world: &World, v: &omsi_sim::VehicleInstance) ->
     stations.iter().any(|p| me.separation(p) < 0.0)
 }
 
+/// One frame of the fuel pump (Omsi.exe 0x6fefbc / 0x7d5120). The pump is a switch: the menu
+/// button flips it, and every frame it is on - and the bus stands in the box of a
+/// `[petrolstation]` (0x7d4fb4 works that out each frame) - the bus's `veh_tank` trigger runs
+/// once. Leaving the station, or a bus without the trigger, switches it off by itself; the
+/// script itself decides when the tank is full (the original never stops it either).
+pub(crate) fn pump_frame(
+    pump: &mut bool,
+    world: Option<&World>,
+    v: &mut omsi_sim::VehicleInstance,
+    dt: f32,
+    msg: &mut Option<(String, f32)>,
+) {
+    if !*pump {
+        return;
+    }
+    let Some(world) = world else {
+        *pump = false;
+        return;
+    };
+    if !at_petrol_station(world, v) {
+        *pump = false;
+        *msg = Some((omsi_ui::tr("Refuelling stopped: the vehicle left the petrol station").into_owned(), 4.0));
+        return;
+    }
+    if !v.pump_frame(dt.clamp(0.0, 0.25)) {
+        *pump = false;
+        *msg = Some((omsi_ui::tr("This vehicle has no fuel pump handling (veh_tank)").into_owned(), 4.0));
+        return;
+    }
+    if let Some(c) = v.var("engine_tank_content") {
+        *msg = Some((format!("{}: {c:.0} l", omsi_ui::tr("Refuelling")), 1.0));
+    }
+}
+
 /// The depot services: the fuel pump, the bus wash and the workshop. OMSI offers them
 /// from its menu, fires `veh_tank` / `veh_wash` while they run and asks the bus for its
 /// repair time with `malfunction_gettime` before it lets the workshop start. The pump and

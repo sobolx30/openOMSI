@@ -71,7 +71,9 @@ fn src_unmasked(uv: vec2<f32>, texel: vec2<f32>, x: f32, y: f32) -> vec3<f32> {
     let m = textureSampleLevel(t_base, s_lin, at, 0.0);
     let c = clean(textureSampleLevel(t_src, s_lin, at, 0.0).rgb);
     let screen = step(0.5, m.r);
-    let led = step(0.5, m.g);
+    // (g: 0.5 + half the strength of the glow, 1 = the panel's own: a material asked to glow
+    // by hand with `[led_glow_effect]` counts for its fraction)
+    let led = step(0.5, m.g) * clamp(m.g * 2.0 - 1.0, 0.0, 1.0);
     return c * (1.0 - screen) + c * (led * p.c.w) * screen;
 }
 

@@ -2166,6 +2166,14 @@ impl VehicleInstance {
         ok
     }
 
+    /// One frame of the fuel pump, as OMSI runs it while the pump is switched on: the
+    /// `veh_tank` trigger once, with this frame's time (`secs`) on the clock - the script
+    /// decides what the frame is worth and caps the tank itself. False: the bus has no
+    /// `veh_tank`.
+    pub fn pump_frame(&mut self, secs: f32) -> bool {
+        self.service("veh_tank", secs)
+    }
+
     /// Refuel until the tank stops filling. Returns the tank content the script reports.
     pub fn refuel(&mut self) -> Option<f32> {
         let mut last = f32::NEG_INFINITY;

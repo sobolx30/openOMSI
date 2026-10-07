@@ -2557,6 +2557,7 @@ pub(crate) fn run_offscreen(
         let (kind, rate) = precip_of(&weather);
         let mut rn = rain::Rain::new();
         rn.set(kind, rate);
+        rn.set_light(rain::flake_light(&daylight));
         for _ in 0..30 {
             scene
                 .coronas

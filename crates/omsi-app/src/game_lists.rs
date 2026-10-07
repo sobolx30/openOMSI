@@ -114,20 +114,210 @@ fn numeric_ibis_line(line: &str) -> bool {
         && matches!(suffix.chars().next().unwrap().to_ascii_uppercase(), 'E' | 'U' | 'N' | 'S' | 'M')
 }
 
+/// The destination window's fields: the route number and the two lines of the custom
+/// destination, and the field being typed in now (`App::menu_edit` holds its text).
+#[derive(Clone, Debug, Default)]
+pub(crate) struct DestForm {
+    pub line: String,
+    pub top: String,
+    pub bottom: String,
+    /// 0 the route number, 1 the upper line, 2 the lower line.
+    pub field: Option<u8>,
+}
+
+/// What is being typed goes into its field of the form.
+pub(crate) fn dest_commit(app: &mut App) {
+    let Some(t) = app.menu_edit.take() else { return };
+    match app.dest_form.field.take() {
+        Some(0) => app.dest_form.line = t.trim().to_string(),
+        Some(1) => app.dest_form.top = t,
+        Some(2) => app.dest_form.bottom = t,
+        _ => {}
+    }
+}
+
+/// Start typing in field `n` (what is typed in another one is kept first).
+pub(crate) fn dest_begin(app: &mut App, n: u8) {
+    dest_commit(app);
+    app.menu_edit = Some(match n {
+        0 => app.dest_form.line.clone(),
+        1 => app.dest_form.top.clone(),
+        _ => app.dest_form.bottom.clone(),
+    });
+    app.dest_form.field = Some(n);
+}
+
+/// Tab / Enter in a field: what is typed is kept, and the next field is typed in (after
+/// the last one, none).
+pub(crate) fn dest_next_field(app: &mut App) {
+    let was = app.dest_form.field;
+    dest_commit(app);
+    if let Some(n) = was.filter(|n| *n < 2) {
+        dest_begin(app, n + 1);
+    }
+}
+
+/// The "Select" button: what is typed goes to the bus in one go - the route number and, when
+/// either line of the custom destination is typed, the destination. False when there was
+/// nothing to set (the window stays).
+pub(crate) fn dest_select(app: &mut App) -> bool {
+    dest_commit(app);
+    let line = app.dest_form.line.trim().to_string();
+    let (top, bottom) = (app.dest_form.top.clone(), app.dest_form.bottom.clone());
+    let custom = !top.trim().is_empty() || !bottom.trim().is_empty();
+    // (an empty route number box means "no route number": it is sent, and clears the number)
+    let nothing_shown = app.player.as_ref().is_none_or(|p| line_shown(&p.vehicle).is_none());
+    if line.is_empty() && !custom && nothing_shown {
+        app.service_msg = Some((omsi_ui::tr("Type a route number or a destination first").into_owned(), 3.0));
+        return false;
+    }
+    if custom {
+        return send_custom(app, &top, &bottom, Some(line.as_str()));
+    }
+    // a route number alone, while a custom destination is on the display: the display is
+    // sent again, under the other virtual terminus, so that the scripts - which redraw when
+    // the terminus changes - take the new route number at once
+    let shown_custom = app.player.as_ref().and_then(|p| {
+        let hof = p.vehicle.host.hof.as_deref()?;
+        let from = hof.custom_from?;
+        let ti = crate::schedule::shown_destination(&p.vehicle, hof, p.blind_pick.as_ref()).filter(|ti| *ti >= from)?;
+        let t = hof.termini.get(ti)?;
+        Some((t.strings.get(1).cloned().unwrap_or_default(), t.strings.get(2).cloned().unwrap_or_default()))
+    });
+    match shown_custom {
+        Some((t, b)) => send_custom(app, &t, &b, Some(line.as_str())),
+        None => {
+            set_route_by_hand(app, &line);
+            true
+        }
+    }
+}
+
+/// The IBIS may still be typing a trip's codes (a duty's, a page's): that job is dropped,
+/// or it would write its own destination over the one set by hand.
+fn drop_ibis_typing(p: &mut crate::player::Player) {
+    if let Some((mut old, ..)) = p.ibis_typist.take() {
+        old.abandon(&mut p.vehicle);
+    }
+}
+
+/// Show a destination of the given two lines on the bus: a virtual terminus of the depot file
+/// (`Hof::with_custom_terminus`) that the scripts read like the file's own, set the way a pick
+/// from the list is. `line` is the route number typed (None: the one shown stays). The route
+/// number is not read back from the bus's own variables when one was typed: the matrix script
+/// updates `Matrix_Nr` only on its next run, and the old number came back with the new text.
+fn send_custom(app: &mut App, top: &str, bottom: &str, line: Option<&str>) -> bool {
+    let Some(p) = app.player.as_mut() else { return false };
+    let Some(hof) = p.vehicle.host.hof.clone() else {
+        app.service_msg = Some((omsi_ui::tr("This bus has no depot file (.hof) with destinations").into_owned(), 3.0));
+        return false;
+    };
+    drop_ibis_typing(p);
+    let (custom, ti) = hof.with_custom_terminus(top, bottom);
+    let custom = std::sync::Arc::new(custom);
+    p.vehicle.host.hof = Some(custom.clone());
+    let typed = line.map(str::trim);
+    let line_text = match typed {
+        Some(l) => l.to_string(),
+        None => line_shown(&p.vehicle).unwrap_or_default(),
+    };
+    p.set_destination_by_hand(&custom, line_text.trim(), ti);
+    // (a route number that is display text rather than a number: as `set_route_by_hand` leaves it)
+    if typed.is_some_and(|l| l.is_empty() || !numeric_ibis_line(l)) {
+        for name in ["SetLineTo", "Matrix_Nr", "Linie"] {
+            if let Some(i) = p.vehicle.ty.program.str_var(name) {
+                p.vehicle.state.str_vars[i as usize] = line_text.clone();
+            }
+        }
+    }
+    log::info!(
+        "custom destination set: '{}' / '{}' (virtual terminus {ti}, code {}, strings {:?}, line '{}'; IBIS_TerminusIndex {:?}, IBIS_TerminusCode {:?}, IBIS_RouteIndex {:?}, IBIS_Linie_Complex {:?}, IBIS_terminus_name {:?})",
+        top.trim(),
+        bottom.trim(),
+        custom.termini[ti].code,
+        custom.termini[ti].strings,
+        line_text.trim(),
+        p.vehicle.var("IBIS_TerminusIndex"),
+        p.vehicle.var("IBIS_TerminusCode"),
+        p.vehicle.var("IBIS_RouteIndex"),
+        p.vehicle.var("IBIS_Linie_Complex"),
+        p.vehicle.str_var("IBIS_terminus_name")
+    );
+    app.service_msg = Some((format!("{}: {} {}", omsi_ui::tr("Destination"), top.trim(), bottom.trim()), 3.0));
+    true
+}
+
+/// The "Clear display" button: terminus 0 and no route number, as the AI's trigger sets them
+/// (`AI_target_index` 0, `SetLineTo` empty), the IBIS's own variables with them.
+pub(crate) fn dest_clear(app: &mut App) {
+    app.menu_edit = None;
+    app.dest_form = DestForm::default();
+    let Some(p) = app.player.as_mut() else { return };
+    drop_ibis_typing(p);
+    let hof = p.vehicle.host.hof.clone();
+    match hof.as_deref().filter(|h| !h.termini.is_empty()) {
+        Some(h) => p.set_destination_by_hand(h, "", 0),
+        None => {
+            if let Some(i) = p.vehicle.ty.program.str_var("SetLineTo") {
+                p.vehicle.state.str_vars[i as usize] = String::new();
+            }
+            p.vehicle.set_var("AI_target_index", 0.0);
+            p.vehicle.trigger("ai_scheduled_settarget");
+        }
+    }
+    // (the text a route number typed by hand left)
+    for name in ["SetLineTo", "Matrix_Nr", "Linie"] {
+        if let Some(i) = p.vehicle.ty.program.str_var(name) {
+            p.vehicle.state.str_vars[i as usize] = String::new();
+        }
+    }
+    app.service_msg = Some((omsi_ui::tr("Display cleared").into_owned(), 3.0));
+}
+
+/// The form beside the list of destinations (None for the other lists).
+/// (the parts of the app it reads are passed one by one: the frame is built while the scene
+/// is borrowed from the app.)
+pub(crate) fn dest_form_view(player: Option<&crate::player::Player>, menu_edit: Option<&String>, f: &DestForm, kind: Option<&ListKind>) -> Option<crate::ui::FormView> {
+    if !matches!(kind, Some(ListKind::Destinations)) {
+        return None;
+    }
+    let p = player?;
+    p.vehicle.host.hof.as_ref()?;
+    let tr = |t: &str| omsi_ui::tr(t).into_owned();
+    let now = line_shown(&p.vehicle).unwrap_or_default();
+    let field = |n: u8, label: &str, value: &str| -> (String, String, bool) {
+        match menu_edit.filter(|_| f.field == Some(n)) {
+            Some(t) => (label.to_string(), t.clone(), true),
+            None => (label.to_string(), value.to_string(), false),
+        }
+    };
+    let line_value = if f.line.is_empty() { now.as_str() } else { f.line.as_str() };
+    Some(crate::ui::FormView {
+        title: tr("Display"),
+        fields: vec![field(0, &tr("Route number"), line_value), field(1, &tr("Destination, upper line"), &f.top), field(2, &tr("Destination, lower line"), &f.bottom)],
+        buttons: vec![tr("Select"), tr("Clear display"), tr("Close")],
+    })
+}
+
 /// The route number on the bus's IBIS and display, as picked or typed in the destination
 /// list (the destination stays: the one on the display now, else the first -
 /// `schedule::shown_destination`).
 pub(crate) fn set_route_by_hand(app: &mut App, line: &str) {
     let line = line.trim();
-    if line.is_empty() {
-        return;
-    }
     if let Some(p) = app.player.as_mut() {
-        if numeric_ibis_line(line) {
+        if line.is_empty() || numeric_ibis_line(line) {
             let hof = p.vehicle.host.hof.clone();
             if let Some(hof) = hof.as_deref() {
                 if let Some(ti) = crate::schedule::shown_destination(&p.vehicle, hof, p.blind_pick.as_ref()) {
                     p.set_destination_by_hand(hof, line, ti);
+                }
+            }
+            if line.is_empty() {
+                // (cleared: the scripts' own copies of the number go with it)
+                for name in ["SetLineTo", "Matrix_Nr", "Linie"] {
+                    if let Some(i) = p.vehicle.ty.program.str_var(name) {
+                        p.vehicle.state.str_vars[i as usize] = String::new();
+                    }
                 }
             }
         } else {
@@ -458,13 +648,9 @@ pub(crate) fn items(app: &App, kind: &ListKind) -> Vec<(String, String)> {
             }
         }
         ListKind::Destinations => {
-            if let Some(p) = app.player.as_ref().filter(|p| p.vehicle.host.hof.is_some()) {
-                let now = line_shown(&p.vehicle).unwrap_or_else(|| "-".into());
-                out.push((format!("{}: {now}...", tr("Route number")), "routes".into()));
-            }
             if let Some(hof) = app.player.as_ref().and_then(|p| p.vehicle.host.hof.clone()) {
                 let mut termini: Vec<(String, i32, usize)> = hof
-                    .termini
+                    .real_termini()
                     .iter()
                     .enumerate()
                     .map(|(i, t)| (t.menu_name(), t.code, i))
@@ -922,7 +1108,6 @@ pub(crate) fn run_move(app: &mut App, kind: &ListKind, action: &str, mv: Move) -
             app.place_vehicle(&bus, Some(paint).filter(|p| !p.is_empty()), Some(hof).filter(|h| !h.is_empty()));
             None
         }
-        ListKind::Destinations if verb == "routes" => Some(ListKind::RouteNumbers),
         ListKind::RouteNumbers if verb == "route_type" => {
             // the first press starts typing, the next one (Enter) sets what is typed
             match app.menu_edit.take() {
@@ -948,6 +1133,7 @@ pub(crate) fn run_move(app: &mut App, kind: &ListKind, action: &str, mv: Move) -
                     // (the line on the IBIS stays; only the destination changes)
                     let line = destination_line(&p.vehicle);
                     let name = t.menu_name();
+                    drop_ibis_typing(p);
                     p.set_destination_by_hand(hof, &line, ti);
                     log::info!("destination display set by hand: {} {} (terminus code now {:?})", t.code, name.trim(), p.vehicle.var("IBIS_TerminusCode"));
                     app.service_msg = Some((format!("Destination: {}", name.trim()), 3.0));
@@ -2423,7 +2609,8 @@ fn vehicle_pages(app: &App) -> Vec<Page> {
     }
     let mut service: Vec<(String, String)> = Vec::new();
     if has {
-        service.push(button("Refuel", "Refuel", "Fills the tank of the current vehicle", "refuel"));
+        let (pump_text, pump_desc) = if app.pump { ("Stop", "The pump is running: press to stop it (it also stops when the vehicle leaves the petrol station)") } else { ("Start", "Starts the fuel pump of the current vehicle while it stands at a petrol station; press again to stop") };
+        service.push(button("Refuel", pump_text, pump_desc, "refuel"));
         service.push(button("Wash", "Wash", "Cleans the current vehicle", "wash"));
         service.push(button("Repair", "Repair", "Repairs the current vehicle", "repair"));
         service.push(button("Put back on its wheels", "Reset", "Return the vehicle to an upright position", "reset"));

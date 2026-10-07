@@ -276,7 +276,8 @@ under that name too; an eighth of the machine's memory when unset), `texture_com
 (BC1-BC3 on the GPU, on by default), `reflections` (the materials' reflection maps,
 `[matl_envmap]` - off, paint, chrome and glass mirror nothing), `led_glow` (0..15: how
 bright an LED destination matrix's dots burn in the enhanced picture, 0 = off - they are
-the panel's own light, and the glow draws a halo around them), `led_mips` (0..4, 0.05 steps,
+the panel's own light, and the glow draws a halo around them; only materials the author gave
+`[led_glow_effect]` glow, see MODDING.md), `led_mips` (0..4, 0.05 steps,
 1.3 by default: how much of the mip chain an LED matrix is held at - its picture and its
 `\S:n` mask are sampled at the level their screen footprint asks for, never coarser than
 this. 0 point-samples them, the sharpest dots and the worst shimmer; 1.3 keeps a matrix's

@@ -967,6 +967,13 @@ impl Material {
     pub fn transmap_declared(&self) -> bool {
         (self.uniform.params2[3] + 0.5) as u32 & 2 != 0
     }
+
+    /// A window pane (or rain film) as the shader knows it (`MaterialExtra::glass`,
+    /// `rain_film`): a see-through layer, not a blended body panel.
+    pub fn is_pane(&self) -> bool {
+        let w = self.uniform.emissive[3];
+        w > 0.5 && w < 2.5
+    }
 }
 
 /// The material manager's settings beyond the maps of `add_material_all`: depth handling,
@@ -1020,6 +1027,12 @@ pub struct MaterialExtra {
     /// (Only a panel whose `[matl_lightmap]` is white all over: a flipdot carries the same
     /// mask, but its light map is a picture of the lamps over it, and it does not glow.)
     pub led: bool,
+    /// (`led` is only ever set by hand now: nothing is guessed from a `\\S:n` mask any more.)
+    /// `[led_glow_effect]` set on the material: the glow was asked for by hand (`led` is then
+    /// the author's word, not the guess from a `\S:n` mask), and `led_level` (0..1) is how
+    /// strongly it burns. Without it a panel glows at full strength.
+    pub led_forced: bool,
+    pub led_level: f32,
     /// The film of water on a window (`[alphascale] Rain_Window_…`): drawn as drops that sit,
     /// gather and run down the glass instead of the texture sliding down as a whole.
     pub rain_film: bool,
@@ -5744,7 +5757,7 @@ impl Renderer {
                     + if extra.transmap_declared || transmap.is_some() { 2.0 } else { 0.0 }
                     + if extra.metal_ok { 4.0 } else { 0.0 },
             ],
-            emissive: [emissive[0], emissive[1], emissive[2], if extra.rain_film { 2.0 } else if extra.glass { 1.0 } else if extra.led { -2.0 } else if extra.display { -1.0 } else { 0.0 }],
+            emissive: [emissive[0], emissive[1], emissive[2], if extra.rain_film { 2.0 } else if extra.glass { 1.0 } else if extra.led && extra.led_forced { -4.0 + extra.led_level.clamp(0.01, 1.0) } else if extra.led { -2.0 } else if extra.display { -1.0 } else { 0.0 }],
             specular: extra.specular,
             bump: [
                 bump.map(|b| b.1).unwrap_or(0.0),

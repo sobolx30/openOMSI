@@ -90,6 +90,10 @@ pub struct MaterialDef {
     pub lightmaps: Vec<(String, String)>,
     pub nightmap: Option<String>,
     pub allcolor: Option<[f32; 14]>,
+    /// `[led_glow_effect]` 0..1 (openOMSI's own): the material's lit parts glow as an LED
+    /// panel's dots do, at this strength; 0 keeps the glow off it. None: left to the
+    /// renderer's own guess (a `\S:n` script mask over an all-white light map).
+    pub led_glow: Option<f32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -978,6 +982,12 @@ impl Model {
                     m.lightmap = Some((t, v));
                 }
             }
+            "led_glow_effect" => {
+                let v = r.f32().clamp(0.0, 1.0);
+                if let Some(m) = self.cur_matl() {
+                    m.led_glow = Some(v);
+                }
+            }
             "matl_nightmap" => {
                 let t = r.str().to_string();
                 if let Some(m) = self.cur_matl() {
@@ -1154,8 +1164,81 @@ pub fn load_texchanges(base: &Path, files: &[String]) -> Vec<TexChangeMaster> {
     out
 }
 
+/// The lamps an `[illumination_interior]` list really names, of a vehicle with `n`
+/// `[interiorlight]`s: each index that exists, once, in ascending order, at most `max`.
+/// OMSI's `-1` (an empty slot), an index past the last lamp and a repeat all name nothing
+/// more, and the order of a list says nothing (the lights add up), so lists that name the
+/// same lamps give the same set however they are written - a model that writes `2 2 -1 -1`
+/// or `-1 2 5 -1` or `5 2` lights its mesh by the same two lamps as one that writes `2 5`.
+pub fn lamp_indices(list: &[i32], n: usize, max: usize) -> Vec<usize> {
+    let mut set: Vec<usize> = list.iter().filter_map(|&k| usize::try_from(k).ok()).filter(|&k| k < n).collect();
+    set.sort_unstable();
+    set.dedup();
+    set.truncate(max);
+    set
+}
+
+/// What is wrong with an `[illumination_interior]` list for a vehicle of `n` lamps, in words
+/// (empty when there is nothing to say): an index past the last lamp, a lamp named twice, or
+/// not one lamp named while the list is not all empty slots. (-1 slots are the format's own
+/// way of naming fewer than four lamps and are no fault.)
+pub fn lamp_list_problems(list: &[i32], n: usize) -> Vec<String> {
+    let mut out = Vec::new();
+    let beyond: Vec<i32> = list.iter().copied().filter(|&k| k >= 0 && k as usize >= n).collect();
+    if !beyond.is_empty() {
+        out.push(format!("lamp {beyond:?} does not exist (the vehicle has {n})"));
+    }
+    let mut seen: Vec<i32> = Vec::new();
+    let mut repeats: Vec<i32> = Vec::new();
+    for &k in list.iter().filter(|&&k| k >= 0) {
+        if seen.contains(&k) {
+            if !repeats.contains(&k) {
+                repeats.push(k);
+            }
+        } else {
+            seen.push(k);
+        }
+    }
+    if !repeats.is_empty() {
+        out.push(format!("lamp {repeats:?} is named more than once"));
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn interior_lamp_lists_name_each_lamp_once() {
+        use super::{lamp_indices, lamp_list_problems};
+        assert_eq!(lamp_indices(&[0, 1, 2, 3], 4, 63), [0, 1, 2, 3]);
+        assert_eq!(lamp_indices(&[2, 2, -1, -1], 8, 63), [2]);
+        assert_eq!(lamp_indices(&[-1, 5, 2, -1], 8, 63), [2, 5]);
+        assert_eq!(lamp_indices(&[5, 2], 8, 63), lamp_indices(&[2, 5, 5, 2], 8, 63));
+        assert_eq!(lamp_indices(&[9, 40, -3], 8, 63), Vec::<usize>::new());
+        assert_eq!(lamp_indices(&[0, 1, 2, 3, 4], 8, 3), [0, 1, 2]);
+        assert!(lamp_list_problems(&[-1, 2, 5, -1], 8).is_empty());
+        assert_eq!(lamp_list_problems(&[2, 2, -1, -1], 8).len(), 1);
+        assert_eq!(lamp_list_problems(&[9, 1, 1, 1], 8).len(), 2);
+    }
+
+    #[test]
+    fn a_short_interior_lamp_list_does_not_eat_the_next_block() {
+        let text = "[mesh]\na.o3d\n\n[illumination_interior]\n3\n\n[visible]\nDoor\n1\n";
+        let model = super::Model::parse(&omsi_cfg::CfgFile::from_str("model.cfg", text));
+        assert_eq!(model.meshes[0].illumination_interior, [3, -1]);
+        assert!(model.meshes[0].visible.is_some());
+        let text = "[mesh]\nb.o3d\n\n[illumination_interior]\n4\n5\n-1\n-1\n\n";
+        let model = super::Model::parse(&omsi_cfg::CfgFile::from_str("model.cfg", text));
+        assert_eq!(model.meshes[0].illumination_interior, [4, 5, -1, -1]);
+    }
+
+    #[test]
+    fn led_glow_effect_is_set_by_hand_per_material() {
+        let text = "[mesh]\na.o3d\n\n[matl]\nsign.bmp\n0\n[led_glow_effect]\n0.4\n\n[matl]\nlamp.bmp\n0\n[led_glow_effect]\n7\n\n[matl]\nplain.bmp\n0\n\n[matl]\noff.bmp\n0\n[led_glow_effect]\n0\n";
+        let model = super::Model::parse(&omsi_cfg::CfgFile::from_str("model.cfg", text));
+        let glow: Vec<Option<f32>> = model.meshes[0].materials.iter().map(|m| m.led_glow).collect();
+        assert_eq!(glow, [Some(0.4), Some(1.0), None, Some(0.0)], "0..1, left to the guess without it");
+    }
 
     #[test]
     fn terrain_hole_meshes_are_independent_of_render_meshes() {
