@@ -7096,7 +7096,13 @@ impl World {
                             tg.trees.push(tkey.clone());
                         }
                         let mat = tr.material;
-                        let xf = Mat4::from_rotation_z((-heading).to_radians() as f32)
+                        // The card is turned the opposite way to the object: Omsi.exe builds its
+                        // matrix as RotationY(angle) x Scaling x Translation (0x774548) with
+                        // the angle from the object's quaternion by 0x7f0094 / 0x7efe78 - the
+                        // signed angle of the turned X axis from +X, which is minus the turn
+                        // the object is drawn with. The crossed cards only show it when the
+                        // heading is not a multiple of 45 degrees.
+                        let xf = Mat4::from_rotation_z(heading.to_radians() as f32)
                             * Mat4::from_scale(glam::Vec3::new(
                                 *width as f32,
                                 *width as f32,
