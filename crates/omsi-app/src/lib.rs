@@ -61,6 +61,7 @@ mod scene;
 mod schedule;
 mod schedule_paper;
 mod real_time;
+mod devtools_proc;
 mod settings;
 mod threads;
 mod tiles;
@@ -183,6 +184,11 @@ pub fn run() -> Result<()> {
             ""
         }
     );
+    // The developer tools window: this program started by the game for that alone (see
+    // `devtools_proc`), no command line of its own.
+    if std::env::var_os("OMSI_DEVTOOLS_WINDOW").is_some() {
+        return launcher::devtools::run(graphics_instance());
+    }
     let args = Args::parse();
     // Started by a double click or with no arguments at all: that is the launcher's job.
     // The launcher itself runs the game with a full command line (--no-menu, --map, ...).
@@ -567,6 +573,7 @@ pub(crate) fn make_app(mut args: Args, server_cfg: Option<server::ServerCfg>) ->
         key_capture: None,
         menu_prev_pause: false,
         info_bar,
+        devtools: Default::default(),
         pending_time: None,
         world_day: None,
         autosave_t: 0.0,

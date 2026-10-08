@@ -290,6 +290,21 @@ station), or `SndExt_Radio` (the station button, 0 = off) with `SndVol_Radio` (t
 its `magnitola_1` (`frequency@station`, `@` the line break) gets the map's frequency for the
 place in its first line and the station and song in its second.
 
+**Callbacks for the station and the song.** A script can ask what the radio plays with two
+openOMSI callbacks that return a string, written like OMSI's own:
+
+```
+(M.V.GetRadioName)   { the station's name: what it calls itself (icy-name), else its name in radio.cfg }
+(M.V.GetRadioSong)   { the stream title the station sends: "Artist - Title", or whatever text it puts there }
+```
+
+Both read an empty string while the radio is off, and `GetRadioSong` is empty while the
+station sends no title. The text is as the station sends it (UTF-8): a display font without
+its letters shows gaps, so a script may want to cut or replace what it cannot show. Unlike
+`Snd_Radio_Text` the callbacks need no variable in the bus's files, and the script decides
+what to show and how. OMSI 2 itself does not know them (it reads them as 0), so a bus using
+them should still work without them.
+
 ## What stays as in OMSI 2
 
 The following behave as in OMSI 2 so that existing content works unchanged:

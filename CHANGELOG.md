@@ -8,6 +8,25 @@ Every push to `main` is released as `MAJOR.MINOR.COMMIT` (see
 
 ### Added
 
+* **Developer tools window**: Settings → General → *Enable Developer Tools* opens an extra window
+  beside the game at session start (a process of its own; closing it only closes the window, and
+  it closes by itself when the game ends). Ctrl+Shift+Backspace in the game starts it again. In
+  it: switches that draw the seated places (orange dots), the standing places (red dots), the
+  passengers' paths, the vehicle's bounding box, the axles and wheels and the interior lights (with
+  their number and variable), the numbers and uses of the path points (entry, exit, links,
+  ticket sale, stamper) and the ticket sale, stamper, money and change points over the picture, and the player vehicle's
+  variables and strings - watch, set, hold, and save the watched names as named lists.
+
+* **`(M.V.GetRadioName)` and `(M.V.GetRadioSong)`**: script callbacks that return the internet
+  radio's station name (`icy-name`, else the name in `radio.cfg`) and its stream title as strings;
+  empty while the radio is off. See MODDING.md.
+
+* **Bus radio from the cab**: the radio plays from a point by the driver's camera; inside it is
+  semi-spatial (slightly quieter with distance, slightly to the radio's side, smoothed over ~0.5 s and
+  following the bus's axes so changing views never swings it between the ears). Optional effects in
+  Settings → Sound (launcher and in-game), off by default: sliders *Cheap speaker*, *FM hiss and
+  crackle*, *Lost reception* (`radio_fx_speaker`, `radio_fx_noise`, `radio_fx_dropouts`, 0..1).
+
 * **`[led_glow_effect]`** (0-1, in a `[matl]` block): the material's lit parts glow like an LED
   panel's dots in the enhanced picture, at that fraction of the *LED glow* setting; 0 keeps the glow
   off it. It works on any material of a vehicle or a scenery object - with a light map it glows where
@@ -32,6 +51,12 @@ Every push to `main` is released as `MAJOR.MINOR.COMMIT` (see
 
 ### Changed
 
+* **Launcher, Drive → Day & weather: the time and date can be changed again with "Start on today's date" on.**
+  The old "Start at the real time" switch is gone (it, and the date switch, overwrote the fields every
+  frame and at every launch, so they could not be edited). The *Current time* and *Current date*
+  buttons are always there for a one-click sync of either. "Start on today's date" now sets the date
+  and year from the computer's calendar once, when the launcher opens; after that the date is yours.
+
 * The LED glow is no longer given automatically to every material with a `\S:n` transmap and a
   white light map: only a material with `[led_glow_effect]` glows. A panel of a mod that should
   keep its glow needs the key in its `model.cfg`.
@@ -55,6 +80,10 @@ Every push to `main` is released as `MAJOR.MINOR.COMMIT` (see
 
 ### Removed
 
+* **"Driver's hands in the cab view"** is gone from Settings and the pause Options; the hands are no
+  longer shown in the cab view.
+* **Android** is no longer described in the README, the user guide, the build and versioning docs or the
+  website (the `docs/ANDROID.md` page is removed). The code is untouched.
 * The updater, completely: the launcher no longer asks GitHub for a newer release when it starts
   or every half hour, the game no longer looks for one during a session and downloads nothing in
   the background, and nothing replaces the program (no `.openomsi-update` swap, no relaunch).

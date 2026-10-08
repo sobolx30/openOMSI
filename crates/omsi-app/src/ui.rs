@@ -410,6 +410,85 @@ pub struct DropdownView<'a> {
     pub current: Option<usize>,
 }
 
+/// A dot (`to` none) or a line of the developer tools drawn over the picture: screen pixels,
+/// `size` the dot's radius or the line's thickness in interface pixels.
+#[derive(Clone, Debug)]
+pub struct Mark {
+    pub p: (f32, f32),
+    pub to: Option<(f32, f32)>,
+    pub rgba: [u8; 4],
+    pub size: f32,
+    /// A text beside a dot.
+    pub label: Option<String>,
+}
+
+/// `rgba` (straight alpha, times `cover`) over pixel (x, y) of a straight-alpha RGBA picture `w` wide.
+fn mark_blend(buf: &mut [u8], w: u32, x: i32, y: i32, rgba: [u8; 4], cover: f32) {
+    if x < 0 || y < 0 || x >= w as i32 {
+        return;
+    }
+    let o = ((y as u32 as usize) * w as usize + x as usize) * 4;
+    if o + 4 > buf.len() {
+        return;
+    }
+    let a = rgba[3] as f32 / 255.0 * cover.clamp(0.0, 1.0);
+    if a <= 0.0 {
+        return;
+    }
+    let da = buf[o + 3] as f32 / 255.0;
+    let oa = a + da * (1.0 - a);
+    for c in 0..3 {
+        let v = (rgba[c] as f32 * a + buf[o + c] as f32 * da * (1.0 - a)) / oa;
+        buf[o + c] = v.round().clamp(0.0, 255.0) as u8;
+    }
+    buf[o + 3] = (oa * 255.0).round().clamp(0.0, 255.0) as u8;
+}
+
+/// A soft-edged disc of radius `r` at (cx, cy).
+fn mark_disc(buf: &mut [u8], w: u32, cx: f32, cy: f32, r: f32, rgba: [u8; 4]) {
+    let (x0, x1) = ((cx - r - 1.0).floor() as i32, (cx + r + 1.0).ceil() as i32);
+    let (y0, y1) = ((cy - r - 1.0).floor() as i32, (cy + r + 1.0).ceil() as i32);
+    for y in y0..=y1 {
+        for x in x0..=x1 {
+            let (dx, dy) = (x as f32 + 0.5 - cx, y as f32 + 0.5 - cy);
+            mark_blend(buf, w, x, y, rgba, r - (dx * dx + dy * dy).sqrt() + 0.5);
+        }
+    }
+}
+
+/// A line of thickness `t` from `a` to `b`, cut to the picture (`w` x `h`) first.
+fn mark_line(buf: &mut [u8], w: u32, h: u32, a: (f32, f32), b: (f32, f32), t: f32, rgba: [u8; 4]) {
+    // Liang-Barsky against the picture with a small margin
+    let (xmin, xmax, ymin, ymax) = (-4.0, w as f32 + 4.0, -4.0, h as f32 + 4.0);
+    let (dx, dy) = (b.0 - a.0, b.1 - a.1);
+    let (mut t0, mut t1) = (0.0f32, 1.0f32);
+    for (p, q) in [(-dx, a.0 - xmin), (dx, xmax - a.0), (-dy, a.1 - ymin), (dy, ymax - a.1)] {
+        if p == 0.0 {
+            if q < 0.0 {
+                return;
+            }
+        } else {
+            let u = q / p;
+            if p < 0.0 {
+                t0 = t0.max(u);
+            } else {
+                t1 = t1.min(u);
+            }
+        }
+    }
+    if t0 >= t1 {
+        return;
+    }
+    let (p0, p1) = ((a.0 + dx * t0, a.1 + dy * t0), (a.0 + dx * t1, a.1 + dy * t1));
+    let len = ((p1.0 - p0.0).powi(2) + (p1.1 - p0.1).powi(2)).sqrt();
+    let step = (t * 0.5).max(0.75);
+    let n = ((len / step).ceil() as usize).clamp(1, 6000);
+    for k in 0..=n {
+        let u = k as f32 / n as f32;
+        mark_disc(buf, w, p0.0 + (p1.0 - p0.0) * u, p0.1 + (p1.1 - p0.1) * u, t * 0.5, rgba);
+    }
+}
+
 /// Everything the interface draws in a frame.
 pub struct Frame<'a> {
     /// Physical pixels per logical one.
@@ -456,6 +535,8 @@ pub struct Frame<'a> {
     pub tutorial: Option<(&'a str, &'a str, Option<&'a std::path::Path>, usize, usize)>,
     /// Name tags: a screen position (the point above a bus), the name and a second line.
     pub tags: Vec<((f32, f32), String, String, f32)>,
+    /// The developer tools' dots and lines over the picture (screen pixels, see `Mark`).
+    pub marks: Vec<Mark>,
     /// The server's notifications, oldest first.
     pub notices: &'a [Notice],
     /// Where the navigator is on the screen (the notifications stand over it, or under it
@@ -542,6 +623,11 @@ pub struct Ui {
     /// Where the information bar was drawn (within the panel, before `origin_x`), for the
     /// navigator to keep out of its way.
     pub info_rect: Option<[f32; 4]>,
+    /// The developer tools' dots and lines: one picture of the size of the view (drawn on the
+    /// CPU, written to this texture each frame) - thousands of small overlays of their own
+    /// cost the frame most of its time.
+    marks_img: Option<(TextureId, u32, u32)>,
+    marks_buf: Vec<u8>,
 }
 
 /// Between the information bar's parts.
@@ -623,7 +709,7 @@ impl Ui {
         self.chat.rect[2] += x;
     }
     pub fn new() -> Option<Ui> {
-        Some(Ui { origin_x: 0.0, text: TextCache::new()?, chat: ChatWidget::default(), menu_rects: Vec::new(), menu_arrows: Vec::new(), menu_scroll_thumb: None, menu_scroll_track: None, menu_ctl: Vec::new(), dd_rects: Vec::new(), dd_top: 0, dd_rows: 8, dd_scroll: None, menu_side: Vec::new(), menu_pane: Vec::new(), menu_pane_start: 0, menu_pane_go: None, menu_pane_box: None, menu_pane_scroll: None, menu_time: Vec::new(), menu_form_fields: Vec::new(), menu_form_buttons: Vec::new(), anim: Default::default(), anim_dt: 0.0, menu_overlay_range: 0..0, vr_cursor_overlay: None, vr_tooltip_overlay: None, menu_start: 0, menu_rows: 0, menu_row_h: 1.0, images: Default::default(), info_rect: None })
+        Some(Ui { origin_x: 0.0, text: TextCache::new()?, chat: ChatWidget::default(), menu_rects: Vec::new(), menu_arrows: Vec::new(), menu_scroll_thumb: None, menu_scroll_track: None, menu_ctl: Vec::new(), dd_rects: Vec::new(), dd_top: 0, dd_rows: 8, dd_scroll: None, menu_side: Vec::new(), menu_pane: Vec::new(), menu_pane_start: 0, menu_pane_go: None, menu_pane_box: None, menu_pane_scroll: None, menu_time: Vec::new(), menu_form_fields: Vec::new(), menu_form_buttons: Vec::new(), anim: Default::default(), anim_dt: 0.0, menu_overlay_range: 0..0, vr_cursor_overlay: None, vr_tooltip_overlay: None, menu_start: 0, menu_rows: 0, menu_row_h: 1.0, images: Default::default(), info_rect: None, marks_img: None, marks_buf: Vec::new() })
     }
 
     /// Draw the frame's interface: its overlays go after the HUD's in `scene.overlays`.
@@ -642,6 +728,43 @@ impl Ui {
                     let m = self.text.label(r, scene, sub, (12.0 * s) as u32, [210, 225, 255, 200]);
                     let mx = x - m.w as f32 * 0.5;
                     scene.overlays.push((m.tex, [mx, y0 + l.h as f32 - 3.0 * s, mx + m.w as f32, y0 + l.h as f32 - 3.0 * s + m.h as f32]));
+                }
+            }
+        }
+        // --- the developer tools' dots and lines: drawn into one picture the size of the view
+        // (at most 1920 wide), which goes over the picture as a single overlay; the texts beside
+        // the dots are overlays of their own (few)
+        if !f.marks.is_empty() && f.width >= 1.0 && f.height >= 1.0 {
+            let k = (1920.0 / f.width).min(1.0);
+            let (bw, bh) = (((f.width * k).round() as u32).max(1), ((f.height * k).round() as u32).max(1));
+            if !matches!(self.marks_img, Some((_, a, b)) if a == bw && b == bh) {
+                let blank = omsi_texture::Image { width: bw, height: bh, rgba: vec![0; (bw * bh * 4) as usize], has_alpha: true };
+                let tex = r.add_texture(scene, &blank, false);
+                self.marks_img = Some((tex, bw, bh));
+            }
+            if let Some((tex, bw, bh)) = self.marks_img {
+                let mut buf = std::mem::take(&mut self.marks_buf);
+                buf.clear();
+                buf.resize((bw * bh * 4) as usize, 0);
+                for m in &f.marks {
+                    let size = m.size * s * k;
+                    let p = (m.p.0 * k, m.p.1 * k);
+                    match m.to {
+                        None => mark_disc(&mut buf, bw, p.0, p.1, size.max(1.0), m.rgba),
+                        Some(b) => mark_line(&mut buf, bw, bh, p, (b.0 * k, b.1 * k), size.max(1.2), m.rgba),
+                    }
+                }
+                let img = omsi_texture::Image { width: bw, height: bh, rgba: buf, has_alpha: true };
+                r.update_texture(scene, tex, &img);
+                self.marks_buf = img.rgba;
+                scene.overlays.push((tex, [0.0, 0.0, f.width, f.height]));
+            }
+            for m in f.marks.iter().filter(|m| m.label.is_some()) {
+                if let Some(text) = m.label.as_deref() {
+                    let l = self.text.label(r, scene, text, (12.0 * s) as u32, [m.rgba[0], m.rgba[1], m.rgba[2], 255]);
+                    let x0 = m.p.0 + (m.size + 3.0) * s;
+                    let y0 = m.p.1 - l.h as f32 * 0.5;
+                    scene.overlays.push((l.tex, [x0, y0, x0 + l.w as f32, y0 + l.h as f32]));
                 }
             }
         }

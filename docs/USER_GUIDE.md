@@ -67,8 +67,7 @@ is the same thing for an offscreen run.
 
 **Updates.** This build has no updater: it does not look for a newer version, downloads nothing
 by itself and has no switch for it. To update, download a release from the project's Releases
-page and unpack it over the old folder (settings, mods and content stay; on Android install the
-new APK over the old one). An `update_*` line left in an older `settings.cfg` is ignored.
+page and unpack it over the old folder (settings, mods and content stay). An `update_*` line left in an older `settings.cfg` is ignored.
 
 **Alt** (tapped alone: press and let go with no other key or click between) shows and hides the
 quick menu, as in OMSI 2: tiles in the lower right corner for what is wanted often, without the way
@@ -120,7 +119,7 @@ wheel button turns the view; each view keeps its own
 direction (turning the outside camera leaves the driver's head where it was), **Space** looks
 ahead again in every view (OMSI's `view_reset_all_directions`), Home recentres the view shown
 where keyboard.cfg does not make it the ticket desk camera.
-The mouse wheel (and **=** / **-**, a pinch on a phone) zooms: outside the camera comes closer,
+The mouse wheel (and **=** / **-**) zooms: outside the camera comes closer,
 inside the bus the view narrows, as in OMSI; **Ctrl**+wheel outside narrows the view instead
 (a telephoto, the camera stays where it is). F1-F4 driver / passenger / outside / map (free) camera, F5-F8 the destination
 sign and roller blind keys as in OMSI, Ctrl+S quick save, F9 write the run into the personnel
@@ -542,6 +541,13 @@ The file is read when the game starts. The launcher's Settings → Sound → *Ra
 edits the same list: a name and an address a station, the bin removes one, *Add a station*
 adds one, saved at once (the file's comments, `volume` and frequencies stay as they are).
 
+**Where the sound comes from, and radio effects.** The radio plays from the cab: a point on the
+dashboard beside and ahead of the driver's camera. Inside, the sound is not spatial, it only gets
+a little quieter when the head is far from the radio and sits slightly to the side the radio is
+on; this follows the bus's axes, not where you look, and is smoothed over about half a second, so
+turning the head or switching cab views never throws the sound from one ear to the other. Outside,
+it is heard from the cab through the bodywork. Optional effects, **off by default**, are sliders in the launcher's Settings → Sound (*Radio effects*) and in the in-game Options → Sound, applied at once: *Cheap speaker* (narrow, boxy, a little overdriven), *FM hiss and crackle* (drifting with the "reception"), and *Lost reception* (now and then the station drops out for a moment - mute or a dip - with static). The old `effects`/`fx_*` lines in `radio.cfg`, if any, are ignored.
+
 **Stations of a radio plugin.** Stations already set up for an OMSI radio plugin (SuperRadio
 and the like) are taken over: every line with an http(s) address in the text files under
 `plugins` is a station, after those of `radio.cfg`.
@@ -623,6 +629,42 @@ A new panel has the shape of the mirror's glass in the model. The layout is kept
 3 both) gives a bus with no layout of its own its first panels. The panels need the mirrors
 themselves to be drawn (`mirror_size` not 0); they are redrawn at the rate `mirror_refresh`
 sets, also when the glass is not in the view.
+
+## Developer tools
+
+Settings → General → **Enable Developer Tools** opens an extra window ("openOMSI Developer Tools")
+beside the game whenever a session starts. It is a process of its own: closing it only closes
+the window, and it closes by itself when the game ends. **Ctrl+Shift+Backspace** in the game
+opens it again (or replaces a window that is still open).
+
+* **Over the picture in the game** - a list of switches (click its heading to fold it up)  for what the game draws over the player's vehicle:
+  the seated places (orange dots) and the standing places (red dots) - told apart by the seat
+  height, the fourth value of a `[passpos]` (above 0 a seat, 0 a standing place) - the paths the
+  passengers walk on inside the vehicle (`paths.cfg`, green), and the vehicle's bounding box
+  (`[boundingbox]`, magenta; the sections of an articulated bus or a trailer each have theirs).
+* **Path point numbers and uses** - beside each point of the paths its number (the index in the
+  `paths.cfg`; in an articulated bus the sections' points are numbered on one after another)
+  and what it is for: `entry n` (with `{noticketsale}` / `{withbutton}` where the door has
+  them), `exit n`, `linkToNextVeh` / `linkToPrevVeh`, `ticket sale` (where a passenger stands to
+  buy a ticket) and `stamper`; the points with a use are bigger and coloured (entry white, exit
+  purple, links aqua, ticket sale pink, stamper lime).
+* **Ticket sale, stamper, money and change points** - the places of the `[ticket_sale]`,
+  `[stamper]`, `[ticket_sale_money_point]` and `[ticket_sale_change_point]` (and their `_2`
+  kinds) with their names; the `_2` ones with their variables and parent.
+* **Axles and wheels** (blue) - each axle of `[axle]` where the physics puts it: the wheel
+  centres at half the maximum width, a ring of the wheel's diameter round each, a white dot where
+  it meets the ground, a line across and the axle's number (and "driven"). To check that the
+  physics entries sit where the model's wheels are.
+* **Interior lights** (yellow) - every `[interiorlight]` of the vehicle at its position, with
+  its number (the index scripts and `[illumination_interior]` use) and the variable that
+  switches it; bright while the variable is 0.5 or more, dim while it is off.
+* **Variables of the vehicle** - the numeric variables and the strings of the player's
+  vehicle: search a name, click it to watch it, see its value five times a second, type a new
+  one and **Set** it once or **Hold** it (written again every frame, as long as the vehicle's
+  scripts would overwrite it). **Save list** keeps the watched names (never the values) under a
+  name in `devtools_lists.txt` next to `settings.cfg`; **Load** brings a list back.
+
+Reloading the model, scripts, `.bus` and textures from this window comes next.
 
 ## Debug and test switches
 

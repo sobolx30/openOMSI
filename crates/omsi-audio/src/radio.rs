@@ -97,6 +97,7 @@ fn play(agent: &ureq::Agent, buf: &StreamBuf, url: &str) -> anyhow::Result<()> {
     let ctype = resp.content_type().to_ascii_lowercase();
     let metaint = resp.header("icy-metaint").and_then(|v| v.trim().parse::<usize>().ok());
     let name = resp.header("icy-name").map(|s| s.trim().to_string()).unwrap_or_default();
+    buf.set_info(&name, "");
     let reader: Box<dyn Read + Send + Sync> = Box::new(resp.into_reader());
     let title = Arc::new(parking_lot::Mutex::new(String::new()));
     let reader: Box<dyn Read + Send + Sync> = match metaint {
@@ -161,6 +162,7 @@ fn play(agent: &ureq::Agent, buf: &StreamBuf, url: &str) -> anyhow::Result<()> {
             spec.rate,
             data.chunks_exact(ch).map(|f| if ch >= 2 { [f[0], f[1]] } else { [f[0], f[0]] }),
         );
+        buf.set_info(&name, &title.lock());
         let now = {
             let t = title.lock();
             if t.is_empty() { name.clone() } else { t.clone() }

@@ -265,6 +265,8 @@ pub(crate) struct App {
     /// air and cabin temperatures, the passengers aboard, the trip and its next stop along
     /// the top of the picture.
     pub(crate) info_bar: bool,
+    /// The developer tools window (a process of its own), when Settings → General has it on.
+    pub(crate) devtools: crate::devtools_proc::DevToolsProc,
     /// A time of day the bus's script wrote (`(S.S.Time)`), for the clock at the next frame.
     pub(crate) pending_time: Option<f64>,
     /// The play time (`clock.run_time`) the last situation was saved at.
@@ -538,6 +540,9 @@ impl App {
         self.surface = Some(surface);
         self.renderer = Some(renderer);
         self.scene = Some(scene);
+        if self.settings.developer_tools {
+            self.devtools.start();
+        }
         // fully specified runs skip the menu
         if self.args.bus.is_some() || self.args.cam.is_some() || self.args.no_menu {
             self.load_world_now(event_loop);

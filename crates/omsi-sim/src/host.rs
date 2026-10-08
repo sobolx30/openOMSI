@@ -96,6 +96,10 @@ pub struct VehicleHost {
     pub number_var: Option<u32>,
     /// Timetable information for the `GetTT*` callbacks (line, delay in s, stops).
     pub tt_line: String,
+    /// The internet radio now playing, for `GetRadioName` / `GetRadioSong`: the station's name
+    /// and the stream title (empty while the radio is off or the station says none).
+    pub radio_name: String,
+    pub radio_song: String,
     pub tt_delay: f32,
     pub tt_stops: Vec<(String, f32, f32)>,
     /// The map objects of `tt_stops` (0: not known).
@@ -218,6 +222,8 @@ impl VehicleHost {
             hof: self.hof.clone(),
             tickets: self.tickets.clone(),
             tt_line: self.tt_line.clone(),
+            radio_name: self.radio_name.clone(),
+            radio_song: self.radio_song.clone(),
             tt_delay: self.tt_delay,
             tt_stops: self.tt_stops.clone(),
             tt_stop_ids: self.tt_stop_ids.clone(),
@@ -256,7 +262,7 @@ pub const PROVIDED_CALLBACKS: &[&str] = &[
     "getrouteindex", "getrouteterminusindex", "getterminuscode", "getterminusindex", "getterminusstring", "getbusstopcount", "getroutebusstopident", "getbusstopindex", "getbusstopstring", "getdepotstringglobal",
     "getttlinestring", "getttdelay", "getttbusstopcount", "getttbusstopindex", "gettterminusindex", "getttterminusindex", "getttbusstopname", "getttbusstopdep", "getttbusstoparr",
     "getheightabovepoint", "gethumancountonpathlink", "gethumancountonseat", "givechangecoin", "nrspecrandom", "getticketname", "gettticketname", "getticketvalue",
-    "getarrbusline", "getarrbusterminus", "getarrbustimediff",
+    "getarrbusline", "getarrbusterminus", "getarrbustimediff", "getradioname", "getradiosong",
 ];
 
 /// A number a script hands a callback, as Omsi.exe takes it: rounded to the nearest
@@ -610,6 +616,9 @@ impl Host for VehicleHost {
             // --- timetable callbacks
             "getttlinestring" => stacks.push_str(self.tt_line.clone()),
             "getttdelay" => stacks.push(self.tt_delay),
+            // openOMSI extension: what the internet radio says (see MODDING.md)
+            "getradioname" => stacks.push_str(self.radio_name.clone()),
+            "getradiosong" => stacks.push_str(self.radio_song.clone()),
             "getttbusstopcount" => stacks.push(self.tt_stops.len() as f32),
             // Without a timetable there is no current stop. Returning the first
             // stop (0) makes the Atron repeatedly detect an arrival and clear its

@@ -214,6 +214,43 @@ struct Seat {
     group: usize,
 }
 
+/// A cabin for the developer tools' picture (see `Humans::debug_cabin`).
+pub struct CabinDebug {
+    pub points: Vec<DVec3>,
+    pub links: Vec<(usize, usize)>,
+    /// Each place's point and whether it is a seat (`[passpos]` height above 0) or a standing place.
+    pub seats: Vec<(DVec3, bool)>,
+    /// What each path point is for (same order as `points`).
+    pub roles: Vec<PointRole>,
+    /// The cabin's devices: the `[ticket_sale]`, `[stamper]`, `[ticket_sale_money_point]` and
+    /// `[ticket_sale_change_point]` places (with `_2`): the world point, the kind and a note.
+    pub devices: Vec<(DVec3, &'static str, String)>,
+}
+
+/// What a path point is used for besides being part of the paths.
+#[derive(Clone, Default)]
+pub struct PointRole {
+    /// `[entry]` doors ending here: (the door's number, `{noticketsale}`, `{withbutton}`).
+    pub entries: Vec<(usize, bool, bool)>,
+    /// `[exit]` doors ending here (their numbers).
+    pub exits: Vec<usize>,
+    /// `[linkToNextVeh]` / `[linkToPrevVeh]` of a section (articulated buses, trailers).
+    pub link_next: bool,
+    pub link_prev: bool,
+    /// Where a passenger stands to buy a ticket (`[ticket_sale]`), at a validator (`[stamper]`).
+    pub sale: bool,
+    pub stamper: bool,
+}
+
+/// A device of the cabin kept for the developer tools: kind, place in the cabin's frame, the
+/// path point it belongs to (if any) and a note.
+struct DebugPoint {
+    kind: &'static str,
+    pos: Vec3,
+    point: Option<usize>,
+    note: String,
+}
+
 /// What passengers need to know about one vehicle type's cabin.
 struct Cabin {
     data: PassengerCabin,
@@ -253,6 +290,10 @@ struct Cabin {
     money_point: Option<Vec3>,
     money_var: Option<(Vec3, [f32; 2])>,
     change_point: Option<Vec3>,
+    /// For the developer tools: the path points that link to the next / previous vehicle (the
+    /// bool: next), and every ticket sale, stamper, money and change point of every section.
+    link_marks: Vec<(usize, bool)>,
+    debug_points: Vec<DebugPoint>,
 }
 
 /// The people on each seat by the scripts' numbers (`Seat::omsi_seat`, the `[drivpos]`
@@ -385,6 +426,8 @@ impl Cabin {
         let mut seat_base = 0usize;
         let mut cabin_parts: Vec<CabinPart> = Vec::new();
         let mut stampers: Vec<(Option<usize>, Vec3)> = Vec::new();
+        let mut link_marks: Vec<(usize, bool)> = Vec::new();
+        let mut debug_points: Vec<DebugPoint> = Vec::new();
         // the point of the section in front that leads on to the next one, and that one as
         // its cabin gives it (`[linkToPrevVeh]`)
         let mut rear_link: Option<usize> = None;
@@ -466,6 +509,30 @@ impl Cabin {
                 .map(|b| b[0] * 0.5)
                 .unwrap_or_else(|| own.iter().map(|p| p.x.abs()).fold(1.2, f32::max));
             let shift = |i: i32| valid(i).map(|m| m as i32).unwrap_or(-1);
+            if let Some(i) = cab.link_to_next_veh.and_then(valid) {
+                link_marks.push((i, true));
+            }
+            if let Some(i) = cab.link_to_prev_veh.and_then(valid) {
+                link_marks.push((i, false));
+            }
+            for t in &cab.ticket_sales {
+                debug_points.push(DebugPoint { kind: "ticket_sale", pos: Vec3::from(t.pos) + *offset, point: valid(t.path_point), note: String::new() });
+            }
+            for t in &cab.stampers {
+                debug_points.push(DebugPoint { kind: "stamper", pos: Vec3::from(t.pos) + *offset, point: valid(t.path_point), note: String::new() });
+            }
+            for (list, base_kind) in [(&cab.money_points, "ticket_sale_money_point"), (&cab.change_points, "ticket_sale_change_point")] {
+                for m in list {
+                    let kind = match (base_kind, m.parent.is_some()) {
+                        ("ticket_sale_money_point", false) => "ticket_sale_money_point",
+                        ("ticket_sale_money_point", true) => "ticket_sale_money_point_2",
+                        (_, false) => "ticket_sale_change_point",
+                        (_, true) => "ticket_sale_change_point_2",
+                    };
+                    let note = format!("var {} {}{}", m.var[0], m.var[1], m.parent.as_deref().map(|p| format!(", parent {p}")).unwrap_or_default());
+                    debug_points.push(DebugPoint { kind, pos: Vec3::from(m.pos) + *offset, point: None, note });
+                }
+            }
             entry_points.extend(
                 cab.entries
                     .iter()
@@ -638,6 +705,8 @@ impl Cabin {
             money_point,
             money_var,
             change_point,
+            link_marks,
+            debug_points,
         })
     }
 
@@ -5218,6 +5287,54 @@ impl Humans {
         // the one straight above or below it)
         let d = |a: &Vec3| (a.truncate() - s.floor.truncate()).length() + (a.z - s.floor.z).abs() * 3.0;
         bn.cabin.graph.points.iter().copied().min_by(|a, b| d(a).total_cmp(&d(b)))
+    }
+
+    /// The cabin of vehicle `v` as the developer tools draw it, in the world now: the path
+    /// points, the links between them (indices into the points) and the places (the
+    /// `[passpos]` point, seated or standing).
+    pub fn debug_cabin(&mut self, v: &VehicleInstance) -> Option<CabinDebug> {
+        let cabin = self.cabin_for(v)?;
+        let trailers = part_frames(v, &cabin);
+        let rot = v.body_rotation();
+        let world = |p: Vec3| train_point(v.position, &rot, &trailers, p);
+        let mut roles = vec![PointRole::default(); cabin.graph.points.len()];
+        for (n, d) in cabin.entries.iter().enumerate() {
+            if let Some(r) = d.point.and_then(|p| roles.get_mut(p)) {
+                r.entries.push((n, !d.sells, d.button));
+            }
+        }
+        for (n, d) in cabin.exits.iter().enumerate() {
+            if let Some(r) = d.point.and_then(|p| roles.get_mut(p)) {
+                r.exits.push(n);
+            }
+        }
+        for (i, next) in &cabin.link_marks {
+            if let Some(r) = roles.get_mut(*i) {
+                if *next {
+                    r.link_next = true;
+                } else {
+                    r.link_prev = true;
+                }
+            }
+        }
+        let mut devices = Vec::new();
+        for dp in &cabin.debug_points {
+            if let Some(r) = dp.point.and_then(|p| roles.get_mut(p)) {
+                match dp.kind {
+                    "ticket_sale" => r.sale = true,
+                    "stamper" => r.stamper = true,
+                    _ => {}
+                }
+            }
+            devices.push((world(dp.pos), dp.kind, dp.note.clone()));
+        }
+        Some(CabinDebug {
+            points: cabin.graph.points.iter().map(|p| world(*p)).collect(),
+            links: cabin.links.iter().filter(|l| l.0 >= 0 && l.1 >= 0).map(|l| (l.0 as usize, l.1 as usize)).collect(),
+            seats: cabin.seats.iter().map(|s| (world(s.pos), s.seated)).collect(),
+            roles,
+            devices,
+        })
     }
 
     /// Cabin point `local` of vehicle `v` in the world (before the buses' first tick).

@@ -3,12 +3,26 @@
 //! device rate (see `AudioEngine::play_stream`).
 
 use parking_lot::{Mutex, MutexGuard};
+use crate::fx::{FxState, RadioFx};
 use std::collections::VecDeque;
+
+/// What the radio asks of the mixer for this stream, set every frame.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct StreamControl {
+    /// Where the sound sits between the ears, -1 (left) .. 1 (right): the far ear is turned
+    /// down by up to 40 %, the near one stays.
+    pub balance: f32,
+    /// The optional radio effects (all off by default).
+    pub fx: RadioFx,
+}
 
 pub struct StreamBuf {
     inner: Mutex<StreamInner>,
     /// What the reader says about the stream: the song playing, or why it is silent.
     status: Mutex<String>,
+    /// What the station says about itself: (its name from the response header, the song or
+    /// whatever text it puts in the stream title). Either may be empty.
+    info: Mutex<(String, String)>,
 }
 
 pub struct StreamInner {
@@ -22,6 +36,8 @@ pub struct StreamInner {
     prebuffer: f32,
     /// The voice ends (the radio was switched off or to another station).
     pub closed: bool,
+    pub ctl: StreamControl,
+    pub(crate) fx: FxState,
 }
 
 impl StreamInner {
@@ -55,8 +71,11 @@ impl Default for StreamBuf {
                 playing: false,
                 prebuffer: 1.5,
                 closed: false,
+                ctl: StreamControl::default(),
+                fx: FxState::default(),
             }),
             status: Mutex::new(String::new()),
+            info: Mutex::new((String::new(), String::new())),
         }
     }
 }
@@ -89,6 +108,11 @@ impl StreamBuf {
         self.inner.lock().playing
     }
 
+    /// Balance and effects for what the mixer plays next.
+    pub fn set_control(&self, ctl: StreamControl) {
+        self.inner.lock().ctl = ctl;
+    }
+
     pub fn close(&self) {
         let mut b = self.inner.lock();
         b.closed = true;
@@ -97,6 +121,19 @@ impl StreamBuf {
 
     pub fn set_status(&self, s: impl Into<String>) {
         *self.status.lock() = s.into();
+    }
+
+    /// The station's own name and stream title, as the reader found them.
+    pub fn set_info(&self, name: &str, song: &str) {
+        let mut i = self.info.lock();
+        if i.0 != name || i.1 != song {
+            *i = (name.to_string(), song.to_string());
+        }
+    }
+
+    /// (the station's name, the stream title) - empty where the station says none.
+    pub fn info(&self) -> (String, String) {
+        self.info.lock().clone()
     }
 
     pub fn status(&self) -> String {

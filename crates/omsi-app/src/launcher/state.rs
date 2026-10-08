@@ -271,9 +271,16 @@ impl State {
         crate::mt::enable(settings.get("machine_translation").and_then(|x| x.as_bool()).unwrap_or(false));
         let keybindings = core::get_keybindings().unwrap_or(serde_json::Value::Null);
         let mut choice = Choice::load();
-        // (at the real time, a trip picked in an earlier session has most likely left)
-        if settings.get("use_real_time").and_then(|v| v.as_bool()).unwrap_or(false) {
-            choice.start_trip = None;
+        // "Start on today's date": once, as the launcher opens, the date (and year) of this
+        // computer's calendar become the duty's - after that it is the player's to change
+        if settings.get("use_real_date").and_then(|v| v.as_bool()).unwrap_or(false) {
+            if let Some((y, mo, d, _, _)) = core::local_now() {
+                let today = format!("{y:04}-{mo:02}-{d:02}");
+                if choice.date != today {
+                    choice.date = today;
+                    choice.season = "auto".into();
+                }
+            }
         }
         let mut s = State {
             config,
@@ -745,31 +752,10 @@ impl State {
     }
 
     /// Work done each frame: results of background work, the regular poll, saving.
-    fn follow_clock(&mut self) {
-        let on = |k: &str| self.settings.get(k).and_then(|v| v.as_bool()).unwrap_or(false);
-        let (time, date, year) = (on("use_real_time"), on("use_real_date"), on("use_real_year"));
-        if !time && !date {
-            return;
-        }
-        let Some((y, mo, d, h, m)) = core::local_now() else { return };
-        if time {
-            self.choice.time = h * 60 + m;
-        }
-        if date {
-            let y = if year { y } else { self.choice.date.get(..4).and_then(|x| x.parse().ok()).unwrap_or(y) };
-            let today = format!("{y:04}-{mo:02}-{d:02}");
-            if self.choice.date != today {
-                self.choice.date = today;
-                self.load_lines();
-            }
-        }
-    }
-
     pub fn update(&mut self, dt: f32) {
         while let Ok(m) = self.rx.try_recv() {
             self.handle(m);
         }
-        self.follow_clock();
         self.poll_t -= dt;
         if self.poll_t <= 0.0 {
             self.poll_t = 2.5;
@@ -1199,22 +1185,13 @@ impl State {
 
     pub fn picked_trip(&self) -> Option<usize> {
         let (line, tour, index, time) = self.choice.start_trip.as_ref()?;
-        // (at the real time the clock moves on, and the trip picked stays: the bus waits for it)
-        (self.choice.line.as_ref() == Some(line) && self.choice.tour.as_ref() == Some(tour) && (*time == self.choice.time || self.real_time())).then_some(*index)
+        (self.choice.line.as_ref() == Some(line) && self.choice.tour.as_ref() == Some(tour) && *time == self.choice.time).then_some(*index)
     }
 
-    /// The start time follows the computer's clock (`use_real_time`).
-    pub fn real_time(&self) -> bool {
-        self.settings.get("use_real_time").and_then(|v| v.as_bool()).unwrap_or(false)
-    }
-
-    /// Start the tour at trip `index` (leaving at `departure`): at its departure, or at the
-    /// real time, which then stays and the bus waits for the trip.
+    /// Start the tour at trip `index` (leaving at `departure`): at its departure.
     pub fn pick_trip(&mut self, index: usize, departure: f64) {
         let (Some(line), Some(tour)) = (self.choice.line.clone(), self.choice.tour.clone()) else { return };
-        if !self.real_time() {
-            self.choice.time = (departure / 60.0).floor() as i32;
-        }
+        self.choice.time = (departure / 60.0).floor() as i32;
         self.choice.start_trip = Some((line, tour, index, self.choice.time));
         self.touched();
     }

@@ -3,7 +3,6 @@
 const REPO = "openOMSI-Project/openOMSI";
 const DOCS = [
   { file: "USER_GUIDE", title: "User guide", icon: "sports_esports" },
-  { file: "ANDROID", title: "Android & mobile", icon: "smartphone" },
   { file: "MODDING", title: "Modding beyond OMSI 2", icon: "handyman" },
   { file: "PBR", title: "PBR materials", icon: "texture" },
   { file: "BUILDING", title: "Building", icon: "build" },
@@ -21,7 +20,6 @@ const PLATFORMS = [
   { key: "macos-x64", name: "macOS (Intel)", icon: "laptop_mac", note: "Intel Macs, macOS 11 or newer", os: "mac-intel" },
   { key: "linux-x64", name: "Linux", icon: "computer", note: "x86-64, Vulkan drivers", os: "linux" },
   { key: "linux-arm64", name: "Linux on ARM", icon: "computer", note: "ARM64, Vulkan drivers", os: "linux-arm" },
-  { key: "android-arm64", ext: "apk", name: "Android", icon: "smartphone", note: "arm64 phones and tablets, Android 8.0+", os: "android" },
 ];
 // The dedicated server: no window, for hosting a session (see the Dedicated server page).
 const SERVERS = [

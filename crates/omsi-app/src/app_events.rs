@@ -1023,7 +1023,7 @@ impl ApplicationHandler for App {
                     // from the driver's seat the figure stays in the mirrors
                     // (from the driver's seat only the mirrors show him)
                     // (out of the seat: nobody at the wheel)
-                    p.sync_driver_hands(r, scene, dt, self.settings.driver && self.on_foot.is_none(), self.view == "driver", self.settings.hands_in_cab);
+                    p.sync_driver_hands(r, scene, dt, self.settings.driver && self.on_foot.is_none(), self.view == "driver", false);
                     if self.view != "free" && self.view != "foot" {
                         let key = crate::input_script::look_key_of(&self.view, Some(p.cam_choice));
                         crate::input_script::swap_view_look(&mut self.look, &mut self.view_looks, &mut self.look_view, &key);
@@ -1293,11 +1293,12 @@ impl ApplicationHandler for App {
                         Some(p) => {
                             let inside = self.in_cab;
                             self.radio.set_map(&self.args.root, &self.args.map);
-                            if let Some(m) = self.radio.update(a, &p.vehicle, inside) {
+                            if let Some(m) = self.radio.update(a, &p.vehicle, inside, self.camera.as_ref().map(|c| c.position), dt, omsi_audio::fx::RadioFx { speaker: self.settings.radio_fx_speaker, noise: self.settings.radio_fx_noise, dropouts: self.settings.radio_fx_dropouts }) {
                                 self.service_msg = Some((m, 6.0));
                             }
                             // (a radio whose display is a text of its script shows the station)
                             p.vehicle.radio_text = self.radio.display_text();
+                            (p.vehicle.host.radio_name, p.vehicle.host.radio_song) = self.radio.now_playing();
                             p.vehicle.radio_frequency = self.radio.frequency(p.vehicle.position.x, p.vehicle.position.y);
                         }
                         None => self.radio.stop(a),
@@ -2308,6 +2309,17 @@ impl ApplicationHandler for App {
                             }
                         }
                     }
+                    // the developer tools window: what it said, and the dots and lines it asked for
+                    crate::devtools_proc::tick(&mut self.devtools, self.player.as_mut(), dt);
+                    let dev_marks = match (self.settings.developer_tools && self.devtools.view.any(), self.surface.as_ref(), self.camera.as_ref(), self.player.as_ref()) {
+                        (true, Some(s), Some(cam), Some(p)) => {
+                            let rig = (self.settings.triple.enabled && !self.settings.vr_requested()).then(|| {
+                                self.settings.triple.zoomed(s.config.width, s.config.height, self.view_zoom.get(&self.view).copied().unwrap_or(1.0))
+                            });
+                            crate::devtools_proc::marks(&self.devtools.view, self.humans.as_mut(), p, cam, s.config.width as f32, hud[3], rig.as_ref(), hud[0])
+                        }
+                        _ => Vec::new(),
+                    };
                     let menu_form = crate::game_lists::dest_form_view(self.player.as_ref(), self.menu_edit.as_ref(), &self.dest_form, self.list_kind.as_ref());
                     if let (Some(ui), Some(s)) = (self.ui.as_mut(), self.surface.as_ref()) {
                         let scale = self.window.as_ref().map(|w| w.scale_factor() as f32).unwrap_or(1.0);
@@ -2420,6 +2432,7 @@ impl ApplicationHandler for App {
                             chat,
                             chat_size: self.settings.chat_size,
                             tags,
+                            marks: dev_marks,
                             notices: &self.notices,
                             notice_anchor: self.navigator.as_ref().and_then(|n| n.screen_rect()),
                         };
@@ -3044,6 +3057,7 @@ impl ApplicationHandler for App {
     /// quit signal): the session is written and the LAN peers hear that we left, before
     /// anything else is torn down (Cmd+Q ends the process without returning from the loop).
     fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
+        self.devtools.stop();
         crate::game_lists::flush_settings(true);
         self.finish_session();
         if let Some(lan) = self.lan.take() {

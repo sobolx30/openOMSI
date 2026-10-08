@@ -202,12 +202,37 @@ impl Shared {
                     continue;
                 }
                 let step = buf.rate as f64 / dev_rate;
+                let ctl = buf.ctl;
+                let fx_on = !ctl.fx.is_off();
+                if fx_on {
+                    buf.fx.prepare(ctl.fx, dev_rate as f32);
+                }
+                // (a source off to one side: the far ear a little quieter, never silent)
+                let b = ctl.balance.clamp(-1.0, 1.0);
+                let far = 1.0 - 0.4 * b.abs();
+                let (bl, br) = if b > 0.0 { (far, 1.0) } else { (1.0, far) };
+                let (left, right) = (left * bl, right * br);
                 for f in 0..frames {
                     v.cur_gain += (target_gain - v.cur_gain) * 0.005;
-                    // silence while the buffer fills (at the start, after a stall)
-                    let Some((a, b)) = buf.pair() else { break };
-                    let t = v.pos as f32;
-                    let (mut l, mut r) = (a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t);
+                    // silence while the buffer fills (at the start, after a stall); with the
+                    // effects on, the gap is the static of a lost station
+                    let (mut l, mut r, real) = match buf.pair() {
+                        Some((a, b)) => {
+                            let t = v.pos as f32;
+                            let (l, r) = (a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t);
+                            if fx_on {
+                                let (l, r) = buf.fx.process(l, r);
+                                (l, r, true)
+                            } else {
+                                (l, r, true)
+                            }
+                        }
+                        None if fx_on => {
+                            let (l, r) = buf.fx.stall();
+                            (l, r, false)
+                        }
+                        None => break,
+                    };
                     if v.params.lowpass_hz > 0.0 {
                         v.lp[0] += (l - v.lp[0]) * lp_alpha;
                         v.lp[1] += (r - v.lp[1]) * lp_alpha;
@@ -218,10 +243,12 @@ impl Shared {
                     if ch > 1 {
                         out[f * ch + 1] += r * g * right;
                     }
-                    v.pos += step;
-                    while v.pos >= 1.0 {
-                        v.pos -= 1.0;
-                        buf.advance();
+                    if real {
+                        v.pos += step;
+                        while v.pos >= 1.0 {
+                            v.pos -= 1.0;
+                            buf.advance();
+                        }
                     }
                 }
                 continue;

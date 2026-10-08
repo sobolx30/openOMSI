@@ -210,6 +210,18 @@ impl App {
             } else if !pressed {
                 self.keys.remove(&code);
             }
+            // Ctrl+Shift+Backspace: the developer tools window starts again (see `devtools_proc`)
+            if pressed
+                && !repeat
+                && code == KeyCode::Backspace
+                && self.settings.developer_tools
+                && (self.keys.contains(&KeyCode::ControlLeft) || self.keys.contains(&KeyCode::ControlRight))
+                && (self.keys.contains(&KeyCode::ShiftLeft) || self.keys.contains(&KeyCode::ShiftRight))
+            {
+                self.devtools.restart();
+                self.service_msg = Some(("Developer tools restarted".into(), 2.0));
+                return;
+            }
             // the trip summary's keys (while it is up)
             if self.summary_key(code, pressed, repeat) {
                 return;

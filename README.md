@@ -36,7 +36,7 @@ Releases are built by hand and published on the
 | --- | --- |
 | Windows x64 | `openOMSI-<version>-windows-x64.zip` - run `openomsi.exe` |
 
-Other systems (macOS, Linux, Android, the dedicated server): build from source, see
+Other systems (macOS, Linux, the dedicated server): build from source, see
 [Building from source](#building-from-source) and [docs/BUILDING.md](docs/BUILDING.md).
 
 Start the game, point the launcher to your OMSI 2 folder once, pick a map, a bus and a duty,
@@ -65,8 +65,6 @@ brings no game content of its own; it plays the original's maps, buses and mods.
      `xattr -dr com.apple.quarantine /path/to/openOMSI.app` once.
    * **Linux:** `./openomsi` (run `chmod +x openomsi` if it does not start). It needs a
      Vulkan or OpenGL driver (Mesa: `mesa-vulkan-drivers`, or your GPU vendor's driver).
-   * **Android:** see [docs/ANDROID.md](docs/ANDROID.md) - the OMSI 2 folder is copied onto the
-     phone first.
 3. **Point it at OMSI 2.** The launcher usually finds the installation by itself (Steam
    libraries, the usual folders). If not, open **Setup** and choose the OMSI 2 folder - the
    one with `Omsi.exe`, `maps` and `Vehicles` in it (the folder, or `Omsi.exe` itself) - and
@@ -138,10 +136,9 @@ The documentation lives in [`docs/`](docs):
 | --- | --- |
 | [User guide](docs/USER_GUIDE.md) | running, controls, launcher, settings, mods, LAN play, debug switches |
 | [Virtual reality](docs/VR.md) | OpenXR setup, VR settings and controls on Windows |
-| [Android](docs/ANDROID.md) | the mobile version: install, touch controls, building the APK |
 | [Modding](docs/MODDING.md) | limits lifted for modders: more interior lights, larger textures, additions OMSI 2 ignores |
 | [PBR materials](docs/PBR.md) | normal, roughness, metalness and occlusion maps for mods |
-| [Building](docs/BUILDING.md) | building from source on macOS, Windows, Linux and Android |
+| [Building](docs/BUILDING.md) | building from source on macOS, Windows and Linux |
 | [Content formats](docs/FORMATS.md) | every OMSI 2 file format |
 | [Architecture](docs/ARCHITECTURE.md) | crates, threading, renderer, roadmap |
 | [Routes](docs/ROUTES.md) | how the original runs timetables, chrono, HOF, IBIS |
@@ -157,7 +154,6 @@ git clone https://github.com/sobolx30/openOMSI.git && cd openOMSI
 scripts/build-macos.sh        # macOS   → dist/macos/openOMSI.app
 scripts\build-windows.cmd     # Windows → dist\windows\openomsi.exe
 scripts/build-linux.sh        # Linux   → dist/linux/openomsi
-scripts/build-android.sh      # Android → dist/android/openOMSI-<version>.apk
 scripts/build-server.sh       # server  → dist/server
 ```
 

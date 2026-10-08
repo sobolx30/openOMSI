@@ -8,6 +8,7 @@
 //! lists, timetables, profiles, installs, running games) is `omsi-launcher-core`, the same
 //! functions `omsi-launcher --cli` offers a terminal.
 
+pub(crate) mod devtools;
 pub(crate) mod drive;
 pub(crate) mod mapview;
 pub mod mobile;
@@ -358,7 +359,7 @@ impl ApplicationHandler for Launcher {
             Some((iw, ih)) => (winit::dpi::LogicalSize::new(iw, ih), None),
             None => crate::startup::fit_window(event_loop, 1440.0, 880.0),
         };
-        let mut attrs = Window::default_attributes().with_title("openOMSI").with_window_icon(crate::startup::window_icon()).with_inner_size(fit);
+        let mut attrs = Window::default_attributes().with_title("openOMSI Sobol3D Edition").with_window_icon(crate::startup::window_icon()).with_inner_size(fit);
         if !mobile::mobile() {
             // (no bigger than the window fitted to the screen: a small one at 150 % has less)
             attrs = attrs.with_min_inner_size(winit::dpi::LogicalSize::new(1080.0f64.min(fit.width), 680.0f64.min(fit.height)));

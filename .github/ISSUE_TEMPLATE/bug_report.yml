@@ -97,7 +97,6 @@ body:
         - Windows
         - macOS
         - Linux
-        - Android
     validations:
       required: true
 

@@ -767,7 +767,6 @@ fn camera_tab(ui: &mut Ui, s: &mut Value, dirty: &mut f32, out: &mut Outside, co
     }
     toggle_setting(ui, s, dirty, c.row(), "Head moves with the bus", "head_movement");
     toggle_setting(ui, s, dirty, c.row(), "Camera glides between viewpoints", "driverview_smooth");
-    toggle_setting(ui, s, dirty, c.row(), "Driver's hands in the cab view", "hands_in_cab");
     toggle_setting(ui, s, dirty, c.row(), "Right mouse button turns the view, Shift+right zooms (off: right zooms as in OMSI, the wheel button turns)", "alt_view");
     toggle_setting(ui, s, dirty, c.row(), "Precision mouse zoom (FOV curve instead of the linear way)", "precision_zoom");
     let left = c.used();
@@ -927,6 +926,15 @@ fn sound_tab(ui: &mut Ui, s: &mut Value, dirty: &mut f32, cols: [Rect; 2]) -> [f
     }
     toggle_setting(ui, s, dirty, c.row(), "Doppler effect", "doppler");
     sel_setting(ui, s, dirty, "s-voices", c.row(), "Passenger voices", "pax_voices", &[("all", "Greetings and tickets"), ("tickets", "Only the ticket asked for"), ("off", "Silent")]);
+    c.section(ui, "Radio effects");
+    c.y += ui.paragraph("Optional character for the bus radio, all off by default. The radio plays from the cab by the driver's seat.", Vec2::new(c.inner.x, c.y), c.inner.w, 12.5, Weight::Regular, TEXT_DIM) + 8.0;
+    for (key, label, id) in [("radio_fx_speaker", "Cheap speaker", "s-fx-spk"), ("radio_fx_noise", "FM hiss and crackle", "s-fx-noise"), ("radio_fx_dropouts", "Lost reception", "s-fx-drop")] {
+        let mut v = get(s, key).as_f64().unwrap_or(0.0) as f32;
+        if ui.slider(id, c.row(), &mut v, 0.0, 1.0, 0.05, label, &|v| if v < 0.025 { "Off".to_string() } else { format!("{:.0}%", v * 100.0) }) {
+            s[key] = json!((v * 100.0).round() / 100.0);
+            *dirty = 0.3;
+        }
+    }
     [c.used(), radio_stations(ui, cols[1])]
 }
 
@@ -993,8 +1001,8 @@ fn gameplay_tab(ui: &mut Ui, s: &mut Value, dirty: &mut f32, cols: [Rect; 2]) ->
     toggle_setting(ui, s, dirty, c.row(), "Collisions with vehicles", "collision_vehicles");
     toggle_setting(ui, s, dirty, c.row(), "Collisions with objects (walls, poles)", "collision_objects");
     toggle_setting(ui, s, dirty, c.row(), "Collisions with people", "collision_pedestrians");
-    toggle_setting(ui, s, dirty, c.row(), "Start at the real time", "use_real_time");
-    toggle_setting(ui, s, dirty, c.row(), "Start on today's date", "use_real_date");
+    // (once, as the launcher opens; the date can be changed freely afterwards)
+    toggle_setting(ui, s, dirty, c.row(), "Start on today's date (set when the launcher opens)", "use_real_date");
     // the game's clock follows this device's (the host's in multiplayer); the time cannot be set
     toggle_setting(ui, s, dirty, c.row(), "Sync the clock with the real time (locks the time)", "time_sync");
     // the weather follows the METAR report of the airport nearest the map; it cannot be changed then
@@ -1045,6 +1053,7 @@ fn general_tab(ui: &mut Ui, s: &mut Value, dirty: &mut f32, out: &mut Outside, c
         TEXT_FAINT,
     );
     c.y += help_height + 3.0;
+    toggle_setting(ui, s, dirty, c.row(), "Enable Developer Tools", "developer_tools");
     // (the texts over the picture, the menu, the timetable and the navigator: larger for
     // those who find them hard to read, smaller for more of the picture; on a window taller
     // than 1080p they grow with it as well, and the launcher grows with its window anyway)
@@ -2654,7 +2663,6 @@ mod settings_tests {
             "s-steer-look-response",
             "set-head_movement",
             "set-driverview_smooth",
-            "set-hands_in_cab",
             "set-alt_view",
             "set-precision_zoom",
             "set-camera_collision",
@@ -2677,10 +2685,10 @@ mod settings_tests {
         let sound = vec!["s-vol", "s-volai", "s-volsc", "set-doppler", "s-voices", "radio-name-0", "radio-url-0", "radio-del-0", "radio-add"];
         let gameplay = vec![
             "s-board", "set-exact_fare", "set-trip_summary", "s-pax", "set-get_up", "s-unsched", "s-maxsched", "s-maxpark",
-            "s-maint", "set-collision_vehicles", "set-collision_objects", "set-collision_pedestrians", "set-use_real_time", "set-use_real_date", "set-time_sync", "set-metar_sync", "s-timespeed",
+            "s-maint", "set-collision_vehicles", "set-collision_objects", "set-collision_pedestrians", "set-use_real_date", "set-time_sync", "set-metar_sync", "s-timespeed",
         ];
         let general = vec![
-            "s-lang", "set-machine_translation", "set-discord_status", "set-voice_chat", "s-uiscale", "set-ui_scale_window", "s-uiop", "set-tooltips", "set-show_fps", "set-notes", "set-chat", "s-chatsize", "set-name_tags",
+            "s-lang", "set-machine_translation", "set-discord_status", "set-voice_chat", "set-developer_tools", "s-uiscale", "set-ui_scale_window", "s-uiop", "set-tooltips", "set-show_fps", "set-notes", "set-chat", "s-chatsize", "set-name_tags",
             "set-navigator", "set-nav_arrows", "set-nav_ai", "corner-top-left", "corner-top-right", "corner-bottom-left", "corner-bottom-right",
             "s-upd-github", "s-reset",
         ];

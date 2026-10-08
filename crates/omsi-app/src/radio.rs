@@ -11,8 +11,9 @@
 //! `radio.cfg` of the same kind beside its global.cfg, whose stations come before the
 //! player's (its `volume` is not read).
 
-use glam::Vec3;
-use omsi_audio::stream::StreamBuf;
+use glam::{DVec3, Vec3};
+use omsi_audio::fx::RadioFx;
+use omsi_audio::stream::{StreamBuf, StreamControl};
 use omsi_audio::{AudioEngine, VoiceId, VoiceParams};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -36,12 +37,19 @@ fn default_text() -> String {
          # (an MP3, AAC or Ogg stream, or an .m3u/.pls playlist). A radio's station\n\
          # button n plays the n-th station, a cassette player the first; Shift+R in the\n\
          # game steps through the list. volume = 0..1.\n\
-         volume = 0.7\n",
+         volume = 0.7\n\
+         # (The optional radio effects - speaker, hiss, lost reception - are in the game's\n\
+         # Settings -> Sound.)\n",
     );
     for (n, u) in DEFAULT_STATIONS {
         text.push_str(&format!("{n} = {u}\n"));
     }
     text
+}
+
+/// The names of the settings in a radio.cfg (not stations).
+fn is_setting(name: &str) -> bool {
+    ["volume", "effects", "fx_speaker", "fx_noise", "fx_dropouts"].iter().any(|k| name.eq_ignore_ascii_case(k))
 }
 
 /// The station lines of a radio.cfg as they stand: (name, all behind the `=` - the address
@@ -52,7 +60,7 @@ fn station_lines(text: &str) -> Vec<(String, String)> {
         .filter(|l| !l.is_empty() && !l.starts_with('#'))
         .filter_map(|l| l.split_once('='))
         .map(|(n, v)| (n.trim().to_string(), v.trim().to_string()))
-        .filter(|(n, v)| !n.eq_ignore_ascii_case("volume") && !v.split('|').next().unwrap_or("").trim().is_empty())
+        .filter(|(n, v)| !is_setting(n) && !v.split('|').next().unwrap_or("").trim().is_empty())
         .collect()
 }
 
@@ -215,6 +223,9 @@ fn parse_stations(text: &str) -> (Vec<(String, String)>, Option<f32>, Frequencie
             volume = value.parse::<f32>().ok().map(|v| v.clamp(0.0, 1.0)).or(volume);
             continue;
         }
+        if is_setting(name) {
+            continue;
+        }
         let mut parts = value.split('|');
         let url = parts.next().unwrap_or("").trim();
         if url.is_empty() {
@@ -254,6 +265,10 @@ pub struct Radio {
     /// Shift+R: how far the list is turned from the bus's own station numbers.
     offset: usize,
     playing: Option<Playing>,
+    /// The smoothed place of the sound: 0..1 how near the head is to the radio, and the
+    /// balance -1..1 (see `update`).
+    near: f32,
+    bal: f32,
 }
 
 struct Playing {
@@ -265,6 +280,17 @@ struct Playing {
     /// The line a text display runs through (see `Radio::display_text`), and since when.
     line: (String, std::time::Instant),
 }
+
+/// Where the radio sits against the driver's camera, in the bus's frame (metres: right,
+/// forward, up): the dashboard, a little to the right of the driver and low.
+const RADIO_OFFSET: Vec3 = Vec3::new(0.3, 0.5, -0.25);
+/// Inside the cab the radio is at full volume within this distance of the head (metres).
+const ROOM_RANGE: f32 = 2.5;
+/// A radio this far to the side (metres) pulls the sound as far as `MAX_BALANCE`.
+const BALANCE_SPAN: f32 = 1.5;
+/// How far to the side the sound sits at most (1 = fully one ear's side; the far ear is
+/// turned down by 40 % of this, see the mixer).
+const MAX_BALANCE: f32 = 0.5;
 
 /// Characters in a line of a radio's text display (the "Magnitola" radio of P3ta's SOR
 /// buses and its kin: two lines of ten).
@@ -369,7 +395,7 @@ impl Radio {
         if !stations.is_empty() {
             log::info!("radio: {} stations", stations.len());
         }
-        Radio { stations: stations.clone(), own: stations, frequencies: frequencies.clone(), own_frequencies: frequencies, map: String::new(), relisted: false, volume, offset: 0, playing: None }
+        Radio { stations: stations.clone(), own: stations, frequencies: frequencies.clone(), own_frequencies: frequencies, map: String::new(), relisted: false, volume, offset: 0, playing: None, near: 1.0, bal: 0.0 }
     }
 
     /// The frequency the station that plays is on where the bus is (`94.6 MHz`), for a
@@ -424,7 +450,15 @@ impl Radio {
 
     /// Follow the player's bus radio; a text for the screen when the station or its song
     /// changes.
-    pub fn update(&mut self, audio: &AudioEngine, v: &omsi_sim::VehicleInstance, inside: bool) -> Option<String> {
+    ///
+    /// The sound comes from the cab: a point beside and ahead of the driver's camera. Inside
+    /// it is not spatial - it only gets a little quieter as the head moves away from the radio
+    /// and sits a little to the side it is on. Both follow the *bus's* axes (not where the
+    /// head looks) and are smoothed over about half a second, so turning the head or switching
+    /// the cab views never swings the sound from one ear to the other. Outside it is a
+    /// voice at that point, muffled by the bodywork. `ear` is the camera in the world, `dt`
+    /// the frame time, `fx` the effects of the Sound settings.
+    pub fn update(&mut self, audio: &AudioEngine, v: &omsi_sim::VehicleInstance, inside: bool, ear: Option<DVec3>, dt: f32, fx: RadioFx) -> Option<String> {
         let wanted = self.wanted(v);
         // (another map's list: the same button is another station now)
         if std::mem::take(&mut self.relisted) {
@@ -444,14 +478,32 @@ impl Radio {
         // the volume knob, where the radio has one (0..1, some go to 2)
         let knob = v.var("SndVol_Radio").map(|x| x.clamp(0.0, 2.0)).unwrap_or(1.0);
         let gain = self.volume * knob;
+        // the radio: by the driver's camera (right, forward, down), else in the front of the cab
+        let def = &v.ty.def;
+        let n = def.cameras_driver.len().max(1);
+        let seat = def.cameras_driver.get(def.camera_std % n).or(def.cameras_driver.first()).map(|c| Vec3::new(c.pos[0], c.pos[1], c.pos[2]));
+        let local = seat.map(|s| s + RADIO_OFFSET).unwrap_or(Vec3::new(0.0, 0.0, 1.5));
+        let rot = v.body_rotation();
+        let source = v.position + rot.transform_vector3(local).as_dvec3();
+        let right = rot.transform_vector3(Vec3::X).as_dvec3();
+        let (mut near_goal, mut bal_goal) = (1.0f32, 0.0f32);
+        if let Some(ear) = ear.filter(|_| inside) {
+            let d = source - ear;
+            near_goal = (ROOM_RANGE / (d.length() as f32).max(ROOM_RANGE)).clamp(0.12, 1.0);
+            bal_goal = (d.dot(right) as f32 / BALANCE_SPAN).clamp(-1.0, 1.0) * MAX_BALANCE;
+        }
+        // (about half a second to settle; a jump of the view moves it gently)
+        let k = 1.0 - (-dt.clamp(0.0, 0.25) / 0.55).exp();
+        self.near += (near_goal - self.near) * k;
+        self.bal += (bal_goal - self.bal) * k;
         // heard through the bodywork from outside
-        let pos = v.position.as_vec3() + Vec3::Z * 1.5;
         let params = if inside {
-            VoiceParams { gain, ..Default::default() }
+            VoiceParams { gain: gain * self.near, ..Default::default() }
         } else {
-            VoiceParams { gain, position: Some(pos), range: 4.0, lowpass_hz: 700.0, ..Default::default() }
+            VoiceParams { gain, position: Some(source.as_vec3()), range: 4.0, lowpass_hz: 700.0, ..Default::default() }
         };
         audio.set_params(p.voice, params);
+        p.buf.set_control(StreamControl { balance: if inside { self.bal } else { 0.0 }, fx: fx.clamped() });
         let status = p.buf.status();
         if status != p.shown && !status.is_empty() && status != "connecting …" {
             p.shown = status.clone();
@@ -460,6 +512,16 @@ impl Radio {
             return Some(line);
         }
         None
+    }
+
+    /// The station that plays and its stream title, for the scripts' `GetRadioName` and
+    /// `GetRadioSong`: the name the station gives itself (else the one in the list), and the
+    /// song or whatever text it sends. Both empty while the radio is off.
+    pub fn now_playing(&self) -> (String, String) {
+        let Some(p) = self.playing.as_ref() else { return Default::default() };
+        let (name, song) = p.buf.info();
+        let name = if name.trim().is_empty() { self.stations.get(p.station).map(|s| s.0.clone()).unwrap_or_default() } else { name };
+        (name, song)
     }
 
     /// What a radio with a text display shows now (`VehicleInstance::radio_text`): the
@@ -523,6 +585,14 @@ mod tests {
     }
 
     #[test]
+    fn the_old_effect_lines_of_a_radio_cfg_are_no_stations() {
+        let text = "effects = light\nfx_noise = 0.3\nOne = http://a.example/x.mp3\n";
+        assert_eq!(station_lines(text).len(), 1);
+        assert_eq!(parse_stations(text).0.len(), 1);
+        assert!(station_lines(&default_text()).iter().all(|(n, _)| !is_setting(n)));
+    }
+
+    #[test]
     fn a_text_display_gets_plain_letters_and_no_line_break() {
         assert_eq!(display_line("Evropa 2", ""), "Evropa 2");
         assert_eq!(display_line("Evropa 2", "buffering …"), "Evropa 2");
@@ -538,7 +608,7 @@ mod tests {
         std::fs::create_dir_all(&map).unwrap();
         std::fs::write(map.join("radio.cfg"), "# the town's stations\nvolume = 0.1\nMestske radio = http://example.org/mesto.mp3\nSecond = http://example.org/own.mp3\n").unwrap();
         let own = vec![("Mine".to_string(), "http://example.org/mine.mp3".to_string()), ("Own".to_string(), "http://EXAMPLE.org/own.mp3".to_string())];
-        let mut r = Radio { stations: own.clone(), own, frequencies: Default::default(), own_frequencies: Default::default(), map: String::new(), relisted: false, volume: 0.7, offset: 2, playing: None };
+        let mut r = Radio { stations: own.clone(), own, frequencies: Default::default(), own_frequencies: Default::default(), map: String::new(), relisted: false, volume: 0.7, offset: 2, playing: None, near: 1.0, bal: 0.0 };
         r.set_map(&dir, "maps/Mesto/global.cfg");
         let names: Vec<&str> = r.stations.iter().map(|s| s.0.as_str()).collect();
         assert_eq!(names, ["Mestske radio", "Second", "Mine"]);

@@ -1227,6 +1227,7 @@ fn steps_of(verb: &str) -> Option<Vec<f32>> {
         "pax" => PAX.to_vec(),
         "volume" => VOLUME.to_vec(),
         "led_glow" => (0..16).map(|v| v as f32).collect(),
+        "radio_fx_speaker" | "radio_fx_noise" | "radio_fx_dropouts" => (0..=20).map(|v| v as f32 * 0.05).collect(),
         "led_mips" => (0..=80).map(|v| v as f32 * 0.05).collect(),
         "ui_scale" => (10..=40).map(|v| v as f32 * 0.05).collect(),
         "chat_size" => (5..=30).map(|v| v as f32 * 0.1).collect(),
@@ -1365,6 +1366,9 @@ fn option_now(app: &App, verb: &str, arg: &str) -> Option<f32> {
         "volume" => s.volume,
         "led_glow" => s.led_glow as f32,
         "led_mips" => s.led_mips,
+        "radio_fx_speaker" => s.radio_fx_speaker,
+        "radio_fx_noise" => s.radio_fx_noise,
+        "radio_fx_dropouts" => s.radio_fx_dropouts,
         "ctrl_deadzone" => s.ctrl_deadzone,
         "pedal_t" => s.pedal_throttle,
         "pedal_b" => s.pedal_brake,
@@ -1443,6 +1447,16 @@ fn option_set(app: &mut App, verb: &str, arg: &str, v: f32) -> Option<(&'static 
         "led_glow" => {
             app.settings.led_glow = v.round() as _;
             Some(("led_glow", app.settings.led_glow.to_string()))
+        }
+        "radio_fx_speaker" | "radio_fx_noise" | "radio_fx_dropouts" => {
+            let v = ((v.clamp(0.0, 1.0)) * 20.0).round() / 20.0;
+            let (key, slot) = match verb {
+                "radio_fx_speaker" => ("radio_fx_speaker", &mut app.settings.radio_fx_speaker),
+                "radio_fx_noise" => ("radio_fx_noise", &mut app.settings.radio_fx_noise),
+                _ => ("radio_fx_dropouts", &mut app.settings.radio_fx_dropouts),
+            };
+            *slot = v;
+            Some((key, v.to_string()))
         }
         "led_mips" => {
             app.settings.led_mips = v.clamp(0.0, 4.0);
@@ -2338,6 +2352,7 @@ fn options_pages(app: &App) -> Vec<Page> {
     let file = settings_file();
     let pick = |key: &str, name: &str, desc: &str| select_row(&file, key, name, desc);
     let pct = |v: f32| format!("{:.0} %", v * 100.0);
+    let fx_fmt = |v: f32| if v < 0.025 { "Off".to_string() } else { format!("{:.0} %", v * 100.0) };
     let cm = |v: f32| format!("{:+.0} cm", v * 100.0);
     let later = "Takes effect when the game starts the next time";
     let game: Vec<(String, String)> = vec![
@@ -2470,6 +2485,9 @@ fn options_pages(app: &App) -> Vec<Page> {
         slider_row(app, "volume", "Volume", "Set how loud the game should be", &pct),
         slider_row(app, "vol_ai", "Traffic", "How loud the other vehicles are", &pct),
         slider_row(app, "vol_scenery", "Surroundings", "How loud the sounds of the scenery are", &pct),
+        slider_row(app, "radio_fx_speaker", "Radio: cheap speaker", "Narrow, boxy dashboard speaker sound (0 = off)", &fx_fmt),
+        slider_row(app, "radio_fx_noise", "Radio: FM hiss and crackle", "Noise of a weak FM reception (0 = off)", &fx_fmt),
+        slider_row(app, "radio_fx_dropouts", "Radio: lost reception", "Now and then the station fades out for a moment (0 = off)", &fx_fmt),
         switch_row(app, "doppler", "Doppler effect", "Approaching sounds higher, receding ones lower"),
         pick("pax_voices", "Passenger voices", "What passengers say"),
     ]
@@ -2485,7 +2503,6 @@ fn options_pages(app: &App) -> Vec<Page> {
         slider_row(app, "steer_look_response", "Steering view response", "How quickly the view follows the steering", &|v| format!("{:.0} ms", v * 1000.0)),
         slider_row(app, "head_idle", "Head sway at a standstill", "How much the view sways on its own when nothing is done to it - a head at rest is never quite still, most of it seen while the bus waits at a stop", &|v| if v <= 0.0 { "Off".to_string() } else { format!("{:.0}%", v * 100.0) }),
         slider_row(app, "head_idle_pace", "Sway pace", "How fast that sway moves (100% is the pace it is designed at)", &|v| format!("{:.0}%", v * 100.0)),
-        switch_row(app, "hands_in_cab", "Driver's hands in the cab view", "Shows the driver's hand on the steering wheel (Cockpit only)"),
         switch_row(app, "driver", "Driver at the wheel (outside views)", "Shows the driver in the outside views and in the mirrors"),
         switch_row(app, "headtrack", "Head tracking", &format!("Head tracking with opentrack (UDP port {})", s.head_tracking_port)),
         slider_row(app, "look_sens", "Mouse look sensitivity", "How fast the view turns when looking round with the mouse (100% is OMSI's)", &pct),

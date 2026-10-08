@@ -1136,17 +1136,14 @@ fn step_time(l: &mut Launcher, r: Rect) {
         l.state.touched();
     }
     y += 54.0;
-    // the computer's clock in one click - not while the launcher follows it already
-    // (Settings: start at the real time / on today's date), where a button would do nothing
-    let follows = |k: &str| l.state.settings.get(k).and_then(|v| v.as_bool()).unwrap_or(false);
-    let (own_time, own_date) = (!follows("use_real_time"), !follows("use_real_date"));
-    if own_time && l.ui.button("current-time", Rect::new(r.x, y, col, 34.0), "Current time", None, ButtonKind::Normal) {
+    // the computer's clock in one click, each on its own
+    if l.ui.button("current-time", Rect::new(r.x, y, col, 34.0), "Current time", None, ButtonKind::Normal) {
         if let Some((_, _, _, h, m)) = omsi_launcher_lib::local_now() {
             l.state.choice.time = h * 60 + m;
             l.state.touched();
         }
     }
-    if own_date && l.ui.button("current-date", Rect::new(r.x + col + 12.0, y, col, 34.0), "Current date", None, ButtonKind::Normal) {
+    if l.ui.button("current-date", Rect::new(r.x + col + 12.0, y, col, 34.0), "Current date", None, ButtonKind::Normal) {
         if let Some((yy, mo, d, _, _)) = omsi_launcher_lib::local_now() {
             l.state.choice.date = format!("{yy:04}-{mo:02}-{d:02}");
             l.state.choice.season = "auto".into();
@@ -1154,9 +1151,7 @@ fn step_time(l: &mut Launcher, r: Rect) {
             l.state.touched();
         }
     }
-    if own_time || own_date {
-        y += 44.0;
-    }
+    y += 44.0;
     let seasons = ["auto", "spring", "summer", "autumn", "winter"];
     let mut s = seasons.iter().position(|x| *x == l.state.choice.season).unwrap_or(0);
     if l.ui.segmented("season", Rect::new(r.x, y, r.w, 34.0), &mut s, &["By date", "Spring", "Summer", "Autumn", "Winter"]) {
