@@ -86,6 +86,8 @@ struct Params {
     vehicle_centre: [f32; 4],
     sky: [f32; 4],
     sun_light: [f32; 4],
+    /// x 1: the sun's shadow is traced (0: only the occlusion is; the shadow map holds the shadows)
+    flags: [f32; 4],
 }
 
 /// The traced lighting's textures for one picture size (all rgba16float: r the ambient
@@ -287,6 +289,13 @@ impl RayTracer {
                     count: None,
                 },
                 tex(12, unfilt, d2, vis),
+                tex(13, filt, wgpu::TextureViewDimension::D2Array, wgpu::ShaderStages::COMPUTE),
+                wgpu::BindGroupLayoutEntry {
+                    binding: 14,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None },
+                    count: None,
+                },
             ],
         });
         let refl_module = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("ray-traced reflections"), source: wgpu::ShaderSource::Wgsl(reflect_source().into()) });
@@ -436,6 +445,33 @@ impl Renderer {
         (solid, cut, glass)
     }
 
+    /// The light the saloon lamps give a surface of this instance on average, in the picture's
+    /// own terms (0..1, as `interior_lamps` in shader.wgsl adds it): the traced reflections'
+    /// hits add `albedo * this`, so that a lit saloon is lit in a reflection of what is off the
+    /// screen as well (there the picture has no colour to take, and the sun and sky alone
+    /// left it black by night). Taken at the mesh's centre with the lamps' fall-off and an
+    /// average N.L of a half.
+    fn lamp_level(scene: &Scene, inst: &Instance, ro: DVec3, centre: Vec3) -> f32 {
+        let code = inst.interior_lamps;
+        if code == 0 {
+            return inst.interior.clamp(0.0, 0.99);
+        }
+        let first = (code / LAMP_CODE_STRIDE) as usize;
+        let count = (code % LAMP_CODE_STRIDE) as usize;
+        let mut sum = 0.0f32;
+        for l in scene.interior_lights.iter().skip(first).take(count) {
+            let d = (l.position - ro).as_vec3() - centre;
+            let dist2 = d.length_squared().max(1e-4);
+            if l.intensity <= 0.0 || dist2 >= l.radius * l.radius {
+                continue;
+            }
+            let core = l.core.max(0.01);
+            let lum = 0.2126 * l.color[0] + 0.7152 * l.color[1] + 0.0722 * l.color[2];
+            sum += lum * l.intensity * (core * core / dist2) * 0.5;
+        }
+        sum.clamp(0.0, 1.0)
+    }
+
     /// The frame's ray-tracing input: the instances near the camera with their structures
     /// (made for meshes met for the first time) and the records of their geometries, and the
     /// shaders' parameters. False when there is nothing to trace with.
@@ -473,6 +509,7 @@ impl Renderer {
                 }
             }
             let (c, r) = Self::bounding_sphere(scene, inst);
+            let sphere_centre = c;
             let d = (c - cam).length();
             if d - r > RT_RANGE {
                 continue;
@@ -491,6 +528,7 @@ impl Renderer {
             if solid | cut | glass == 0 {
                 continue;
             }
+            let lamp = Self::lamp_level(scene, inst, ro, sphere_centre);
             let caster = inst.casts_shadow && !(self.options.omsi_shadow_casters && !inst.omsi_caster);
             let seen = !inst.mirror_only;
             let t = Mat4::from_translation((inst.origin - ro).as_vec3()) * inst.transform;
@@ -583,7 +621,7 @@ impl Renderer {
                     if from_trans {
                         flags |= 4;
                     }
-                    rt.records.push(Record { tex, trans, flags, pad: 0, color: mat.color });
+                    rt.records.push(Record { tex, trans, flags, pad: lamp.to_bits(), color: mat.color });
                 }
                 chosen.push((key, rows, base, mask));
             }
@@ -652,9 +690,18 @@ impl Renderer {
             vehicle_centre,
             sky: [0.0; 4],
             sun_light: [0.0; 4],
+            flags: [if self.options.rt_shadows { 1.0 } else { 0.0 }, 0.0, 0.0, 0.0],
         };
         self.queue.write_buffer(&rt.params, 0, bytemuck::bytes_of(&p));
         rt.prev = Some((view_proj, ro, vehicle));
+        // the world probe's anchor, from where the render origin is now
+        if let Some(c) = self.cab_probe.as_mut() {
+            let off = c.anchor.map_or([0.0; 4], |a| (a - ro).as_vec3().extend(0.0).to_array());
+            if c.data.anchor != off {
+                c.data.anchor = off;
+                self.queue.write_buffer(&c.uniform, 0, bytemuck::bytes_of(&c.data));
+            }
+        }
         true
     }
 
@@ -792,11 +839,213 @@ impl Renderer {
     }
 }
 
+/// The cabin probe's pictures are this many pixels square.
+const CAB_SIZE: u32 = 512;
+/// The faces' field of view: wider than a cube's 90 degrees, so that they overlap.
+const CAB_FOV: f32 = 100.0;
+/// Yaw (added to the vehicle's heading) and pitch of the six faces: ahead, right, behind,
+/// left, up, down (a pitch of exactly 90 has no "up" to look with).
+const CAB_FACES: [(f32, f32); 6] = [(0.0, 0.0), (90.0, 0.0), (180.0, 0.0), (270.0, 0.0), (0.0, 88.0), (0.0, -88.0)];
+
+/// The probes in the vehicle's frame, while the camera is inside it: the eye, the middle of the
+/// vehicle and its rear, six faces each.
+const CAB_VEHICLE_FACES: usize = 18;
+/// All the faces: those, and six more of the probe at the camera in the world's own frame (the
+/// camera outside the vehicle).
+const CAB_FACE_COUNT: usize = 24;
+/// Farther than this from the world probe's anchor and its faces are forgotten (metres).
+const CAB_ANCHOR_RANGE: f64 = 250.0;
+
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct CabUniform {
+    /// Each face: a point in the vehicle's frame (x right, y ahead, z up, from its origin) to clip space.
+    vp: [[[f32; 4]; 4]; CAB_FACE_COUNT],
+    /// Each face's centre in its frame (the vehicle's, or for the world probe's faces the anchor's);
+    /// w 1 once a face of the vehicle's frame has been drawn, 2 for one of the world's.
+    centre: [[f32; 4]; CAB_FACE_COUNT],
+    /// Where the world probe's anchor is, relative to the render origin (xyz; kept up to date every frame).
+    anchor: [f32; 4],
+}
+
+/// Six pictures of the player's vehicle from the camera inside it, drawn one a frame with the
+/// plain shading (its lamps and all), and the matrices that find a point of the vehicle in them.
+pub(super) struct CabProbe {
+    _texture: wgpu::Texture,
+    faces: Vec<wgpu::TextureView>,
+    /// What the reflections sample (binding 13).
+    array: wgpu::TextureView,
+    uniform: wgpu::Buffer,
+    data: CabUniform,
+    next: usize,
+    next_world: usize,
+    /// The world probe's frame: a point near the camera, kept while the camera stays within `CAB_ANCHOR_RANGE` of it.
+    anchor: Option<DVec3>,
+}
+
+impl Renderer {
+    /// Forget the faces in a range of the probe (they are drawn again before they are read).
+    fn forget_cab_faces(&mut self, range: std::ops::Range<usize>) {
+        let Some(c) = self.cab_probe.as_mut() else { return };
+        let mut changed = false;
+        for v in &mut c.data.centre[range] {
+            if v[3] != 0.0 {
+                v[3] = 0.0;
+                changed = true;
+            }
+        }
+        if changed {
+            self.queue.write_buffer(&c.uniform, 0, bytemuck::bytes_of(&c.data));
+        }
+    }
+
+    /// Make the cabin probe's textures (once, the first time the traced reflections are drawn).
+    pub(super) fn ensure_cab_probe(&mut self) {
+        if self.cab_probe.is_some() || self.rt.is_none() {
+            return;
+        }
+        let texture = self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("cabin probe"),
+            size: wgpu::Extent3d { width: CAB_SIZE, height: CAB_SIZE, depth_or_array_layers: CAB_FACE_COUNT as u32 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: self.format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        let faces = (0..CAB_FACE_COUNT as u32)
+            .map(|i| {
+                texture.create_view(&wgpu::TextureViewDescriptor {
+                    label: Some("cabin probe face"),
+                    dimension: Some(wgpu::TextureViewDimension::D2),
+                    base_array_layer: i,
+                    array_layer_count: Some(1),
+                    ..Default::default()
+                })
+            })
+            .collect();
+        let array = texture.create_view(&wgpu::TextureViewDescriptor {
+            label: Some("cabin probe"),
+            dimension: Some(wgpu::TextureViewDimension::D2Array),
+            ..Default::default()
+        });
+        let data: CabUniform = bytemuck::Zeroable::zeroed();
+        let uniform = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("cabin probe"),
+            size: std::mem::size_of::<CabUniform>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        self.queue.write_buffer(&uniform, 0, bytemuck::bytes_of(&data));
+        self.cab_probe = Some(CabProbe { _texture: texture, faces, array, uniform, data, next: 0, next_world: 0, anchor: None });
+    }
+
+    /// Enhanced+ with the camera inside the player's vehicle: draw the next face of the cabin
+    /// probe (one a frame). Outside the vehicle the faces are forgotten. Returns whether one was drawn.
+    /// `OMSI_CAB_PROBE=0` (or `OMSI_CAB_REFLECTION=0`) leaves it out.
+    pub fn render_cab_probe(&mut self, scene: &mut Scene, camera: &Camera, lighting: &Lighting) -> bool {
+        let off = |name: &str| omsi_cfg::env::var(name).ok().is_some_and(|v| v.trim() == "0");
+        let active = self.rt.is_some()
+            && self.options.rt_reflections > 0
+            && !self.rt_error.load(std::sync::atomic::Ordering::Relaxed)
+            && lighting.enhanced
+            && self.hdr_pass.is_some()
+            && !off("OMSI_CAB_PROBE")
+            && !off("OMSI_CAB_REFLECTION");
+        if !active {
+            self.forget_cab_faces(0..CAB_FACE_COUNT);
+            return false;
+        }
+        let inside = lighting.inside.filter(|i| point_in_vehicle_box(camera.position, i));
+        self.ensure_cab_probe();
+        if self.cab_probe.is_none() {
+            return false;
+        }
+        let Some((origin, heading, bb)) = inside else {
+            // --- the camera is outside the vehicle: the probe at the camera, in the world's frame
+            self.forget_cab_faces(0..CAB_VEHICLE_FACES);
+            let anchor = match self.cab_probe.as_ref().and_then(|c| c.anchor) {
+                Some(a) if (camera.position - a).length() < CAB_ANCHOR_RANGE => a,
+                _ => {
+                    let a = (camera.position / 100.0).floor() * 100.0;
+                    self.forget_cab_faces(CAB_VEHICLE_FACES..CAB_FACE_COUNT);
+                    if let Some(c) = self.cab_probe.as_mut() {
+                        c.anchor = Some(a);
+                    }
+                    a
+                }
+            };
+            let Some(c) = self.cab_probe.as_ref() else { return false };
+            let face = c.next_world % 6;
+            let face_i = CAB_VEHICLE_FACES + face;
+            let view = c.faces[face_i].clone();
+            let (yaw, pitch) = CAB_FACES[face];
+            let cam = Camera { position: camera.position, yaw, pitch, roll: 0.0, fov_deg: CAB_FOV, near: 0.05, far: 300.0 };
+            self.texture_aspect = Some(1.0);
+            self.render_inner(scene, &view, CAB_SIZE, CAB_SIZE, &cam, lighting, false, None, None, false);
+            self.texture_aspect = None;
+            let m = cam.view_proj(1.0, anchor);
+            let at = (camera.position - anchor).as_vec3();
+            let Some(c) = self.cab_probe.as_mut() else { return false };
+            c.data.vp[face_i] = m.to_cols_array_2d();
+            c.data.centre[face_i] = [at.x, at.y, at.z, 2.0];
+            c.next_world = (face + 1) % 6;
+            self.queue.write_buffer(&c.uniform, 0, bytemuck::bytes_of(&c.data));
+            return true;
+        };
+        // --- the camera is inside the vehicle: the probes in its frame
+        self.forget_cab_faces(CAB_VEHICLE_FACES..CAB_FACE_COUNT);
+        let Some(c) = self.cab_probe.as_ref() else { return false };
+        let face_i = c.next % CAB_VEHICLE_FACES;
+        let (probe, face) = (face_i / 6, face_i % 6);
+        let view = c.faces[face_i].clone();
+        // (the vehicle's frame: x = d.x ch - d.y sh, y = d.x sh + d.y ch, as the shader turns a point into it)
+        let (sh, ch) = (heading as f32).to_radians().sin_cos();
+        let d = (camera.position - origin).as_vec3();
+        let eye = Vec3::new(d.x * ch - d.y * sh, d.x * sh + d.y * ch, d.z);
+        // the eye, the middle of the vehicle's box, and a quarter of its length behind that (at the eye's height)
+        let q = match probe {
+            0 => eye,
+            1 => Vec3::new(bb[3], bb[4], eye.z),
+            _ => Vec3::new(bb[3], bb[4] - 0.28 * bb[1], eye.z),
+        };
+        let position = if probe == 0 {
+            camera.position
+        } else {
+            origin + DVec3::new((q.x * ch + q.y * sh) as f64, (-q.x * sh + q.y * ch) as f64, q.z as f64)
+        };
+        let (yaw, pitch) = CAB_FACES[face];
+        let cam = Camera {
+            position,
+            yaw: (heading as f32 + yaw).rem_euclid(360.0),
+            pitch,
+            roll: 0.0,
+            fov_deg: CAB_FOV,
+            near: 0.05,
+            far: 250.0,
+        };
+        self.texture_aspect = Some(1.0);
+        self.render_inner(scene, &view, CAB_SIZE, CAB_SIZE, &cam, lighting, false, None, None, false);
+        self.texture_aspect = None;
+        // (the vehicle's frame to the world)
+        let to_world = Mat4::from_cols(glam::Vec4::new(ch, -sh, 0.0, 0.0), glam::Vec4::new(sh, ch, 0.0, 0.0), glam::Vec4::Z, glam::Vec4::W);
+        let m = cam.view_proj(1.0, origin) * to_world;
+        let Some(c) = self.cab_probe.as_mut() else { return false };
+        c.data.vp[face_i] = m.to_cols_array_2d();
+        c.data.centre[face_i] = [q.x, q.y, q.z, 1.0];
+        c.next = (face_i + 1) % CAB_VEHICLE_FACES;
+        self.queue.write_buffer(&c.uniform, 0, bytemuck::bytes_of(&c.data));
+        true
+    }
+}
+
 impl Renderer {
     /// The ray-traced reflections of the window's picture, added to `HdrTargets::view` after
     /// the main pass (and before the rain on the glass, which looks through it).
     pub(super) fn encode_rt_reflections(&mut self, encoder: &mut wgpu::CommandEncoder, w: u32, h: u32, queries: Option<&wgpu::QuerySet>, timed: &mut Vec<&'static str>) {
-        let (Some(rt), Some(hdr), Some(ao), Some(probe)) = (self.rt.as_mut(), self.hdr_targets.get(&(w, h)), self.ao.as_ref(), self.probe.as_ref()) else { return };
+        self.ensure_cab_probe();
+        let (Some(rt), Some(hdr), Some(ao), Some(probe), Some(cab)) = (self.rt.as_mut(), self.hdr_targets.get(&(w, h)), self.ao.as_ref(), self.probe.as_ref(), self.cab_probe.as_ref()) else { return };
         let Some(gbuf) = hdr.gbuf.as_ref() else { return };
         let half = (w.div_ceil(refl_div()), h.div_ceil(refl_div()));
         if rt.refl.as_ref().is_none_or(|r| r.0 != half) {
@@ -836,6 +1085,8 @@ impl Renderer {
                     wgpu::BindGroupEntry { binding: 10, resource: wgpu::BindingResource::TextureView(&probe.view) },
                     wgpu::BindGroupEntry { binding: 11, resource: self.enh_buf.as_entire_binding() },
                     wgpu::BindGroupEntry { binding: 12, resource: wgpu::BindingResource::TextureView(h12) },
+                    wgpu::BindGroupEntry { binding: 13, resource: wgpu::BindingResource::TextureView(&cab.array) },
+                    wgpu::BindGroupEntry { binding: 14, resource: cab.uniform.as_entire_binding() },
                 ],
             })
         };

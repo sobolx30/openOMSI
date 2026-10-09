@@ -392,6 +392,21 @@ fn lamp_light(p: vec3<f32>, n: vec3<f32>, v: vec3<f32>, sf: Surface, thin: bool)
 // most of the sky, and the dashboard lies right under the windscreen.
 const CAB_AMBIENT: f32 = 1.15;
 
+// [ROLLBACK envmap-39 begin] (devtools-39: how a `[matl_envmap]` paint reflects in Enhanced)
+// Before: the F0 of a paint was clamp(refl, 0.02, 0.08); the photo's tint weighed 0.65 with mix(0.25, 1.0, sharpness);
+// a paint was never traced in Enhanced+ (`!paint` in the `traced` test). Old values to put back:
+//   ENVMAP_F0_MAX 0.08, ENVMAP_PHOTO 0.65, ENVMAP_PHOTO_SOFT 0.25, ENVMAP_TRACED false.
+const ENVMAP_F0_MAX: f32 = 0.16;
+const ENVMAP_PHOTO: f32 = 1.0;
+const ENVMAP_PHOTO_SOFT: f32 = 0.6;
+const ENVMAP_TRACED: bool = true;
+const ENVMAP_SPHERE: bool = true;
+// [ROLLBACK envlit-41] (devtools-41: a reflection map lit by the lamps; false = before, no such term)
+const ENVMAP_LIT_GLASS: bool = true;
+const ENVMAP_LIT_PAINT: bool = false;
+const ENVMAP_LIT_GAIN: f32 = 1.0;
+// [ROLLBACK envmap-39 end]
+
 // How far the puddle threshold drops with the wetness: see the puddle mask in `shade_enhanced`.
 const PUDDLE_SPREAD: f32 = 0.45;
 
@@ -732,7 +747,9 @@ fn shade_enhanced(in: FsIn, puddle_weight: ptr<function, vec2<f32>>, capture: bo
         let masked = (u32(material.params2.w + 0.5) & 1u) != 0u;
         let metal_ok = (u32(material.params2.w + 0.5) & 4u) != 0u;
         metal = select(0.0, smoothstep(0.3, 0.85, refl), masked || metal_ok);
-        f0 = mix(vec3<f32>(clamp(refl, 0.02, 0.08)), mix(albedo, vec3<f32>(1.0), 0.4) * refl, metal);
+        // [ROLLBACK envmap-39] before: f0 = mix(vec3<f32>(clamp(refl, 0.02, 0.08)), ...)
+        let paint_f0 = max(clamp(refl, 0.02, 0.08), ENVMAP_F0_MAX * smoothstep(0.3, 1.0, refl));
+        f0 = mix(vec3<f32>(paint_f0), mix(albedo, vec3<f32>(1.0), 0.4) * refl, metal);
         rough = mix(max(0.3 - 0.12 * smoothstep(0.0, 0.25, refl), select(0.22, 0.0, masked || metal_ok)), 0.14, metal);
     } else if (!thin && material.specular.w > 0.0 && dot(material.specular.rgb, vec3<f32>(1.0)) > 0.05) {
         // the o3d material's Blinn-Phong power as GGX roughness
@@ -962,6 +979,26 @@ fn shade_enhanced(in: FsIn, puddle_weight: ptr<function, vec2<f32>>, capture: bo
     // the sky, the doors (seen at a grazing angle from the driver's seat) went a milky
     // grey sheet in fog and snow, when the probe is bright all round.
     let own_pane = select(0.0, near_player_vehicle(in.world) * inside_vehicle(camera.cam_pos.xyz), glass);
+    // Experimental (OMSI_CAB_REFLECTION, on unless 0; enh.led.z): the bus's own pane seen from
+    // its cab mirrors the cabin as a real pane does, as strongly as the cabin is bright against
+    // what lies outside: nothing by day (the sun makes the street far brighter), clearly at night
+    // with the saloon's lamps lit - instead of a flat 15 % of the sky's reflection at any hour.
+    // `cab_lamp` (the lamps' light at the pane) goes to the reflection pass with the weight.
+    let cab_pane = own_pane > 0.5 && enh.led.z > 0.5;
+    var cab_mirror = 0.0;
+    var cab_lamp = 0.0;
+    if (cab_pane) {
+        let lum3 = vec3<f32>(0.2126, 0.7152, 0.0722);
+        let lamp_v = max(interior_lamps(in.world, n, in.params2.z), interior_lamps(in.world, -n, in.params2.z));
+        cab_lamp = dot(lamp_v, lum3);
+        // (mean radiance of a cabin wall: its ambient and the lamps on a mid-light surface; of
+        // the street: the sky's light and half the sun's on a darker one, all pre-exposed)
+        let cabin_rad = dot(cab_e, lum3) * CAB_AMBIENT * 0.35 / PI * pre + cab_lamp * 0.35;
+        let street_rad = (dot(avg_e, lum3) + dot(enh.sun.rgb, lum3) * 0.5) * 0.3 / PI * pre;
+        cab_mirror = smoothstep(0.25, 2.0, cabin_rad / max(street_rad, 1e-4));
+    }
+    var env_lit = vec3<f32>(0.0);
+    let paint_env = reflective_env && !glass;
     if (reflective_env) {
         // OMSI's photographed environment gives the reflection its structure (trees,
         // houses, the street), the probe its light
@@ -972,7 +1009,11 @@ fn shade_enhanced(in: FsIn, puddle_weight: ptr<function, vec2<f32>>, capture: bo
         // rows (sky, the horizon's trees and houses, the ground), the compass direction
         // a gentle drift across it that stays put in the world.
         let az = atan2(r.y, r.x);
-        var env_uv = vec2<f32>(0.5 + 0.3 * sin(az), 0.5 + 0.45 * clamp(r.z, -1.0, 1.0));
+        // [ROLLBACK envmap-40] before: `var env_uv = vec2<f32>(0.5 + 0.3 * sin(az), 0.5 + 0.45 * clamp(r.z, -1.0, 1.0));`
+        // (the photo read as a panorama by the reflection's height and compass direction); now it is read
+        // as OMSI reads it, by the sphere map's coordinate from the vertex (with the scroll of the camera's
+        // turn, see `sphere_map_uv` in shader.wgsl). ENVMAP_SPHERE false puts the old lookup back.
+        var env_uv = select(vec2<f32>(0.5 + 0.3 * sin(az), 0.5 + 0.45 * clamp(r.z, -1.0, 1.0)), in.env_uv, ENVMAP_SPHERE);
         if (material.bump.y > 0.5) {
             env_uv = env_uv + bump_offset(duv);
         }
@@ -997,7 +1038,18 @@ fn shade_enhanced(in: FsIn, puddle_weight: ptr<function, vec2<f32>>, capture: bo
         // trees stood as flat grey silhouettes on every pane in fog, in front of the real
         // (fogged) trees behind the glass - outlines of trees that are not there
         let clear_air = exp(-enh.fog.x * 150.0);
-        env = env * mix(vec3<f32>(1.0), ratio, band * 0.65 * mix(0.25, 1.0, sharpness) * outside_env * clear_air * enh.debug.z);
+        // [ROLLBACK envmap-39] before: band * 0.65 * mix(0.25, 1.0, sharpness)
+        let photo_tint = mix(vec3<f32>(1.0), ratio, band * ENVMAP_PHOTO * mix(ENVMAP_PHOTO_SOFT, 1.0, sharpness) * outside_env * clear_air * enh.debug.z);
+        env = env * photo_tint;
+        // [ROLLBACK envlit-41] The lamps' light on the pane (a street lamp, a headlamp, a lit shop front: what
+        // the grid holds at this point) lights the surroundings the photograph shows, which the pane mirrors:
+        // as much as a mid-grey (0.25) world would send back of it, in the photograph's tints. This is the
+        // lamps' share of what the traced reflection finds in a ray tracing frame; the sky probe above
+        // is dark by night, so the pane stood black without it.
+        if ((glass && ENVMAP_LIT_GLASS) || (paint_env && ENVMAP_LIT_PAINT)) {
+            let white = Surface(vec3<f32>(1.0), vec3<f32>(0.0), 1.0);
+            env_lit = lamp_light(in.world, n, v, white, false) * 0.25 * photo_tint * outside_env * ENVMAP_LIT_GAIN;
+        }
     }
     // what the SSAO darkens, it also keeps reflections out of
     let spec_occ = clamp(pow(nv + ao, exp2(-16.0 * rough - 1.0)) - 1.0 + ao, 0.0, 1.0);
@@ -1014,14 +1066,19 @@ fn shade_enhanced(in: FsIn, puddle_weight: ptr<function, vec2<f32>>, capture: bo
     if (glass) {
         // Transparent bus panes need a readable outside reflection from the driver's
         // viewpoint; opaque paint must never receive this boost.
-        refl_f = refl_f * 0.75 * (1.0 - 0.85 * own_pane);
+        refl_f = refl_f * 0.75 * (1.0 - 0.85 * own_pane * select(1.0, 1.0 - cab_mirror, cab_pane));
     }
-    var reflection = select(vec3<f32>(0.0), env * refl_f, reflects);
+    var reflection = select(vec3<f32>(0.0), (env + env_lit) * refl_f, reflects);
     // Enhanced+: traced instead (rough surfaces keep the probe, which is as good as a
     // ray there; so does a body's paint: OMSI's photographed envmap on its low-poly panels
     // looks better than a sharp picture of the street, only chrome is traced)
     let paint = reflective_env && !glass && metal < 0.5;
-    let traced = camera.clouds.w > 1.5 && reflects && !paint && refl_rough < 0.75 && !capture;
+    // [ROLLBACK envmap-39] before: `&& !paint &&` (a paint was never traced)
+    // [ROLLBACK rtsplit-40] before: `camera.clouds.w > 1.5 &&` - every Enhanced+ frame traced every reflecting surface.
+    // clouds.w 2: the traced lighting, with no reflections but the wet roads' (a ray tracing build has no puddle
+    // pass), 3: also those of the player's vehicle, 4: those of every surface (Settings: Ray traced reflections).
+    let rt_refl_here = camera.clouds.w > 3.5 || (camera.clouds.w > 1.5 && wet_road > 0.0) || (camera.clouds.w > 2.5 && near_player_vehicle(in.world) > 0.5);
+    let traced = rt_refl_here && reflects && !(paint && !ENVMAP_TRACED) && refl_rough < 0.75 && !capture;
     if (traced) {
         var w = dot(refl_f, vec3<f32>(0.2126, 0.7152, 0.0722)) * aer.a;
         if (glass) {
@@ -1034,7 +1091,8 @@ fn shade_enhanced(in: FsIn, puddle_weight: ptr<function, vec2<f32>>, capture: bo
         if (w > 0.002) {
             reflection = vec3<f32>(0.0);
             rt_gbuf = vec4<f32>(n * w, w);
-            rt_aux = vec4<f32>(dist * w, rough_t * w, 0.0, w);
+            // (z: 0, or 1 + the cabin lamps' light for an own pane that mirrors the cabin, see rt_reflect)
+            rt_aux = vec4<f32>(dist * w, rough_t * w, select(0.0, (1.0 + cab_lamp) * w, cab_pane), w);
         }
     }
     // --- the lamps, the cabin light and what glows by itself
@@ -1122,6 +1180,18 @@ fn shade_enhanced(in: FsIn, puddle_weight: ptr<function, vec2<f32>>, capture: bo
         // a display's text (see MaterialExtra::display)
         emit = emit + tex.rgb * 0.35 * max(enh.exposure.z * 2.0, 0.8);
     }
+    // [ROLLBACK glass-38 begin] (devtools-38: the colour of a pane)
+    // A pane is no surface that scatters light: its colour is the tint of what it lets through. What
+    // it shows of itself is the sun and the sky on it (OMSI_DEBUG_ENHANCED=14) and its reflection
+    // (=6); the lamps' light, the saloon lamps' on it and a glow of its own laid a pale veil on
+    // the dark tint of a window, by day and at night (a 31454A pane of alpha 80 stood grey).
+    // Before devtools-38 there was no block here: the pane kept `rgb = (direct + ambient + lamps) * pre + cabin`
+    // (computed above) and `emit` as computed above. To roll back, delete the `if` below.
+    if (glass) {
+        rgb = (direct + ambient) * pre;
+        emit = vec3<f32>(0.0);
+    }
+    // [ROLLBACK glass-38 end]
     rgb = rgb + emit;
     if (enh.debug.x > 0.5) {
         // OMSI_DEBUG_ENHANCED: one term alone, as it lands on the screen
@@ -1164,7 +1234,7 @@ fn shade_enhanced(in: FsIn, puddle_weight: ptr<function, vec2<f32>>, capture: bo
         let rl = dot(refl_rgb, vec3<f32>(0.2126, 0.7152, 0.0722));
         // (a pane passes most light: a reflection making it up to 60 % opaque laid a grey
         // veil over the destination display behind the windscreen and the saloon)
-        let a2 = clamp(alpha + (1.0 - alpha) * clamp(rl * 0.25 + fr.g, 0.0, 0.25) * (1.0 - 0.85 * own_pane) * cover, alpha, 1.0);
+        let a2 = clamp(alpha + (1.0 - alpha) * clamp(rl * 0.25 + fr.g, 0.0, 0.25) * (1.0 - 0.85 * own_pane * select(1.0, 1.0 - cab_mirror, cab_pane)) * cover, alpha, 1.0);
         let c = (rgb * alpha + refl_rgb) / max(a2, 1e-3);
         return vec4<f32>(c * aer.a + aer.rgb * pre, a2);
     }

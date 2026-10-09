@@ -933,6 +933,9 @@ impl ApplicationHandler for App {
                         w.terrains.read().contains_key(&k) || w.surfaces.read().contains_key(&k)
                     });
                     if !self.paused && ground_here {
+                        // (the sound crossfades between the street and the cab as the
+                        // walker's camera goes in or out of the bus)
+                        p.foot_mix = if self.view == "foot" { crate::on_foot::foot_cab_mix(self.camera.as_ref().map(|c| c.position), p) } else { None };
                         p.tick(
                             dt,
                             self.audio.as_ref(),
@@ -1028,7 +1031,7 @@ impl ApplicationHandler for App {
                         let key = crate::input_script::look_key_of(&self.view, Some(p.cam_choice));
                         crate::input_script::swap_view_look(&mut self.look, &mut self.view_looks, &mut self.look_view, &key);
                         if let Some(cam) = self.camera.as_ref() {
-                            p.seat = glam::Vec3::from_array(self.settings.seat);
+                            p.seat = glam::Vec3::from_array(self.settings.seat) + glam::Vec3::new(p.view_adj[0], p.view_adj[1], p.view_adj[2]);
                             // head tracking: the head's turn on top of the look, its movement
                             // on top of the seat (opentrack: x left, y up, z back, in cm; the
                             // eye moved by HeadPose::seat_offset)
@@ -1048,7 +1051,7 @@ impl ApplicationHandler for App {
                             // Physical head tracking controls the view without an added automatic turn.
                             p.steer_look = if vr_on || tracked.is_some() { 0.0 } else {
                                 crate::player::steering_view_yaw(p.steer_look, p.vehicle.physics.controls.steering, dt,
-                                                                 self.settings.steer_look && self.view == "driver", self.settings.steer_look_angle, self.settings.steer_look_response)
+                                                                 self.settings.steer_look && self.view == "driver" && p.cam_choice.0 == 0, self.settings.steer_look_angle, self.settings.steer_look_response)
                             };
                             if let Some(t) = tracked {
                                 p.seat += t.seat_offset();
@@ -1069,12 +1072,16 @@ impl ApplicationHandler for App {
                                 dt,
                                 self.settings.look_smoothing_ms,
                             );
-                            let head_look = crate::player::driver_head_look(
+                            let mut head_look = crate::player::driver_head_look(
                                 look,
                                 &self.view,
-                                self.settings.seat_pitch_deg,
+                                self.settings.seat_pitch_deg + if vr_on { 0.0 } else { p.view_adj[4] },
                                 vr_on,
                             );
+                            // (this vehicle's own turn of the driver's view)
+                            if self.view == "driver" && !vr_on {
+                                head_look.0 += p.view_adj[3];
+                            }
                             // what turns the bus's own camera into the picture: the head's turn,
                             // the field of view setting and the zoom (for the camera left in a
                             // switch as well as for the one taken)
@@ -1123,6 +1130,8 @@ impl ApplicationHandler for App {
                             // his head (and nothing at all while the sway is off or driven by a
                             // head tracker - `head_idle` is still then).
                             let idle_rot = (self.view == "driver" && !p.head_idle.is_still()).then(|| [p.head_idle.yaw, p.head_idle.pitch, p.head_idle.roll]);
+                            // (this vehicle's own change of the driver's field of view)
+                            let fov_adj = if self.view == "driver" { p.view_adj[5] } else { 0.0 };
                             let finish = move |c: &mut omsi_render::Camera| {
                                 if let Some(r) = tracked_rot {
                                     c.yaw += r[0].clamp(-170.0, 170.0);
@@ -1138,6 +1147,9 @@ impl ApplicationHandler for App {
                                 if fov_setting >= 20.0 {
                                     c.fov_deg = fov_setting.min(120.0);
                                 }
+                                if fov_adj != 0.0 {
+                                    c.fov_deg = (c.fov_deg + fov_adj).clamp(20.0, 120.0);
+                                }
                                 if let Some(z) = zoom {
                                     c.fov_deg = (c.fov_deg * z).clamp(8.0, 120.0);
                                 }
@@ -1145,7 +1157,7 @@ impl ApplicationHandler for App {
                             let mut cam = p.camera_look(&self.view, &base, head_look, self.orbit);
                             finish(&mut cam);
                             // Smooth cockpit camera switch (arrow keys): the glide mixes the camera left and the one
-                            // taken in the bus's own frame (ease-out over CAM_BLEND_SECS); the bus's motion and
+                            // taken in the bus's own frame (OMSI's exponential approach, see CAM_GLIDE_RATE); the bus's motion and
                             // the head go on top afterwards, so nothing of the last frame's picture is needed.
                             {
                                 let inside_view = self.view == "driver";
@@ -1194,7 +1206,7 @@ impl ApplicationHandler for App {
                                         // (the frame that starts the glide does not count, and a long frame
                                         // adds no more than a 30th of a second)
                                         if !started {
-                                            self.cam_blend.t += dt.min(crate::app::CAM_BLEND_MAX_DT) / crate::app::CAM_BLEND_SECS;
+                                            self.cam_blend.t += dt.min(crate::app::CAM_BLEND_MAX_DT) / crate::app::CAM_GLIDE_SECS;
                                         }
                                         if self.cam_blend.t >= 1.0 {
                                             // (the hand-over to the plain camera: the glide ends exactly on it (k = 1),
@@ -2121,6 +2133,7 @@ impl ApplicationHandler for App {
                     _ => Vec::new(),
                 };
                 let vr_nav_display = self.vr_nav_display();
+                let view_editor_view = self.view_editor_frame();
                 let vr_active = self.vr_active();
                 // the interface over the picture
                 // (the pages of an open settings window)
@@ -2311,7 +2324,39 @@ impl ApplicationHandler for App {
                     }
                     // the developer tools window: what it said, and the dots and lines it asked for
                     crate::devtools_proc::tick(&mut self.devtools, self.player.as_mut(), dt);
-                    let dev_marks = match (self.settings.developer_tools && self.devtools.view.any(), self.surface.as_ref(), self.camera.as_ref(), self.player.as_ref()) {
+                    for what in self.devtools.take_reloads() {
+                        let text = match (self.humans.as_mut(), self.player.as_mut()) {
+                            (Some(h), Some(p)) => h.reload_cabin(what, &mut p.vehicle),
+                            _ => "Nothing to reload: there is no vehicle with passengers yet".to_string(),
+                        };
+                        self.devtools.note(&text);
+                        self.service_msg = Some((text, 4.0));
+                    }
+                    for kind in self.devtools.take_file_reloads() {
+                        use crate::devtools_proc::FileKind;
+                        let text = match (kind, self.player.as_mut()) {
+                            (_, None) => "Nothing to reload: there is no vehicle yet".to_string(),
+                            (FileKind::Sound, Some(p)) => match self.audio.as_ref() {
+                                Some(a) => p.reload_sounds(a),
+                                None => "There is no sound output to reload for".to_string(),
+                            },
+                            (k, Some(p)) => {
+                                let what = match k {
+                                    FileKind::Bus => omsi_sim::FileReload::Bus,
+                                    FileKind::Model => omsi_sim::FileReload::Model,
+                                    _ => omsi_sim::FileReload::Constants,
+                                };
+                                match p.vehicle.reload_from_files(&self.args.root, what) {
+                                    Ok(t) => t,
+                                    Err(e) => format!("Not reloaded, the vehicle stays as it was: {e}"),
+                                }
+                            }
+                        };
+                        log::info!("developer tools: {text}");
+                        self.devtools.note(&text);
+                        self.service_msg = Some((text, 6.0));
+                    }
+                    let dev_marks = match (self.devtools.view.any(), self.surface.as_ref(), self.camera.as_ref(), self.player.as_ref()) {
                         (true, Some(s), Some(cam), Some(p)) => {
                             let rig = (self.settings.triple.enabled && !self.settings.vr_requested()).then(|| {
                                 self.settings.triple.zoomed(s.config.width, s.config.height, self.view_zoom.get(&self.view).copied().unwrap_or(1.0))
@@ -2421,6 +2466,7 @@ impl ApplicationHandler for App {
                             pane_first: self.pane_scroll.filter(|p| Some(p.0) == chooser_sel).map(|p| p.1),
                             menu_tabs,
                             dropdown,
+                            view_editor: view_editor_view,
                             menu_kbd: self.menu_kbd,
                             menu_top: self.menu_top,
                             // (not over the city map, which has the stops and their times: it
@@ -2642,7 +2688,7 @@ impl ApplicationHandler for App {
                                 };
                                 let next = since.max(0.0) + raw_dt.min(0.1);
                                 // (and while the driver turns a mirror, so it can be aimed)
-                                if since < 0.0 || (since < MIRROR_FREEZE_REDRAW && next >= MIRROR_FREEZE_REDRAW) || p.mirrors_dirty {
+                                if since < 0.0 || (since < MIRROR_FREEZE_REDRAW && next >= MIRROR_FREEZE_REDRAW) || p.mirrors_dirty || p.mirror_dev_dirty.swap(false, std::sync::atomic::Ordering::Relaxed) {
                                     self.mirrors_seen = render_mirrors(r, scene, w, p, &lighting, None, None);
                                 }
                                 self.frozen_mirrors = Some(FrozenMirrors { bus: p.uid, since: next });
@@ -2721,6 +2767,9 @@ impl ApplicationHandler for App {
                                 );
                             }
                         }
+                        // Enhanced+: the next face of the cabin probe (the saloon the traced
+                        // reflections show in a pane), while the camera is in the vehicle
+                        r.render_cab_probe(scene, cam, &lighting);
                         *self.profile.entry("mirrors").or_default() += __t.elapsed().as_secs_f64();
                         let __t = Instant::now();
                         #[cfg(windows)]
@@ -3087,6 +3136,10 @@ impl App {
     /// The mouse wheel (or a pinch of two fingers): `amount` notches, up positive.
     pub(crate) fn wheel(&mut self, amount: f32) {
         if self.vr_nav_edit.is_some() { self.vr_nav_scroll(amount); return; }
+        // (over the view editor's panel the wheel does not zoom the view)
+        if self.view_editor_over() {
+            return;
+        }
         // over a mirror panel the wheel resizes it (Shift: wider or narrower)
         if let Some(size) = self.mirror_hud_size() {
             let shift =
@@ -3131,27 +3184,9 @@ impl App {
                 return;
             }
         }
-        // The wheel over a cockpit switch turns it: the same <event>_drag the
-        // original fires while the mouse is dragged, with the notch as the
-        // movement. Knobs, the sun blind and the ignition key are far easier to
-        // set that way than by holding the button down and moving the mouse.
-        if self.hover.is_some() && self.view != "free" {
-            let ray = self.camera.as_ref().zip(self.surface.as_ref())
-                .map(|(cam, s)| self.cockpit_cursor_ray(cam, (s.config.width, s.config.height)));
-            if let (Some(p), Some((o, d, spread))) = (
-                self.player.as_mut(),
-                ray,
-            ) {
-                p.occlude_controls = self.view == "outside";
-                if p.pick(o, d, spread).is_some() {
-                    // a notch is worth a good push of the mouse: the scripts divide
-                    // the movement by 10 (the ignition key), 200 (the parking brake)
-                    // or 500 (the driver's window), so a few pixels would do nothing
-                    p.wheel(o, d, spread, -amount * 40.0);
-                    return;
-                }
-            }
-        }
+        // (the wheel over a cockpit switch used to turn it - an `<event>_drag` and its `_off`
+        // - which clicked the buttons it rolled over instead of zooming: the wheel only
+        // moves the view now)
         let ctrl = self.keys.contains(&KeyCode::ControlLeft) || self.keys.contains(&KeyCode::ControlRight);
         if self.view == "outside" && self.player.is_some() && ctrl {
             // Ctrl+wheel: the outside camera stays where it is and narrows its field of view
@@ -3175,6 +3210,10 @@ impl App {
     /// The left mouse button (or a finger's tap) where the cursor is.
     pub(crate) fn left_button(&mut self, event_loop: &ActiveEventLoop, pressed: bool) {
         if let Some(edit) = self.vr_nav_edit.as_mut() { edit.moving = pressed; return; }
+        // the view editor's panel takes the clicks on it (a release always ends a drag)
+        if self.view_editor_button(pressed) {
+            return;
+        }
         // a mirror panel is dragged with the left button (a release always ends a drag)
         if let Some(size) = self
             .mirror_hud_size()

@@ -104,6 +104,50 @@ impl Program {
         with_lower(name, |k| self.consts.get(k).copied())
     }
 
+    /// A copy of this program with the constants and curves of `fresh` - the same scripts
+    /// compiled again after the constfiles were edited. The scripts themselves stay as they
+    /// are: `fresh` must have the very same blocks and instructions (a constant that was
+    /// added or removed, or a script edited meanwhile, leaves it with an error and nothing
+    /// done). Returns the copy, how many constants and how many curves changed.
+    pub fn with_constants_of(&self, fresh: &Program) -> Result<(Program, usize, usize), String> {
+        if self.blocks.len() != fresh.blocks.len() {
+            return Err("the scripts have other blocks than when the vehicle was loaded".to_string());
+        }
+        let mut out = self.clone();
+        let mut consts = 0usize;
+        for (bi, (mine, theirs)) in out.blocks.iter_mut().zip(&fresh.blocks).enumerate() {
+            if mine.ops.len() != theirs.ops.len() {
+                return Err(format!("block {} ({}) has other instructions than when the vehicle was loaded", bi, mine.name));
+            }
+            for (a, b) in mine.ops.iter_mut().zip(&theirs.ops) {
+                if std::mem::discriminant(&*a) != std::mem::discriminant(b) {
+                    return Err(format!("block {} ({}) has other instructions than when the vehicle was loaded (a constant added or removed, or a script edited)", bi, mine.name));
+                }
+                if let (Op::Const(x), Op::Const(y)) = (a, b) {
+                    if x.to_bits() != y.to_bits() {
+                        *x = *y;
+                        consts += 1;
+                    }
+                }
+            }
+        }
+        // the curves by their names (the last of a name is the one the scripts use)
+        let mut curves = 0usize;
+        for c in out.curves.iter_mut() {
+            if c.name.is_empty() {
+                continue;
+            }
+            if let Some(f) = fresh.curves.iter().rev().find(|f| f.name.eq_ignore_ascii_case(&c.name)) {
+                if f.points != c.points {
+                    c.points = f.points.clone();
+                    curves += 1;
+                }
+            }
+        }
+        out.consts = fresh.consts.clone();
+        Ok((out, consts, curves))
+    }
+
     /// Declare a variable (idempotent), returning its id.
     pub fn declare_var(&mut self, name: &str) -> VarId {
         let key = name.trim().to_ascii_lowercase();

@@ -47,6 +47,50 @@ pub enum Key {
     Cut,
 }
 
+/// Words for Ctrl+arrows and Ctrl+Backspace/Delete in a text field: spaces, letters and
+/// digits (with `_`), and punctuation each make a run of their own.
+fn word_class(c: char) -> u8 {
+    if c.is_whitespace() {
+        0
+    } else if c.is_alphanumeric() || c == '_' {
+        1
+    } else {
+        2
+    }
+}
+
+/// The start of the word before `from` (chars).
+fn word_back(cs: &[char], from: usize) -> usize {
+    let mut i = from.min(cs.len());
+    while i > 0 && word_class(cs[i - 1]) == 0 {
+        i -= 1;
+    }
+    if i > 0 {
+        let c = word_class(cs[i - 1]);
+        while i > 0 && word_class(cs[i - 1]) == c {
+            i -= 1;
+        }
+    }
+    i
+}
+
+/// The start of the next word after `from` (chars).
+fn word_fwd(cs: &[char], from: usize) -> usize {
+    let mut i = from.min(cs.len());
+    if i < cs.len() {
+        let c = word_class(cs[i]);
+        if c != 0 {
+            while i < cs.len() && word_class(cs[i]) == c {
+                i += 1;
+            }
+        }
+    }
+    while i < cs.len() && word_class(cs[i]) == 0 {
+        i += 1;
+    }
+    i
+}
+
 /// What happened since the last frame.
 #[derive(Default, Clone)]
 pub struct Input {
@@ -742,75 +786,91 @@ impl Ui {
             let n = value.chars().count();
             caret = caret.min(n);
             let byte = |s: &str, c: usize| s.char_indices().nth(c).map(|(b, _)| b).unwrap_or(s.len());
+            let (ctrl, shift) = (self.input.ctrl, self.input.shift);
             for k in self.input.keys.clone() {
+                let cs: Vec<char> = value.chars().collect();
+                let n = cs.len();
+                caret = caret.min(n);
+                // the selection as it stands: its anchor, and the end that moves with the caret
+                let (anchor, to) = self.selection.get(&id).copied().unwrap_or((caret, caret));
+                let (anchor, to) = (anchor.min(n), to.min(n));
+                let has_sel = anchor != to;
+                let (start, end) = (anchor.min(to), anchor.max(to));
+                let mut sel = (caret, caret);
                 match k {
-                    Key::Left => caret = caret.saturating_sub(1),
-                    Key::Right => caret = (caret + 1).min(value.chars().count()),
-                    Key::Home => caret = 0,
-                    Key::End => caret = value.chars().count(),
-                    Key::Backspace => {
-                        if let Some(&(a, b)) = self.selection.get(&id) {
-                            let (start, end) = (a.min(b), a.max(b));
-                            if start != end {
-                                let b0 = byte(value, start);
-                                let b1 = byte(value, end);
-                                value.replace_range(b0..b1, "");
-                                caret = start;
-                                self.selection.insert(id, (caret, caret));
-                            } else if caret > 0 {
-                                let b0 = byte(value, caret - 1);
-                                let b1 = byte(value, caret);
-                                value.replace_range(b0..b1, "");
-                                caret -= 1;
+                    Key::Left | Key::Right | Key::Home | Key::End => {
+                        let old = caret;
+                        if has_sel && !shift && matches!(k, Key::Left | Key::Right) {
+                            caret = if k == Key::Left { start } else { end };
+                        } else {
+                            caret = match k {
+                                Key::Left if ctrl => word_back(&cs, caret),
+                                Key::Left => caret.saturating_sub(1),
+                                Key::Right if ctrl => word_fwd(&cs, caret),
+                                Key::Right => (caret + 1).min(n),
+                                Key::Home => 0,
+                                _ => n,
+                            };
+                            if shift {
+                                sel = (if has_sel { anchor } else { old }, caret);
+                            } else {
+                                sel = (caret, caret);
                             }
-                        } else if caret > 0 {
-                            let b0 = byte(value, caret - 1);
-                            let b1 = byte(value, caret);
-                            value.replace_range(b0..b1, "");
-                            caret -= 1;
                         }
                     }
-                    Key::Delete => {
-                        if let Some(&(a, b)) = self.selection.get(&id) {
-                            let (start, end) = (a.min(b), a.max(b));
-                            if start != end {
-                                let b0 = byte(value, start);
-                                let b1 = byte(value, end);
-                                value.replace_range(b0..b1, "");
-                                caret = start;
-                                self.selection.insert(id, (caret, caret));
-                            } else if caret < value.chars().count() {
-                                let b0 = byte(value, caret);
-                                let b1 = byte(value, caret + 1);
-                                value.replace_range(b0..b1, "");
-                            }
-                        } else if caret < value.chars().count() {
-                            let b0 = byte(value, caret);
-                            let b1 = byte(value, caret + 1);
+                    Key::Backspace | Key::Delete => {
+                        let (a, b) = if has_sel {
+                            (start, end)
+                        } else if k == Key::Backspace {
+                            (if ctrl { word_back(&cs, caret) } else { caret.saturating_sub(1) }, caret)
+                        } else {
+                            (caret, if ctrl { word_fwd(&cs, caret) } else { (caret + 1).min(n) })
+                        };
+                        if a < b {
+                            let b0 = byte(value, a);
+                            let b1 = byte(value, b);
                             value.replace_range(b0..b1, "");
+                            caret = a;
                         }
+                        sel = (caret, caret);
                     }
                     Key::SelectAll => {
-                        self.selection.insert(id, (0, value.chars().count()));
-                        caret = value.chars().count();
+                        caret = n;
+                        sel = (0, n);
                     }
-                    Key::Copy => self.clipboard_out = Some(value.clone()),
-                    Key::Cut => {
-                        self.clipboard_out = Some(value.clone());
-                        value.clear();
-                        caret = 0;
+                    Key::Copy | Key::Cut => {
+                        // (no selection: the whole text, as it always did)
+                        let (a, b) = if has_sel { (start, end) } else { (0, n) };
+                        self.clipboard_out = Some(cs[a..b].iter().collect());
+                        if k == Key::Cut {
+                            let b0 = byte(value, a);
+                            let b1 = byte(value, b);
+                            value.replace_range(b0..b1, "");
+                            caret = a;
+                        } else {
+                            sel = (anchor, to);
+                        }
                     }
                     Key::Paste => {
                         if let Some(t) = self.clipboard_in.clone() {
                             let t: String = t.chars().filter(|c| !c.is_control()).collect();
+                            if has_sel {
+                                let b0 = byte(value, start);
+                                let b1 = byte(value, end);
+                                value.replace_range(b0..b1, "");
+                                caret = start;
+                            }
                             let b = byte(value, caret);
                             value.insert_str(b, &t);
                             caret += t.chars().count();
+                        } else {
+                            sel = (anchor, to);
                         }
                     }
                     Key::Enter | Key::Escape => self.focus = None,
-                    _ => {}
+                    _ => sel = (anchor, to),
                 }
+                self.selection.insert(id, sel);
                 moved = self.time;
             }
             if !self.input.text.is_empty() {

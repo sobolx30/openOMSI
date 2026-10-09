@@ -1877,9 +1877,19 @@ impl VehicleInstance {
         self.physics.speed = speed;
         self.physics.steer_deg = rb.steer_deg;
         self.physics.accel = rb.accel_body;
-        let v = script_speed(speed * 3.6);
+        // `Velocity_Ground` is the body's speed over the ground. `Velocity` is what Omsi.exe
+        // takes from the driven wheels (0x7e5b43): 3.6 * pi / 60 * the mean of rpm * diameter
+        // over them, so wheelspin and locked wheels show in it. Without a driven wheel it
+        // falls back to the ground speed.
+        let (drive_sum, drive_n) = rb
+            .wheels
+            .iter()
+            .filter(|w| w.driven)
+            .fold((0.0_f32, 0_u32), |(s, n), w| (s + w.spin * w.radius, n + 1));
+        let v_ground = script_speed(speed * 3.6);
+        let v = if drive_n > 0 { script_speed(drive_sum / drive_n as f32 * 3.6) } else { v_ground };
         self.put(self.v_velocity, v);
-        self.put(self.v_velocity_ground, v);
+        self.put(self.v_velocity_ground, v_ground);
         let n_wheel = rb
             .wheels
             .iter()
@@ -4274,6 +4284,258 @@ pub fn skin_vertices(
         nrm.push(m.transform_vector3(q).normalize_or_zero());
     }
     Some((pos, nrm))
+}
+
+/// What the developer tools can have a running vehicle read again from its files.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FileReload {
+    /// The `.bus` files of the vehicle and its coupled parts: physics, boundingbox, cameras,
+    /// mirrors, names.
+    Bus,
+    /// The `model.cfg` files: animations, lights, mesh properties.
+    Model,
+    /// The constfiles: the constants and curves the scripts use.
+    Constants,
+}
+
+/// Everything a reload has made ready before anything of the vehicle is touched (see
+/// [`VehicleInstance::reload_from_files`]).
+struct ReloadPlan {
+    what: FileReload,
+    ty: Arc<VehicleType>,
+    trailers: Vec<TrailerPart>,
+    physics: Option<VehiclePhysics>,
+    rigid: Option<crate::rigid::RigidBody>,
+    rest_sag: Option<(Vec<(f32, f32)>, f32)>,
+    animators: Option<Vec<MeshAnimator>>,
+    particles: Option<ParticleSet>,
+    summary: String,
+}
+
+/// A type made again from its files for a running vehicle: what is not being reloaded is
+/// taken over from `old` (the scripts always), what is has to fit the vehicle on screen.
+fn reloaded_type(root: &Path, old: &VehicleType, what: FileReload, program: Option<Arc<Program>>) -> Result<VehicleType, String> {
+    let name = old.def.path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+    let mut t = VehicleType::load(root, &old.def.path).map_err(|e| format!("{name}: {e:#}"))?;
+    // the scene was made from these meshes: other ones need a new session
+    let same_meshes = t.meshes.len() == old.meshes.len()
+        && t.model.meshes.len() == old.model.meshes.len()
+        && t.meshes.iter().zip(&old.meshes).all(|(a, b)| a.def_index == b.def_index && a.file == b.file);
+    if !same_meshes || t.def.model != old.def.model {
+        return Err(format!("{name}: the model has other meshes now (that needs a new session)"));
+    }
+    match what {
+        FileReload::Bus => {
+            if t.def.axles.len() != old.def.axles.len() {
+                return Err(format!("{name}: the number of axles changed (that needs a new session)"));
+            }
+            if t.def.cameras_reflexion.len() != old.def.cameras_reflexion.len() {
+                return Err(format!("{name}: the number of mirrors changed (that needs a new session)"));
+            }
+            t.model = old.model.clone();
+            t.program = old.program.clone();
+        }
+        FileReload::Model => {
+            if t.model.script_textures != old.model.script_textures || t.model.html_textures != old.model.html_textures || t.model.text_textures.len() != old.model.text_textures.len() || t.model.interior_lights.len() != old.model.interior_lights.len() {
+                return Err(format!("{name}: the script textures, HTML textures, text textures or interior lights changed in number (that needs a new session)"));
+            }
+            t.def = old.def.clone();
+            t.program = old.program.clone();
+        }
+        FileReload::Constants => {
+            t.def = old.def.clone();
+            t.model = old.model.clone();
+            t.program = program.ok_or_else(|| "no constants to take over".to_string())?;
+        }
+    }
+    Ok(t)
+}
+
+/// The state of the animations of `old` (their smoothed values) into `new`, mesh by mesh
+/// where the number of animations is the same.
+fn carry_anim_state(new: &mut [MeshAnimator], old: &[MeshAnimator]) {
+    for (n, o) in new.iter_mut().zip(old) {
+        if n.anims.len() == o.anims.len() {
+            for (na, oa) in n.anims.iter_mut().zip(&o.anims) {
+                na.2.value = oa.2.value;
+                na.2.initialized = oa.2.initialized;
+            }
+        }
+    }
+}
+
+impl TrailerPart {
+    /// Take over from `fresh` (the same part made again from edited files) what the files
+    /// give; where the part is and how it moves stays.
+    fn adopt(&mut self, fresh: TrailerPart, model: bool) {
+        let particles_changed = model && (self.ty.model.smokes != fresh.ty.model.smokes || self.ty.model.particle_emitters != fresh.ty.model.particle_emitters);
+        self.ty = fresh.ty;
+        self.length = fresh.length;
+        self.coupling_front = fresh.coupling_front;
+        self.coupling_back = fresh.coupling_back;
+        self.axle_long = fresh.axle_long;
+        self.axle_count = fresh.axle_count;
+        self.wheel_radius = fresh.wheel_radius;
+        self.rest = fresh.rest;
+        self.v_brakes = fresh.v_brakes;
+        if model {
+            let mut animators = fresh.animators;
+            carry_anim_state(&mut animators, &self.animators);
+            self.animators = animators;
+            self.skin_rest = Vec::new();
+            self.props_plan = PropsPlan::default();
+            self.light_fade.clear();
+            self.cookie_fade.clear();
+            if particles_changed {
+                self.particles = fresh.particles;
+            }
+        }
+    }
+}
+
+impl VehicleInstance {
+    /// Developer tools: read files of the running vehicle (and of the parts coupled to it)
+    /// again and take over what they say, without a new session. The scripts stay as they
+    /// are. Everything is read and made ready first - and a panic while doing so is
+    /// caught - and only then put in the place of the old: a file that cannot be read, or
+    /// one that no longer fits the vehicle on screen (other meshes, other numbers of axles,
+    /// mirrors, ...), leaves the vehicle exactly as it was, with the reason as the error.
+    pub fn reload_from_files(&mut self, root: &Path, what: FileReload) -> Result<String, String> {
+        let plan = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.plan_reload(root, what))).unwrap_or_else(|_| Err("an internal error while reading the files (nothing was changed)".to_string()))?;
+        let summary = plan.summary.clone();
+        self.apply_reload(plan);
+        Ok(summary)
+    }
+
+    fn plan_reload(&self, root: &Path, what: FileReload) -> Result<ReloadPlan, String> {
+        let mut changes = (0usize, 0usize);
+        let program = if what == FileReload::Constants {
+            let mut input = CompileInput { builtin_vars: builtin_vars(root), builtin_str_vars: builtin_str_vars(root), ..Default::default() };
+            input.varlists = self.ty.def.scripts.varlists.clone();
+            input.stringvarlists = self.ty.def.scripts.stringvarlists.clone();
+            input.constfiles = self.ty.def.scripts.constfiles.clone();
+            input.scripts = self.ty.def.scripts.scripts.clone();
+            let fresh = compile(&input);
+            if fresh.errors.len() > self.ty.program.errors.len() {
+                let first = fresh.errors.iter().map(|e| e.to_string()).next().unwrap_or_default();
+                return Err(format!("the constfiles or scripts have errors now: {first}"));
+            }
+            let (patched, consts, curves) = self.ty.program.with_constants_of(&fresh)?;
+            changes = (consts, curves);
+            Some(Arc::new(patched))
+        } else {
+            None
+        };
+        let ty = Arc::new(reloaded_type(root, &self.ty, what, program)?);
+        let mut plan = ReloadPlan { what, ty: ty.clone(), trailers: Vec::new(), physics: None, rigid: None, rest_sag: None, animators: None, particles: None, summary: String::new() };
+        if what == FileReload::Constants {
+            plan.summary = format!("Reloaded the constfiles: {} constants and {} curves changed", changes.0, changes.1);
+            return Ok(plan);
+        }
+        // the coupled parts, each made as when it was coupled
+        let mut lead = ty.clone();
+        let mut lead_reversed = false;
+        let mut changed = if what == FileReload::Bus { ty.def != self.ty.def } else { ty.model != self.ty.model };
+        for (i, t) in self.trailers.iter().enumerate() {
+            let nt = Arc::new(reloaded_type(root, &t.ty, what, None)?);
+            changed |= if what == FileReload::Bus { nt.def != t.ty.def } else { nt.model != t.ty.model };
+            let part = TrailerPart::new_ex(nt.clone(), &lead, lead_reversed, t.reversed, ty.program.as_ref(), t.first_axle, i);
+            lead = nt;
+            lead_reversed = t.reversed;
+            plan.trailers.push(part);
+        }
+        let files = 1 + self.trailers.len();
+        let mut notes: Vec<String> = Vec::new();
+        match what {
+            FileReload::Bus => {
+                let mut np = VehiclePhysics::from_definition(&ty.def);
+                np.speed = self.physics.speed;
+                np.accel = self.physics.accel;
+                np.a_trans = self.physics.a_trans;
+                np.steer_deg = self.physics.steer_deg;
+                np.controls = self.physics.controls.clone();
+                np.steer_rate = self.physics.steer_rate;
+                for (na, oa) in np.wheels.iter_mut().zip(&self.physics.wheels) {
+                    for (n, o) in na.iter_mut().zip(oa) {
+                        n.rotation_deg = o.rotation_deg;
+                        n.rpm = o.rpm;
+                        n.suspension = o.suspension;
+                    }
+                }
+                let rest_sag: Vec<(f32, f32)> = {
+                    let rb = crate::rigid::RigidBody::from_definition(&ty.def, &ty.hub_heights(0));
+                    (0..np.wheels.len())
+                        .map(|a| {
+                            let w = &rb.wheels[a * 2];
+                            (w.rest_compression().min(crate::rigid::BUMP), w.radius - w.attach.z)
+                        })
+                        .collect()
+                };
+                let offs: Vec<f32> = rest_sag.iter().enumerate().map(|(a, (comp, off))| if ty.suspension_axles.contains(&a) { *off } else { off - comp }).collect();
+                let ai_lift = offs.iter().sum::<f32>() / offs.len().max(1) as f32;
+                plan.rest_sag = Some((rest_sag, ai_lift));
+                plan.physics = Some(np);
+                if let Some(old) = self.rigid.as_ref() {
+                    let rb = crate::rigid::RigidBody::from_definition(&ty.def, &ty.hub_heights(0));
+                    plan.rigid = Some(old.refit(rb));
+                }
+                if ty.def.scripts != self.ty.def.scripts {
+                    notes.push("the script lists of the .bus changed: those need a new session".to_string());
+                }
+            }
+            _ => {
+                let mut animators: Vec<MeshAnimator> = ty.meshes.iter().map(|m| MeshAnimator::new(&ty.model.meshes[m.def_index], m.pivot, |n| ty.program.var(n))).collect();
+                crate::anim::link_parents(&mut animators, &ty.meshes.iter().map(|m| &ty.model.meshes[m.def_index]).collect::<Vec<_>>());
+                carry_anim_state(&mut animators, &self.animators);
+                plan.animators = Some(animators);
+                if ty.model.smokes != self.ty.model.smokes || ty.model.particle_emitters != self.ty.model.particle_emitters {
+                    plan.particles = Some(ParticleSet::new(ty.model.particle_systems(), 0x7265_6c6f_6164));
+                }
+                notes.push("materials and textures of the model.cfg are made when the vehicle is loaded: those need a new session".to_string());
+            }
+        }
+        let what_it_is = if what == FileReload::Bus { ".bus" } else { "model.cfg" };
+        let mut text = if changed {
+            format!("Reloaded {files} {what_it_is} file{}", if files == 1 { "" } else { "s" })
+        } else {
+            format!("Read {files} {what_it_is} file{} again: nothing changed in them", if files == 1 { "" } else { "s" })
+        };
+        for n in notes {
+            text.push_str("; ");
+            text.push_str(&n);
+        }
+        plan.summary = text;
+        Ok(plan)
+    }
+
+    /// Put a prepared reload in the place of the old state (only assignments).
+    fn apply_reload(&mut self, plan: ReloadPlan) {
+        self.ty = plan.ty;
+        if let Some(p) = plan.physics {
+            self.physics = p;
+        }
+        if let Some((r, l)) = plan.rest_sag {
+            self.rest_sag = r;
+            self.ai_lift = l;
+        }
+        if plan.rigid.is_some() {
+            self.rigid = plan.rigid;
+        }
+        if let Some(a) = plan.animators {
+            self.animators = a;
+            self.skin_rest = Vec::new();
+            self.props_plan = PropsPlan::default();
+            self.light_fade.clear();
+            self.cookie_fade.clear();
+        }
+        if let Some(p) = plan.particles {
+            self.particles = p;
+        }
+        let model = plan.what == FileReload::Model;
+        for (t, fresh) in self.trailers.iter_mut().zip(plan.trailers) {
+            t.adopt(fresh, model);
+        }
+    }
 }
 
 #[cfg(test)]

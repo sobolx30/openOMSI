@@ -640,6 +640,12 @@ pub struct Traffic {
     pub framed_spawns: Vec<(u64, DVec3)>,
     /// The player's vehicle as of the last tick (nothing is put on the road on top of it).
     player: Option<PlayerBox>,
+    /// How tight the player's vehicle turns (1/m, positive to the right; smoothed from its
+    /// heading change per metre driven) and its heading at the last tick: the cars look for
+    /// it along the curve it drives, not along a straight line from its nose (a bus on a bend
+    /// was taken for standing in the lane of the oncoming cars, which stopped for it).
+    player_kappa: f32,
+    player_prev_heading: Option<f64>,
     /// The player's bus has right of way over the traffic (its script's `TrafficPriority`,
     /// OMSI: priority 1000 over the types' own): cars keep out of the way it is about
     /// to take for longer.
@@ -1455,6 +1461,8 @@ impl Traffic {
             debug_population: omsi_cfg::env::var_os("OMSI_DEBUG_POPULATION").is_some(),
             framed_spawns: Vec::new(),
             player: None,
+            player_kappa: 0.0,
+            player_prev_heading: None,
             player_priority: false,
             player_blinker: 0,
             player_signal_age: f32::MAX,
@@ -5046,7 +5054,16 @@ impl Traffic {
         let behind = half_len as f64 + ((-speed).max(0.0) * horizon) as f64;
         let wide = (half_w + half_width + 0.35) as f64;
         let margin = PLAYER_BOX_MARGIN as f64;
-        let inside = |p: DVec3| in_player_box(p, centre, fwd, right, wide, ahead + margin, behind + margin);
+        let kappa = self.player_kappa as f64;
+        let inside = |p: DVec3| {
+            if kappa.abs() < PLAYER_CURVE_MIN {
+                return in_player_box(p, centre, fwd, right, wide, ahead + margin, behind + margin);
+            }
+            // on a bend: the bus's own length as it is, and the stretch ahead of its nose
+            // along the circle it is driving
+            in_player_box(p, centre, fwd, right, wide, half_len as f64 + margin, behind + margin)
+                || in_player_arc(p, centre, fwd, right, wide, half_len as f64, (ahead - half_len as f64).max(0.0) + margin, kappa)
+        };
         let look = (st.speed * st.speed / (2.0 * st.decel) + st.speed * 2.0 + 15.0)
             .clamp(15.0, look_ahead(st.speed));
         let mut d = 0.0f32;
@@ -5166,6 +5183,32 @@ impl Traffic {
         out
     }
 
+    /// Keep `player_kappa`: the player's turn per metre driven, from how its heading changed
+    /// since the last tick.
+    fn track_player_curve(&mut self, dt: f32, player: Option<PlayerBox>) {
+        let Some((_, heading, _, _, speed)) = player else {
+            self.player_kappa = 0.0;
+            self.player_prev_heading = None;
+            return;
+        };
+        let prev = self.player_prev_heading.replace(heading);
+        let metres = speed.abs() * dt;
+        if let (Some(prev), true) = (prev, metres > 0.02 && speed > 1.0) {
+            let mut dh = (heading - prev) % 360.0;
+            if dh > 180.0 {
+                dh -= 360.0;
+            } else if dh < -180.0 {
+                dh += 360.0;
+            }
+            let raw = (dh.to_radians() as f32 / metres).clamp(-0.15, 0.15);
+            // (smoothed over about a third of a second: heading is not steady to the degree)
+            let a = (dt / 0.35).clamp(0.0, 1.0);
+            self.player_kappa += (raw - self.player_kappa) * a;
+        } else {
+            self.player_kappa *= 0.9;
+        }
+    }
+
     pub fn tick(&mut self, dt: f32, player: Option<PlayerBox>) {
         self.lamp_dt += dt;
         if self.mirror {
@@ -5178,6 +5221,7 @@ impl Traffic {
         self.last_dt = dt;
         self.held_at_red = 0;
         self.player = player;
+        self.track_player_curve(dt, player);
         self.geo_prev = self.cars.iter_mut().map(|c| c.geo_block.take()).collect();
         self.index_of = self
             .cars
@@ -7758,6 +7802,29 @@ fn road_scale(near_density: &[f32]) -> f32 {
 /// either side, `ahead` in front and `behind` behind it) - on the same level only: a bus
 /// under a bridge held up the traffic on the bridge above it (#753). 4 m, as for the other
 /// vehicles' bodies.
+/// A turn tighter than this (1/m: a radius under 250 m) bends the box ahead of the player.
+const PLAYER_CURVE_MIN: f64 = 0.004;
+
+/// Whether `p` lies within `wide` of the arc the player's nose follows - from the point
+/// `nose` ahead of its centre, for `reach` metres along a circle of curvature `kappa` (1/m,
+/// positive to the right, the side of `right`).
+fn in_player_arc(p: DVec3, centre: DVec3, fwd: DVec2, right: DVec2, wide: f64, nose: f64, reach: f64, kappa: f64) -> bool {
+    let rel = p.truncate() - centre.truncate();
+    let (mut x, y) = (rel.dot(right), rel.dot(fwd) - nose);
+    if y < 0.0 || kappa == 0.0 || (p.z - centre.z).abs() >= 4.0 {
+        return false;
+    }
+    if kappa < 0.0 {
+        x = -x;
+    }
+    let r = 1.0 / kappa.abs();
+    // the circle's middle lies a radius to the side; the angle the point is round it
+    // from the nose
+    let (dx, dy) = (x - r, y);
+    let theta = std::f64::consts::PI - dy.atan2(dx);
+    (dx.hypot(dy) - r).abs() <= wide && r * theta <= reach
+}
+
 fn in_player_box(p: DVec3, centre: DVec3, fwd: DVec2, right: DVec2, wide: f64, ahead: f64, behind: f64) -> bool {
     let rel = p.truncate() - centre.truncate();
     let (x, y) = (rel.dot(right), rel.dot(fwd));
@@ -7843,6 +7910,22 @@ mod group_density_tests {
     /// Berlin-Spandau's `unsched_vehgroups.txt`: NormalCars 1, Trucks 0, Commercials 1,
     /// Ambulance 1, GDRCars 0.
     const SPANDAU: [i32; 5] = [1, 0, 1, 1, 0];
+
+    /// On a right-hand bend (20 m radius) the oncoming lane ahead of the nose is not where
+    /// the bus is going; the stretch of the circle it drives is.
+    #[test]
+    fn the_box_ahead_of_a_bus_on_a_bend_follows_the_bend() {
+        use super::in_player_arc;
+        use glam::DVec3;
+        let (c, f, r) = (DVec3::ZERO, DVec2::new(0.0, 1.0), DVec2::new(1.0, 0.0));
+        let k = 0.05;
+        // straight ahead of the nose and to the left: the oncoming lane, not on the circle
+        assert!(!in_player_arc(DVec3::new(-2.0, 24.0, 0.0), c, f, r, 2.5, 6.0, 20.0, k));
+        // on the circle, about 22 m along it from the nose (11.3 m right, 18 m on)
+        assert!(in_player_arc(DVec3::new(11.3, 24.0, 0.0), c, f, r, 2.5, 6.0, 30.0, k));
+        // too far along the circle for the reach
+        assert!(!in_player_arc(DVec3::new(11.3, 24.0, 0.0), c, f, r, 2.5, 6.0, 10.0, k));
+    }
 
     #[test]
     fn a_bus_under_a_bridge_is_not_in_the_way_on_it() {

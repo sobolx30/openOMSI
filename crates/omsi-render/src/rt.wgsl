@@ -46,7 +46,7 @@ fn cs_trace(@builtin(global_invocation_id) gid: vec3<u32>) {
     // pass)
     let cell = u32(px.x & 3) + u32(px.y & 3) * 4u;
     var vis = 1.0;
-    if (p.sun.w > 0.0) {
+    if (p.sun.w > 0.0 && p.flags.x > 0.5) {
         // (towards one of 16 points of the sun's disc, a pattern of 4 x 4 pixels the filter
         // averages: the shadow's edge softens with the distance to its caster, as the
         // sun's own does, and nothing is noisy)
@@ -100,6 +100,27 @@ fn cs_denoise(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(workgroup_
         return;
     }
     let tol = 0.012 * c.g + 0.02;
+    // The surface's slope as the filter sees it: the inverse of the view depth runs straight across
+    // a plane on the screen, so a road seen at a grazing angle (whose depth jumps by metres from one
+    // row of pixels to the next) keeps its neighbours, and the 4 x 4 pattern of the rays is averaged
+    // away on it too (compared at the same depth alone, the filter took nothing from the rows above
+    // and below, and the pattern showed as squares in a shadow's edge far down the street). Each
+    // way the smaller of the two steps, so that an edge does not make the slope.
+    let ic = 1.0 / c.g;
+    let tol_inv = tol * ic * ic;
+    let nl = tile[lp.y * 12 + lp.x - 1];
+    let nr = tile[lp.y * 12 + lp.x + 1];
+    let nu = tile[(lp.y - 1) * 12 + lp.x];
+    let nd = tile[(lp.y + 1) * 12 + lp.x];
+    var gx = 1e9;
+    var gy = 1e9;
+    if (nr.g > 0.0) { gx = 1.0 / nr.g - ic; }
+    if (nl.g > 0.0 && abs(ic - 1.0 / nl.g) < abs(gx)) { gx = ic - 1.0 / nl.g; }
+    if (nd.g > 0.0) { gy = 1.0 / nd.g - ic; }
+    if (nu.g > 0.0 && abs(ic - 1.0 / nu.g) < abs(gy)) { gy = ic - 1.0 / nu.g; }
+    // (no neighbour to say it: flat; and no slope steeper than the step of a surface edge-on)
+    gx = select(clamp(gx, -ic * 0.5, ic * 0.5), 0.0, abs(gx) > 1e8);
+    gy = select(clamp(gy, -ic * 0.5, ic * 0.5), 0.0, abs(gy) > 1e8);
     var ao = 0.0;
     var aw = 0.0;
     var sun = 0.0;
@@ -107,7 +128,7 @@ fn cs_denoise(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(workgroup_
     for (var j = -2; j <= 2; j++) {
         for (var i = -2; i <= 2; i++) {
             let s = tile[(lp.y + j) * 12 + lp.x + i];
-            if (s.g > 0.0 && s.b >= 0.0 && abs(s.g - c.g) < tol) {
+            if (s.g > 0.0 && s.b >= 0.0 && abs(1.0 / s.g - (ic + gx * f32(i) + gy * f32(j))) < tol_inv) {
                 ao += s.r;
                 aw += 1.0;
                 sun += s.b;

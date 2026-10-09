@@ -61,6 +61,10 @@ pub struct SoundSet {
     /// The camera is in a cab view (driver or passenger: Omsi.exe's camera modes 0 and 1),
     /// set every frame on every sound set (see [`SoundSet::set_muffled`]).
     muffled: bool,
+    /// The crossfade between the cab and the street (see [`SoundSet::set_inside_faded`]): the
+    /// cab's share while the two are mixed (`None` at rest), and where the mix has got to.
+    mix: Option<f32>,
+    mix_state: Option<f32>,
     /// The sound sets of the coupled parts (with the part's index among the vehicle's
     /// trailers): the rear section of an articulated bus has a `[sound]` of its own - on a
     /// pusher like the MB C2 G that is where the engine is - and plays it on the triggers
@@ -194,6 +198,8 @@ impl SoundSet {
             ai: false,
             listener_vehicle: false,
             muffled: false,
+            mix: None,
+            mix_state: None,
             parts: Vec::new(),
         }
     }
@@ -205,6 +211,38 @@ impl SoundSet {
         self.inside = inside;
         for (_, p) in &mut self.parts {
             p.set_inside(inside);
+        }
+    }
+
+    /// [`SoundSet::set_inside`], but a change between the cab and the street (getting in or
+    /// out of the bus on foot) is a crossfade, not a cut: while the mix is between the two,
+    /// the sounds of both views are heard at once, those of the cab at `mix`, those of the
+    /// street at `1 - mix`, and the own bus's outside sounds close their low-pass as they
+    /// go into the cab. `walker`: with the walker's view, how far in the bus the camera is
+    /// (0 outside .. 1 inside, from where it stands; the mix follows it quickly); without,
+    /// the mix goes to the view's side in half a second. Call every frame with `dt`.
+    pub fn set_inside_faded(&mut self, inside: bool, dt: f32, walker: Option<f32>) {
+        let dt = dt.clamp(0.0, 0.1);
+        let first = self.mix_state.is_none();
+        let target = walker.map_or(if inside { 1.0 } else { 0.0 }, |w| w.clamp(0.0, 1.0));
+        let speed = if walker.is_some() { 1.0 / 0.1 } else { 1.0 / 0.5 };
+        let mut mix = self.mix_state.unwrap_or(target);
+        if !first {
+            mix += (target - mix).clamp(-dt * speed, dt * speed);
+        }
+        self.mix_state = Some(mix);
+        let between = mix > 1.0e-3 && mix < 1.0 - 1.0e-3;
+        // (only while it is between: at rest the camera's own flag decides, as it always did)
+        set_cab_blend(if between { Some(mix) } else { None });
+        self.set_mix(if between { Some(mix) } else { None });
+        // (a walker in the doorway: the view the sounds are first chosen by is the nearer one)
+        self.set_inside(if between { mix >= 0.5 } else { inside_of(mix, inside) });
+    }
+
+    fn set_mix(&mut self, mix: Option<f32>) {
+        self.mix = mix;
+        for (_, p) in &mut self.parts {
+            p.set_mix(mix);
         }
     }
 
@@ -231,6 +269,7 @@ impl SoundSet {
     pub fn add_part(&mut self, index: usize, mut part: SoundSet) {
         part.inside = self.inside;
         part.muffled = self.muffled;
+        part.mix = self.mix;
         part.ai = self.ai;
         part.listener_vehicle = self.listener_vehicle;
         self.parts.push((index, part));
@@ -573,7 +612,7 @@ impl SoundSet {
     }
 
     fn ctx_without_engine(&self) -> Ctx {
-        Ctx { view: self.view_mask(), cab: self.muffled, master: self.master, doppler: !self.listener_vehicle, listener: Vec3::ZERO }
+        Ctx { view: self.view_mask(), cab: self.muffled, master: self.master, doppler: !self.listener_vehicle, listener: Vec3::ZERO, mix: self.mix }
     }
 
     pub fn stop_all(&mut self, engine: &AudioEngine) {
@@ -590,6 +629,8 @@ impl SoundSet {
 
 /// The per-set inputs of an entry's evaluation.
 struct Ctx {
+    /// The cab's share while the cab and the street are mixed (a walker in the doorway).
+    mix: Option<f32>,
     view: i32,
     cab: bool,
     master: f32,
@@ -605,11 +646,30 @@ impl Ctx {
         vp == 0 || vp & self.view != 0 || (vp & 2 == 0 && self.view == 2 && outside_vol() > 0.01)
     }
 
+    /// How much of an entry is heard: 1 or 0 by the view, and while the cab and the street
+    /// are mixed the cab's views at `mix` (the own bus's outside sounds also at
+    /// `Snd_OutsideVol`) and the street's at `1 - mix`.
+    fn view_weight(&self, vp: i32) -> f32 {
+        let Some(w) = self.mix else {
+            return if self.view_lets_through(vp) { 1.0 } else { 0.0 };
+        };
+        let cab = if vp == 0 || vp & 2 != 0 {
+            1.0
+        } else if outside_vol() > 0.01 {
+            outside_vol()
+        } else {
+            0.0
+        };
+        let street = if vp == 0 || vp & 1 != 0 { 1.0 } else { 0.0 };
+        cab * w + street * (1.0 - w)
+    }
+
     /// One entry this frame (`TSound` update 0x750340): its volume and pitch as DirectSound
     /// takes them, and whether it can be started.
     fn eval(&self, s: &mut RuntimeSound, var: &dyn Fn(&str) -> Option<f32>, object_to_world: &Mat4) -> Eval {
         let def = &s.def;
-        if !self.view_lets_through(def.viewpoint) {
+        let weight = self.view_weight(def.viewpoint);
+        if weight <= 0.0 {
             return Eval { gain: 0.0, audible: false, pitch: s.last_pitch, wrong_view: true };
         }
         let triggered = !def.triggers.is_empty();
@@ -640,13 +700,16 @@ impl Ctx {
             vol *= g;
         }
         // an AI vehicle (view 4) heard from a cab: through the player's bus's bodywork
-        if self.view & 4 != 0 && self.cab {
-            vol *= 0.2 + outside_vol();
+        if self.view & 4 != 0 {
+            // (sliding between the street and the cab: part of the way)
+            let b = cab_blend().unwrap_or(if self.cab { 1.0 } else { 0.0 });
+            vol *= 1.0 + (0.2 + outside_vol() - 1.0) * b;
         }
         // the player's bus's outside sound heard in its cab: through what is open
-        if def.viewpoint & 2 == 0 && def.viewpoint != 0 && self.view == 2 {
+        if self.mix.is_none() && def.viewpoint & 2 == 0 && def.viewpoint != 0 && self.view == 2 {
             vol *= outside_vol();
         }
+        vol *= weight;
         let (gain, audible) = direct_sound_volume(vol, s.last_gain);
         s.last_gain = gain;
         let mut audible = audible;
@@ -680,10 +743,59 @@ impl Ctx {
             // keeps its file's rate)
             doppler: self.doppler && s.def.is_loop,
             range: s.def.range,
-            lowpass_hz: 0.0,
+            lowpass_hz: self.through_bodywork_hz(&s.def),
             important: s.def.important,
         }
     }
+
+    /// The low-pass cutoff (Hz, 0 = none) of the own bus's outside sounds heard in its cab
+    /// (the traffic's get none). The more is open (`Snd_OutsideVol`:
+    /// doors, windows), the higher the cutoff, so a closed bus keeps only the dull rumble
+    /// and an open door lets the whole sound in. (Omsi.exe only lowers the volume; this is
+    /// openOMSI's addition, so that it is not the same sound turned down.)
+    fn through_bodywork_hz(&self, def: &SoundEntry) -> f32 {
+        // only the own bus's outside sounds, and only while the script lets them in
+        // (`Snd_OutsideVol` over 0.01: with 0 they are not heard at all)
+        let w = self.mix.unwrap_or(if self.view == 2 { 1.0 } else { 0.0 });
+        let open = outside_vol().clamp(0.0, 1.0);
+        if def.viewpoint & 2 != 0 || def.viewpoint == 0 || w <= 0.0 || open <= 0.01 {
+            return 0.0;
+        }
+        // 500 Hz shut, 16 kHz wide open (from 0.95), an even climb in octaves - and the
+        // filter opens as the sound comes out of the cab
+        let cab = if open >= 0.95 { 16000.0 } else { 500.0 * (16000.0f32 / 500.0).powf(open) };
+        let hz = 16000.0 * (cab / 16000.0).powf(w);
+        if hz >= 15000.0 {
+            0.0
+        } else {
+            hz
+        }
+    }
+}
+
+/// The flag for a mix at rest (all in the cab, all out in the street), else the camera's.
+fn inside_of(mix: f32, flag: bool) -> bool {
+    if mix >= 1.0 - 1.0e-3 {
+        true
+    } else if mix <= 1.0e-3 {
+        false
+    } else {
+        flag
+    }
+}
+
+/// How far the camera has gone from the street into the cab while the player gets in or
+/// out (f32 bits, NaN = not sliding: the camera's own flag counts).
+static CAB_BLEND: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0x7fc0_0000);
+
+/// Set (or, with `None`, end) the slide of the traffic's volume between the street and the cab.
+pub fn set_cab_blend(b: Option<f32>) {
+    let bits = b.filter(|x| x.is_finite()).map_or(0x7fc0_0000, |x| x.clamp(0.0, 1.0).to_bits());
+    CAB_BLEND.store(bits, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn cab_blend() -> Option<f32> {
+    Some(f32::from_bits(CAB_BLEND.load(std::sync::atomic::Ordering::Relaxed))).filter(|x| x.is_finite())
 }
 
 /// `Snd_OutsideVol` of the player's bus (bits of an f32): Omsi.exe's 0x859a04, 1 while the
@@ -711,7 +823,7 @@ mod tests {
     use omsi_vehicle::VolCurve;
 
     fn ctx(view: i32, cab: bool) -> Ctx {
-        Ctx { view, cab, master: 1.0, doppler: false, listener: Vec3::ZERO }
+        Ctx { view, cab, master: 1.0, doppler: false, listener: Vec3::ZERO, mix: None }
     }
 
     fn eval(c: &Ctx, def: SoundEntry, var: &dyn Fn(&str) -> Option<f32>) -> Eval {
@@ -765,6 +877,18 @@ mod tests {
         let cab = SoundEntry { volume: 0.8, viewpoint: 2, ..Default::default() };
         assert!(eval(&ctx(1, false), cab, &none).wrong_view, "a cab sound stays in");
         set_outside_open(None);
+    }
+
+    #[test]
+    fn the_cab_and_the_street_crossfade_while_mixed() {
+        let none = |_: &str| None;
+        let mixed = |w: f32| Ctx { mix: Some(w), ..ctx(2, false) };
+        // a cab sound comes in as the mix goes in, one for every view stays whole
+        let cab = SoundEntry { volume: 0.8, viewpoint: 2, ..Default::default() };
+        assert!((eval(&mixed(0.25), cab.clone(), &none).gain - 0.2).abs() < 1e-3);
+        assert!(eval(&mixed(0.0), cab, &none).wrong_view);
+        let all = SoundEntry { volume: 0.8, viewpoint: 0, ..Default::default() };
+        assert!((eval(&mixed(0.3), all, &none).gain - 0.8).abs() < 1e-3);
     }
 
     #[test]

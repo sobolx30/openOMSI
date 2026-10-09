@@ -176,6 +176,9 @@ pub(crate) struct Player {
     pub(crate) steer_look: f32,
     /// The driver's seat moved (Settings → seat position; bus frame, m).
     pub(crate) seat: Vec3,
+    /// The driver's view as the player set it for this vehicle only: seat shift (bus frame, m:
+    /// across, along, up) and extra turn (yaw, pitch degrees); kept per `.bus` file.
+    pub(crate) view_adj: [f32; 6],
     /// The player's turn of each mirror (yaw, pitch degrees; Ctrl+Alt+arrows in the cab).
     pub(crate) mirror_offsets: Vec<[f32; 2]>,
     /// The player's shift of each mirror (bus frame, m: across, along, up; the mirror editor).
@@ -184,6 +187,14 @@ pub(crate) struct Player {
     pub(crate) mirror_fovs: Vec<f32>,
     /// A mirror was turned or shifted and is not saved yet.
     pub(crate) mirrors_dirty: bool,
+    /// Mirror cameras set by hand in the developer tools (numbered as `all_mirror_cams`);
+    /// shown as they are, never saved.
+    pub(crate) mirror_dev: Vec<Option<omsi_vehicle::Camera>>,
+    /// A mirror was set in the developer tools: the mirrors are drawn again.
+    pub(crate) mirror_dev_dirty: std::sync::atomic::AtomicBool,
+    /// With the walker's view: how far in the bus the camera is (0 outside .. 1 inside), set
+    /// before each tick; the sound crossfades between the street and the cab by it.
+    pub(crate) foot_mix: Option<f32>,
     pub(crate) take_change: bool,
     /// Keys whose `_toggle` this bus does as `_up`/`_down` (see `action`): turned up last.
     pub(crate) toggled_up: hashbrown::HashSet<String>,
@@ -647,6 +658,16 @@ pub(crate) fn door_action(name: &str) -> Option<usize> {
 }
 
 impl Player {
+    /// The mirror cameras of the vehicle and then of its coupled parts, as the files give them
+    /// (the numbering `render_mirrors` and the developer tools' mirror editor use).
+    pub(crate) fn all_mirror_cams(&self) -> Vec<omsi_vehicle::Camera> {
+        let mut v: Vec<omsi_vehicle::Camera> = self.vehicle.ty.def.cameras_reflexion.clone();
+        for t in &self.vehicle.trailers {
+            v.extend(t.ty.def.cameras_reflexion.iter().cloned());
+        }
+        v
+    }
+
     /// Door key `n` (1 = the front door; 0 = all of them): the triggers fired. All the doors
     /// close the ones open when any is (leaving the others as they are) and else open them
     /// all; the door release switch (`bus_dooraft` of the Berlin buses) is not a door then.
@@ -1598,7 +1619,7 @@ impl Player {
             let v = &self.vehicle;
             // the camera decides which `[viewpoint]` entries are heard (the exterior engine
             // samples outside, the rain on the roof in the cab)
-            ss.set_inside(inside);
+            ss.set_inside_faded(inside, dt, self.foot_mix);
             ss.set_muffled(inside);
             ss.set_listener_vehicle(listener_follows_bus);
             // how open the bus is to the outside (doors, driver's window) for every outside
@@ -1646,7 +1667,7 @@ impl Player {
     }
 
     /// Attach the vehicle's sound configuration.
-    pub(crate) fn load_sounds(&mut self, audio: &omsi_audio::AudioEngine) {
+    pub(crate) fn load_sounds(&mut self, audio: &omsi_audio::AudioEngine) -> bool {
         let def = &self.vehicle.ty.def;
         if let Some(rel) = &def.sound {
             let path = omsi_cfg::resolve_path(def.dir(), rel);
@@ -1686,9 +1707,32 @@ impl Player {
                     // they stand when the trigger fires, see `SoundSet::update_fired`)
                     self.vehicle.host.snapshot_triggers = ss.curve_triggers().into_iter().collect();
                     self.sounds = Some(ss);
+                    return true;
                 }
                 Err(e) => log::warn!("{e}"),
             }
+        }
+        false
+    }
+
+    /// Developer tools: the `sound.cfg` of the vehicle and its coupled parts read again,
+    /// and the clips with them. The old sounds stop when the new set is ready; a config
+    /// that cannot be read leaves the old set as it was.
+    pub(crate) fn reload_sounds(&mut self, audio: &omsi_audio::AudioEngine) -> String {
+        if self.vehicle.ty.def.sound.is_none() {
+            return "This vehicle has no sound config".to_string();
+        }
+        let old = self.sounds.take();
+        audio.forget_clips();
+        if self.load_sounds(audio) {
+            if let Some(mut o) = old {
+                o.stop_all(audio);
+            }
+            let n = self.sounds.as_ref().map(|s| s.len()).unwrap_or(0);
+            format!("Reloaded the sound config: {n} sounds")
+        } else {
+            self.sounds = old;
+            "The sound config could not be read: the old sounds stay".to_string()
         }
     }
 
@@ -1928,6 +1972,7 @@ impl Player {
 
     /// One notch of the mouse wheel over a switch: `<event>_drag` with the notch as the
     /// movement, and the `_off` the script expects when the hand lets go again.
+    #[allow(dead_code)]
     pub(crate) fn wheel(&mut self, origin: DVec3, dir: Vec3, spread: f32, amount: f32) {
         let Some(i) = self.pick(origin, dir, spread) else {
             return;
@@ -2188,7 +2233,10 @@ impl Player {
         // picture (a check of the mirrors against OMSI's own `reflexion<n>.bmp`)
         if let Some(c) = view.strip_prefix("mirror").and_then(|n| n.parse::<usize>().ok()).and_then(|n| def.cameras_reflexion.get(n)) {
             let k = def.cameras_reflexion.iter().position(|x| std::ptr::eq(x, c)).unwrap_or(0);
-            let aimed = crate::camera_util::mirror_view(&self.vehicle, &crate::camera_util::adjusted(c, self.mirror_shifts.get(k).copied().unwrap_or([0.0; 3]), self.mirror_fovs.get(k).copied().unwrap_or(0.0)), crate::camera_util::driver_eye(self), self.mirror_offsets.get(k).copied().unwrap_or([0.0; 2]));
+            let aimed = match self.mirror_dev.get(k).and_then(|d| d.as_ref()) {
+                Some(d) => crate::camera_util::mirror_view(&self.vehicle, d, crate::camera_util::driver_eye(self), [0.0; 2]),
+                None => crate::camera_util::mirror_view(&self.vehicle, &crate::camera_util::adjusted(c, self.mirror_shifts.get(k).copied().unwrap_or([0.0; 3]), self.mirror_fovs.get(k).copied().unwrap_or(0.0)), crate::camera_util::driver_eye(self), self.mirror_offsets.get(k).copied().unwrap_or([0.0; 2])),
+            };
             let (eye, yaw, pitch, roll) = self.vehicle.camera_world_full(&aimed);
             return Camera { position: eye, yaw, pitch, roll, fov_deg: if c.fov > 1.0 { c.fov } else { 50.0 }, near: 0.1, far: 450.0 };
         }

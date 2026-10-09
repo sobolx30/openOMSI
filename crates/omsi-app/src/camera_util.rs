@@ -356,6 +356,10 @@ pub(crate) fn render_mirrors(
     let v = &p.vehicle;
     let mut cams: Vec<(omsi_vehicle::Camera, (DVec3, f32, f32, f32))> = Vec::new();
     let aim = |i: usize, c: &omsi_vehicle::Camera, position: DVec3, rot: glam::Mat4| {
+        // (a mirror set by hand in the developer tools is drawn as set)
+        if let Some(d) = p.mirror_dev.get(i).and_then(|d| d.as_ref()) {
+            return mirror_view_in(position, rot, d, eye, [0.0; 2]);
+        }
         let c = adjusted(c, p.mirror_shifts.get(i).copied().unwrap_or([0.0; 3]), p.mirror_fovs.get(i).copied().unwrap_or(0.0));
         mirror_view_in(position, rot, &c, eye, p.mirror_offsets.get(i).copied().unwrap_or([0.0; 2]))
     };

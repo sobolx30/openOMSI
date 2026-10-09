@@ -71,6 +71,24 @@ impl App {
             }
             return;
         }
+        // "move the vehicle here?" in the map camera: Enter yes, Esc no
+        if self.place_question_active() && matches!(code, KeyCode::Escape | KeyCode::Enter | KeyCode::NumpadEnter) {
+            if pressed && !repeat {
+                if code == KeyCode::Escape {
+                    self.cancel_place_question();
+                } else {
+                    self.accept_place_question();
+                }
+            }
+            return;
+        }
+        // Esc closes the view editor (view_editor.rs)
+        if self.view_editor.open && self.game_menu.is_none() && code == KeyCode::Escape {
+            if pressed && !repeat {
+                self.view_editor_close();
+            }
+            return;
+        }
         // The mirror panels (see mirror_hud.rs): Ctrl+M shows or hides them, Ctrl+Shift+M
         // starts and ends their editor; in the editor Insert, Delete, C and Esc are its keys.
         if self.in_cab && self.game_menu.is_none() && self.player.is_some() {
@@ -214,7 +232,6 @@ impl App {
             if pressed
                 && !repeat
                 && code == KeyCode::Backspace
-                && self.settings.developer_tools
                 && (self.keys.contains(&KeyCode::ControlLeft) || self.keys.contains(&KeyCode::ControlRight))
                 && (self.keys.contains(&KeyCode::ShiftLeft) || self.keys.contains(&KeyCode::ShiftRight))
             {
@@ -492,6 +509,11 @@ impl App {
                         // the free camera starts where the current view is looking
                         self.view = "free".into();
                         self.ego = false;
+                        self.view_editor.place = None;
+                        // (a click on the ground asks to put the bus there, see `on_left`)
+                        if self.player.as_ref().is_some_and(|p| !crate::rail_drive::is_rail(&p.vehicle.ty.def)) {
+                            self.service_msg = Some(("Click on the ground to move the bus to that place".into(), 5.0));
+                        }
                     }
                     KeyCode::KeyU
                     if self.keys.contains(&KeyCode::ShiftLeft)
@@ -998,6 +1020,13 @@ impl App {
     }
 
     pub(crate) fn on_mouse_moved(&mut self, x: f32, y: f32) {
+        // a slider of the view editor being dragged follows the cursor
+        if self.view_editor.dragging() {
+            self.cursor = (x, y);
+            if self.view_editor_moved() {
+                return;
+            }
+        }
         // a mirror panel being dragged follows the cursor (nothing else of the cursor's
         // work is done meanwhile, and outside a drag none of it is touched)
         if self.mirror_hud.dragging() {
@@ -1305,11 +1334,10 @@ impl App {
                 }
             }
         }
-        // the map camera (F4): Ctrl+click on the ground puts the bus on the street nearest
-        // that point, as Ctrl+click on the city map does - OMSI's map view moves the vehicle
-        // to a place clicked as well (#1039). A rail vehicle stays on its track.
-        let ctrl = self.keys.contains(&KeyCode::ControlLeft) || self.keys.contains(&KeyCode::ControlRight);
-        if pressed && ctrl && self.view == "free" && self.game_menu.is_none() && self.player.is_some() {
+        // the map camera (F4): a click on the ground asks "move the vehicle here?" and puts
+        // it there on yes, anywhere (OMSI's map view moves the vehicle to a place clicked
+        // the same way; #1039). A rail vehicle stays on its track.
+        if pressed && self.view == "free" && self.game_menu.is_none() && self.player.is_some() {
             if self.player.as_ref().is_some_and(|p| crate::rail_drive::is_rail(&p.vehicle.ty.def)) {
                 self.service_msg = Some(("A rail vehicle cannot be moved off its track".into(), 3.0));
                 return;
@@ -1319,8 +1347,8 @@ impl App {
                 .zip(self.world.clone())
                 .and_then(|((o, d, _), w)| crate::placing::ground_hit(&w, o, d.as_dvec3(), 2000.0));
             match hit {
-                Some(at) => self.place_bus_at(at.truncate()),
-                None => self.service_msg = Some(("Ctrl+click on the ground to move the bus there".into(), 3.0)),
+                Some(at) => self.ask_place_vehicle(at),
+                None => self.service_msg = Some(("Click on the ground to move the bus there".into(), 3.0)),
             }
             return;
         }
@@ -4408,13 +4436,13 @@ pub(crate) const ZOOM_INTENT_F1: f32 = 0.56;
 /// Outside/free zoom intent: a full 364 px drag takes `z` 0 to 0.70.
 pub(crate) const ZOOM_INTENT: f32 = 0.70;
 
-/// Eased Space return for the F1 head: look and zoom glide home on the same
-/// ease-out as the viewpoint switch instead of teleporting. `t` seconds in;
-/// returns the current look, zoom and done. Pure (tested below).
+/// Eased Space return for the F1 head: look and zoom glide home the way OMSI's camera glides
+/// (a fixed part of what is left each moment, `1 - exp(-0.005 * ms)`; see `CAM_GLIDE_RATE`)
+/// instead of teleporting. `t` seconds in; returns the current look, zoom and done (once
+/// 99.95% of the way is covered). Pure (tested below).
 pub(crate) fn reset_blend(look_from: (f32, f32), zoom_from: f32, t: f32) -> ((f32, f32), f32, bool) {
-    let x = (t / crate::app::CAM_BLEND_SECS).clamp(0.0, 1.0);
-    let u = 1.0 - x;
-    let s = 1.0 - u * u * u;
+    let x = (t / crate::app::CAM_GLIDE_SECS).clamp(0.0, 1.0);
+    let s = 1.0 - (-crate::app::CAM_GLIDE_RATE * crate::app::CAM_GLIDE_SECS * x).exp();
     (
         (look_from.0 * (1.0 - s), look_from.1 * (1.0 - s)),
         zoom_from + (1.0 - zoom_from) * s,
@@ -4492,13 +4520,13 @@ mod look_tests {
 
     #[test]
     fn space_return_eases_home_like_the_viewpoint_switch() {
-        // start: untouched; partway: well on the way (ease-out); end: exact and done.
+        // start: untouched; partway: 63% of the way after 200 ms; end: all but nothing and done.
         let (look, zoom, done) = super::reset_blend((30.0, -10.0), 0.5, 0.0);
         assert_eq!((look, zoom, done), ((30.0, -10.0), 0.5, false));
-        let (look, zoom, done) = super::reset_blend((30.0, -10.0), 0.5, 0.27);
-        assert!(look.0 > 3.0 && look.0 < 27.0 && zoom > 0.5 && zoom < 1.0 && !done);
-        let (look, zoom, done) = super::reset_blend((30.0, -10.0), 0.5, 0.54);
-        assert_eq!((look, zoom, done), ((0.0, 0.0), 1.0, true));
+        let (look, zoom, done) = super::reset_blend((30.0, -10.0), 0.5, 0.2);
+        assert!((look.0 - 30.0 * (-1.0f32).exp()).abs() < 1e-3 && zoom > 0.5 && zoom < 1.0 && !done);
+        let (look, zoom, done) = super::reset_blend((30.0, -10.0), 0.5, 1.6);
+        assert!(look.0.abs() < 0.02 && (zoom - 1.0).abs() < 0.001 && done);
         assert!(super::reset_blend((30.0, -10.0), 0.5, 5.0).2);
     }
 

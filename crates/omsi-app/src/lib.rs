@@ -49,6 +49,7 @@ mod lights;
 mod launcher;
 mod menu;
 mod mirror_hud;
+mod view_editor;
 mod navigator;
 mod vr_navigator;
 mod money;
@@ -494,6 +495,7 @@ pub(crate) fn make_app(mut args: Args, server_cfg: Option<server::ServerCfg>) ->
         mirror_turn: 0,
         frozen_mirrors: None,
         mirror_hud: Default::default(),
+        view_editor: Default::default(),
         hover_key: None,
         view,
         audio: None,

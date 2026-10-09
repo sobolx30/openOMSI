@@ -20,7 +20,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 
 /// The overlays, as `devtools_proc::VIEW_KEYS` names them.
-const VIEW_KEYS: [&str; 8] = ["seats", "standing", "paths", "boxes", "axles", "lights", "pathlabels", "devices"];
+const VIEW_KEYS: [&str; 12] = [
+    "seats", "standing", "paths", "pathlabels", "devices", "boxes", "axles", "cog", "lights", "mirrors", "viewsdriver", "viewspax",
+];
 
 /// Tell the game something (one line).
 fn send_line(line: &str) {
@@ -66,10 +68,21 @@ pub fn run(instance: wgpu::Instance) -> anyhow::Result<()> {
         inbox,
         modifiers: Modifiers::default(),
         tools: Tools::new(),
+        clipboard: Clipboard::new().ok(),
     };
     send_line("hello");
     event_loop.run_app(&mut app)?;
     Ok(())
+}
+
+/// The log of the game this window belongs to, in the system's viewer: the file the launcher
+/// keeps for it (`game.log`, or `game-n.log` with several games), or `game.log` when the game
+/// was not started by the launcher.
+fn open_game_log() {
+    let pid: Option<u32> = std::env::var("OMSI_DEVTOOLS_GAME_PID").ok().and_then(|v| v.parse().ok());
+    let found = pid.and_then(|p| omsi_launcher_lib::instances::list().into_iter().find(|i| i.pid == p)).map(|i| std::path::PathBuf::from(i.log));
+    let path = found.filter(|p| p.exists()).unwrap_or_else(|| omsi_launcher_lib::data_dir().join("game.log"));
+    crate::version::open_url(&path.to_string_lossy());
 }
 
 /// One watched variable.
@@ -88,9 +101,18 @@ struct Watch {
 /// The tools' state, apart from the window.
 struct Tools {
     /// The overlays on (by `VIEW_KEYS`).
-    view: [bool; 8],
+    view: [bool; 12],
     /// The list of switches is open.
     overlays_open: bool,
+    /// 0: overlays, reloads and variables; 1: the mirror editor.
+    page: usize,
+    mirrors: Vec<MirrorRow>,
+    incoming_mirrors: Vec<MirrorRow>,
+    mirror_sel: usize,
+    /// What the last copy of the mirror editor put on the clipboard.
+    copied: String,
+    /// How the last reload went, as the game said.
+    note: String,
     vehicle: Option<String>,
     /// The vehicle's variables: numbers, strings.
     names: [Vec<String>; 2],
@@ -101,6 +123,89 @@ struct Tools {
     filter: String,
     lists: Vec<(String, Vec<(bool, String)>)>,
     list_name: String,
+}
+
+/// One mirror camera (`[add_camera_reflexion]`, `_2` or `_static`) in the mirror editor.
+struct MirrorRow {
+    fixed: bool,
+    /// The `_2` form: the eighth value (extra) is there.
+    has_extra: bool,
+    /// As the file gives it: x, y, z, dist, fov, yaw, pitch, extra.
+    base: [f32; 8],
+    /// As set now.
+    cur: [f32; 8],
+    /// What is typed in the fields.
+    edit: [String; 8],
+    /// Set by hand (differs from the file).
+    set: bool,
+}
+
+const MIRROR_LABELS: [&str; 8] = ["x (across)", "y (along)", "z (up)", "dist", "fov", "yaw (deg)", "pitch (deg)", "extra"];
+
+/// A number as short as it can be written in a `.bus`.
+fn num(x: f32) -> String {
+    let s = format!("{x:.4}");
+    let s = if s.contains('.') { s.trim_end_matches('0').trim_end_matches('.').to_string() } else { s };
+    if s == "-0" {
+        "0".to_string()
+    } else {
+        s
+    }
+}
+
+/// The values of a `x;y;z;dist;fov;yaw;pitch;extra` line (extra `-`: none).
+fn mirror_values(text: &str) -> Option<([f32; 8], bool)> {
+    let f: Vec<&str> = text.split(';').collect();
+    if f.len() < 8 {
+        return None;
+    }
+    let mut v = [0.0_f32; 8];
+    for k in 0..7 {
+        v[k] = f[k].trim().parse().ok()?;
+    }
+    let has_extra = f[7].trim() != "-";
+    if has_extra {
+        v[7] = f[7].trim().parse().ok()?;
+    }
+    Some((v, has_extra))
+}
+
+impl MirrorRow {
+    fn from_game(fixed: bool, text: &str) -> Option<MirrorRow> {
+        let (v, has_extra) = mirror_values(text)?;
+        Some(MirrorRow { fixed, has_extra, base: v, cur: v, edit: std::array::from_fn(|k| num(v[k])), set: false })
+    }
+
+    /// The `[add_camera_reflexion...]` block as it goes into the `.bus`.
+    fn block(&self) -> String {
+        let head = if self.fixed {
+            "[add_camera_reflexion_static]"
+        } else if self.has_extra {
+            "[add_camera_reflexion_2]"
+        } else {
+            "[add_camera_reflexion]"
+        };
+        let n = if self.has_extra && !self.fixed { 8 } else { 7 };
+        let mut s = head.to_string();
+        for k in 0..n {
+            s.push_str("\r\n");
+            s.push_str(&num(self.cur[k]));
+        }
+        s
+    }
+
+    /// The line that sets this mirror in the game.
+    fn line(&self, at: usize) -> String {
+        let extra = if self.has_extra { format!("{}", self.cur[7]) } else { "-".to_string() };
+        let v = &self.cur;
+        format!("mirrorset\t{at}\t{};{};{};{};{};{};{};{extra}", v[0], v[1], v[2], v[3], v[4], v[5], v[6])
+    }
+
+    fn reset(&mut self) {
+        self.cur = self.base;
+        self.edit = std::array::from_fn(|k| num(self.base[k]));
+        self.set = false;
+    }
 }
 
 enum Act {
@@ -166,8 +271,14 @@ fn save_lists(lists: &[(String, Vec<(bool, String)>)]) {
 impl Tools {
     fn new() -> Tools {
         Tools {
-            view: [false; 8],
+            view: [false; 12],
             overlays_open: true,
+            page: 0,
+            mirrors: Vec::new(),
+            incoming_mirrors: Vec::new(),
+            mirror_sel: 0,
+            copied: String::new(),
+            note: String::new(),
             vehicle: None,
             names: [Vec::new(), Vec::new()],
             incoming: [Vec::new(), Vec::new()],
@@ -220,6 +331,22 @@ impl Tools {
                 w.edit = f[3].to_string();
                 w.seeded = true;
             }
+            "mirrors_begin" => self.incoming_mirrors.clear(),
+            "mirror" if f.len() >= 4 => {
+                if let Some(m) = MirrorRow::from_game(f[2] == "1", f[3]) {
+                    self.incoming_mirrors.push(m);
+                }
+            }
+            "mirrordev" if f.len() >= 3 => {
+                let at: usize = f[1].parse().unwrap_or(usize::MAX);
+                if let (Some(m), Some((v, _))) = (self.incoming_mirrors.get_mut(at), mirror_values(f[2])) {
+                    m.cur = v;
+                    m.edit = std::array::from_fn(|k| num(v[k]));
+                    m.set = true;
+                }
+            }
+            "mirrors_end" => self.mirrors = std::mem::take(&mut self.incoming_mirrors),
+            "note" if f.len() >= 2 => self.note = f[1].to_string(),
             "val" if f.len() >= 4 => {
                 if let Some(w) = self.watched.iter_mut().find(|w| w.is_str == is_str && w.name == f[2]) {
                     w.value = f[3].to_string();
@@ -233,6 +360,123 @@ impl Tools {
         }
     }
 
+    /// The mirror editor: every `[add_camera_reflexion...]` of the vehicle and its coupled
+    /// parts, set live in the game (never written to a file) and copied as the block to paste.
+    fn draw_mirrors(&mut self, ui: &mut Ui, size: Vec2, mut y: f32, out: &mut Vec<String>) {
+        let pad = 20.0;
+        let w = (size.x - 2.0 * pad).max(200.0);
+        let n = self.mirrors.len();
+        if n == 0 {
+            ui.paragraph("This vehicle has no mirror cameras ([add_camera_reflexion]), or no vehicle is in the game yet.", Vec2::new(pad, y), w, 13.0, Weight::Regular, TEXT_DIM);
+            return;
+        }
+        let hint = "Values change the mirror in the game at once and are not saved anywhere. Copy the block to paste it into the .bus. (They replace the file's values and the turns you made with Ctrl+Alt+arrows.)";
+        y += ui.paragraph(hint, Vec2::new(pad, y), w, 12.5, Weight::Regular, TEXT_DIM) + 8.0;
+        self.mirror_sel = self.mirror_sel.min(n - 1);
+        // which mirror
+        let per_row = (((w + 6.0) / 66.0).floor() as usize).max(1);
+        for k in 0..n {
+            let r = Rect::new(pad + (k % per_row) as f32 * 66.0, y + (k / per_row) as f32 * 34.0, 60.0, 30.0);
+            let label = if self.mirrors[k].set { format!("{}*", k + 1) } else { format!("{}", k + 1) };
+            let kind = if k == self.mirror_sel { ButtonKind::Primary } else { ButtonKind::Normal };
+            if ui.button(&format!("dt-m-sel-{k}"), r, &label, None, kind) {
+                self.mirror_sel = k;
+            }
+        }
+        y += (n.div_ceil(per_row)) as f32 * 34.0 + 6.0;
+        let sel = self.mirror_sel;
+        let all: Vec<String> = self.mirrors.iter().map(|m| m.block()).collect();
+        let row = &mut self.mirrors[sel];
+        let kind = if row.fixed {
+            "static camera"
+        } else if row.has_extra {
+            "[add_camera_reflexion_2]"
+        } else {
+            "[add_camera_reflexion]"
+        };
+        let state = if row.set { "set by hand" } else { "as in the file" };
+        ui.text(&format!("Mirror {} of {n}  -  {kind}  -  {state}", sel + 1), Vec2::new(pad, y + 12.0), 14.0, Weight::Bold, TEXT_SOFT, Align::Left);
+        y += 26.0;
+        let sw = (w - 100.0).max(120.0);
+        let mut changed = false;
+        for k in 0..8 {
+            if k == 7 && !row.has_extra {
+                break;
+            }
+            let b = row.base[k];
+            let (lo, hi, step) = match k {
+                0..=2 => (b - 2.0, b + 2.0, 0.001),
+                3 => (0.0, (b * 2.0).max(10.0), 0.01),
+                4 => (1.0, 120.0, 0.5),
+                5 => (b - 90.0, b + 90.0, 0.5),
+                6 => (-89.0, 89.0, 0.5),
+                _ => (0.0, (b * 2.0).max(2.0), 0.01),
+            };
+            let mut v = row.cur[k];
+            if ui.slider(&format!("dt-ms-{sel}-{k}"), Rect::new(pad, y, sw, 26.0), &mut v, lo, hi, step, MIRROR_LABELS[k], &|x| num(x)) {
+                row.cur[k] = v;
+                row.edit[k] = num(v);
+                changed = true;
+            }
+            if ui.text_input(&format!("dt-mt-{sel}-{k}"), Rect::new(pad + sw + 8.0, y, 90.0, 26.0), &mut row.edit[k], "", None) {
+                if let Ok(x) = row.edit[k].trim().replace(',', ".").parse::<f32>() {
+                    if x.is_finite() {
+                        row.cur[k] = x;
+                        changed = true;
+                    }
+                }
+            }
+            y += 30.0;
+        }
+        if changed {
+            row.set = true;
+            out.push(row.line(sel));
+        }
+        y += 6.0;
+        // copy, reset
+        let mut bx = pad;
+        if ui.button("dt-m-copy", Rect::new(bx, y, 130.0, 30.0), "Copy this mirror", None, ButtonKind::Primary) {
+            ui.clipboard_out = Some(row.block());
+            self.copied = format!("Mirror {} copied", sel + 1);
+        }
+        bx += 138.0;
+        if ui.button("dt-m-copyall", Rect::new(bx, y, 120.0, 30.0), "Copy all", None, ButtonKind::Normal) {
+            ui.clipboard_out = Some(all.join("\r\n\r\n"));
+            self.copied = format!("All {n} mirrors copied (as set now)");
+        }
+        bx += 128.0;
+        if ui.button("dt-m-reset", Rect::new(bx, y, 130.0, 30.0), "Back to the file", None, ButtonKind::Normal) {
+            row.reset();
+            out.push(format!("mirrorreset\t{sel}"));
+        }
+        bx += 138.0;
+        let mut reset_all = false;
+        if ui.button("dt-m-resetall", Rect::new(bx, y, 130.0, 30.0), "All back", None, ButtonKind::Normal) {
+            reset_all = true;
+        }
+        y += 36.0;
+        if reset_all {
+            for (k, m) in self.mirrors.iter_mut().enumerate() {
+                if m.set {
+                    m.reset();
+                    out.push(format!("mirrorreset\t{k}"));
+                }
+            }
+        }
+        if !self.copied.is_empty() {
+            ui.text(&self.copied, Vec2::new(pad, y + 8.0), 13.0, Weight::Regular, ACCENT, Align::Left);
+            y += 24.0;
+        }
+        // the block, as it goes into the file
+        let block = self.mirrors[sel].block();
+        ui.text("In the .bus:", Vec2::new(pad, y + 12.0), 13.0, Weight::Bold, TEXT_SOFT, Align::Left);
+        y += 22.0;
+        for line in block.split("\r\n") {
+            ui.text(line, Vec2::new(pad + 8.0, y + 8.0), 13.0, Weight::Regular, TEXT, Align::Left);
+            y += 17.0;
+        }
+    }
+
     /// The interface; what the game should hear goes into `out`.
     fn draw(&mut self, ui: &mut Ui, size: Vec2, out: &mut Vec<String>) {
         let pad = 20.0;
@@ -243,7 +487,19 @@ impl Tools {
             None => "No vehicle in the game yet.".to_string(),
         };
         ui.text(&status, Vec2::new(pad, 60.0), 13.0, Weight::Regular, TEXT_DIM, Align::Left);
+        if ui.button("dt-open-log", Rect::new(size.x - pad - 110.0, 22.0, 110.0, 30.0), "Open log", None, ButtonKind::Normal) {
+            open_game_log();
+        }
         let mut y = 84.0;
+        let mut page = self.page;
+        if ui.segmented("dt-page", Rect::new(pad, y, 300.0_f32.min(w), 28.0), &mut page, &["Overlays and variables", "Mirror editor"]) {
+            self.page = page;
+        }
+        y += 38.0;
+        if self.page == 1 {
+            self.draw_mirrors(ui, size, y, out);
+            return;
+        }
 
         // --- what the game draws over the picture: a list that folds up
         let head = Rect::new(pad, y, w, 28.0);
@@ -270,17 +526,19 @@ impl Tools {
                 "Path point numbers and uses (entry, exit, links, sale, stamper)",
                 "Ticket sale, stamper, money and change points",
                 "Bounding box of the vehicle",
-                "Axles and wheels (blue, with the axle's number)",
+                "Axles and wheels (blue, with tyre width)",
+                "Center of gravity",
                 "Interior lights (yellow, with number and variable)",
+                "Mirrors (position and the way they are turned)",
+                "Driver views (F1 cameras)",
+                "Passenger views",
             ];
-            // (the switch's place in `VIEW_KEYS` for each line)
-            let keys = [0usize, 1, 2, 6, 7, 3, 4, 5];
             let two = w >= 760.0;
             let col = if two { (w - 20.0) * 0.5 } else { w.min(520.0) };
             for (k, label) in labels.iter().enumerate() {
                 let (cx, row) = if two { (pad + (k % 2) as f32 * (col + 20.0), k / 2) } else { (pad, k) };
                 let r = Rect::new(cx, y + row as f32 * 30.0, col, 28.0);
-                let at = keys[k];
+                let at = k;
                 let mut on = self.view[at];
                 if ui.toggle(&format!("dt-view-{at}"), r, &mut on, label) {
                     self.view[at] = on;
@@ -291,6 +549,35 @@ impl Tools {
             y += rows as f32 * 30.0;
         }
         y += 12.0;
+
+        // --- what the game can read from the files again, without a new session
+        ui.text("Reload while playing", Vec2::new(pad, y + 12.0), 15.0, Weight::Bold, TEXT_SOFT, Align::Left);
+        y += 22.0;
+        if ui.button("dt-reload-cabin", Rect::new(pad, y, 190.0, 30.0), "Reload passenger cabin", None, ButtonKind::Normal) {
+            out.push("reload\tcabin".to_string());
+        }
+        if ui.button("dt-reload-paths", Rect::new(pad + 200.0, y, 130.0, 30.0), "Reload paths", None, ButtonKind::Normal) {
+            out.push("reload\tpaths".to_string());
+        }
+        y += 36.0;
+        if ui.button("dt-reload-sound", Rect::new(pad, y, 120.0, 30.0), "sound.cfg", None, ButtonKind::Normal) {
+            out.push("reload\tsound".to_string());
+        }
+        if ui.button("dt-reload-bus", Rect::new(pad + 130.0, y, 120.0, 30.0), ".bus file(s)", None, ButtonKind::Normal) {
+            out.push("reload\tbus".to_string());
+        }
+        if ui.button("dt-reload-model", Rect::new(pad + 260.0, y, 120.0, 30.0), "model.cfg", None, ButtonKind::Normal) {
+            out.push("reload\tmodel".to_string());
+        }
+        if ui.button("dt-reload-consts", Rect::new(pad + 390.0, y, 120.0, 30.0), "constfiles", None, ButtonKind::Normal) {
+            out.push("reload\tconsts".to_string());
+        }
+        y += 36.0;
+        if !self.note.is_empty() {
+            ui.text(&self.note, Vec2::new(pad, y + 8.0), 13.0, Weight::Regular, TEXT_DIM, Align::Left);
+            y += 24.0;
+        }
+        y += 8.0;
 
         // --- the variables
         ui.text("Variables of the vehicle", Vec2::new(pad, y + 12.0), 15.0, Weight::Bold, TEXT_SOFT, Align::Left);
@@ -483,6 +770,7 @@ struct DevTools {
     inbox: Arc<Mutex<Vec<String>>>,
     modifiers: Modifiers,
     tools: Tools,
+    clipboard: Option<Clipboard>,
 }
 
 impl DevTools {
@@ -535,6 +823,11 @@ impl DevTools {
         self.ui.begin(size, scale, dt);
         self.tools.draw(&mut self.ui, size, &mut out);
         window.set_cursor(self.ui.cursor);
+        if let Some(t) = self.ui.clipboard_out.take() {
+            if let Some(c) = self.clipboard.as_mut() {
+                let _ = c.set_text(t);
+            }
+        }
         let (layers, verts, ranges) = self.ui.finish();
         for l in &out {
             send_line(l);
@@ -646,9 +939,15 @@ impl ApplicationHandler for DevTools {
                         KeyCode::Escape => Some(Key::Escape),
                         KeyCode::Tab => Some(Key::Tab),
                         KeyCode::KeyA if cmd => Some(Key::SelectAll),
+                        KeyCode::KeyC if cmd => Some(Key::Copy),
+                        KeyCode::KeyV if cmd => Some(Key::Paste),
+                        KeyCode::KeyX if cmd => Some(Key::Cut),
                         _ => None,
                     };
                     if let Some(k) = k {
+                        if k == Key::Paste {
+                            self.ui.clipboard_in = self.clipboard.as_mut().and_then(|c| c.get_text().ok());
+                        }
                         self.ui.input.keys.push(k);
                     }
                 }

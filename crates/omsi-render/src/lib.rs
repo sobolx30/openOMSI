@@ -2219,6 +2219,9 @@ pub struct Renderer {
     freed: std::cell::OnceCell<Freed>,
     /// Enhanced+: the ray tracer (on a device with ray queries, see `RenderOptions::ray_tracing`).
     rt: Option<rt::RayTracer>,
+    /// Enhanced+: the cabin probe, six small pictures of the player's vehicle from the camera
+    /// inside it, which the traced reflections read where a ray meets its inside.
+    cab_probe: Option<rt::CabProbe>,
     /// Meshes share pages of buffers (the adapter draws with a base vertex).
     mesh_pages: bool,
 }
@@ -2287,6 +2290,12 @@ pub struct RenderOptions {
     /// reflections, where the device can trace rays (hardware ray queries); elsewhere the
     /// enhanced picture as it is.
     pub ray_tracing: bool,
+    /// With `ray_tracing`: the sun's shadow is traced (the shadow map keeps only the cut-out
+    /// casters); off, the shadow map holds every caster and only the occlusion is traced.
+    pub rt_shadows: bool,
+    /// With `ray_tracing`: which surfaces get traced reflections - 0 none, 1 the player's vehicle
+    /// (and the wet roads, whose puddles have no other picture in a ray tracing build), 2 all; 0: the wet roads only.
+    pub rt_reflections: u8,
 }
 
 impl Default for RenderOptions {
@@ -2306,6 +2315,8 @@ impl Default for RenderOptions {
             reflections: true,
             no_enhanced: false,
             ray_tracing: false,
+            rt_shadows: true,
+            rt_reflections: 2,
         }
     }
 }
@@ -4628,6 +4639,7 @@ impl Renderer {
             pending_meshes: Default::default(),
             freed: std::cell::OnceCell::new(),
             rt,
+            cab_probe: None,
             mesh_pages: false,
         }
     }
@@ -7162,7 +7174,14 @@ impl Renderer {
             // x how bright an LED panel's dots burn (see `MaterialExtra::led`; the settings'
             // 16 levels give 0 = off .. 3.75), y whether the LED panels' `\S:n` masks keep
             // their mip chain (0: at full resolution, the dots stay visible when small)
-            led: [lighting.led_glow, lighting.led_mips, 0.0, 0.0],
+            led: [
+                lighting.led_glow,
+                lighting.led_mips,
+                // z: the player's own panes mirror the cabin from inside it (Enhanced+, experimental;
+                // `OMSI_CAB_REFLECTION=0` switches it off)
+                omsi_cfg::env::var("OMSI_CAB_REFLECTION").ok().map(|v| if v.trim() == "0" { 0.0 } else { 1.0 }).unwrap_or(1.0),
+                0.0,
+            ],
             moon: lighting.moon_dir.normalize_or_zero().extend(MOON_RADIUS).to_array(),
             // (w of the first: the veil's optical depth, which the sky draws as the high
             // layer; of the second: how far the veil spreads the sun, which softens shadows)
@@ -8755,8 +8774,9 @@ impl Renderer {
                 lighting.cloud_density,
                 lighting.cloud_offset[0],
                 lighting.cloud_offset[1],
-                // (2: the traced lighting, full size, see `ao_at`)
-                if rt_frame { 2.0 } else if ao_on { 1.0 } else { 0.0 },
+                // (2: the traced lighting, full size, see `ao_at`; 3 and 4 on top of it: the traced reflections
+                // of the player's vehicle and of every surface, see `RenderOptions::rt_reflections`)
+                if rt_frame { 2.0 + f32::from(self.options.rt_reflections.min(2)) } else if ao_on { 1.0 } else { 0.0 },
             ],
             // (w: the heading the sphere maps are laid out by in the headset, see
             // `set_env_heading`; flagged by cam_up.w)
@@ -8897,7 +8917,8 @@ impl Renderer {
                     // (Enhanced+: what is solid casts its shadow by the traced rays; the
                     // close and near maps keep the cut-out leaves and fences, whose texels
                     // the rays cannot see)
-                    if rt_frame && kind == PIPE_OPAQUE {
+                    // (not when the sun's shadow is not traced: the maps then hold every caster)
+                    if rt_frame && self.options.rt_shadows && kind == PIPE_OPAQUE {
                         kind = PIPE_KINDS;
                     }
                     ranges.push((kind, ri as u32, *slot, mat_id, mat.look));
@@ -9076,6 +9097,10 @@ impl Renderer {
         let fov_y = camera.fov_deg.to_radians().max(1e-3);
         let max_obj_dist = self.options.max_obj_dist;
         let min_obj_size = lighting.min_obj_size.max(self.options.min_obj_size);
+        // OMSI_NO_FRUSTUM_CULL=1 (a test of the traced reflections): the window's picture draws what
+        // is behind the camera, outside the view and beyond the fog as well; the size, the
+        // distance and the levels of detail still choose
+        let no_frustum = with_overlays && omsi_cfg::env::var_os("OMSI_NO_FRUSTUM_CULL").is_some();
         // (instance, distance along the view direction, the camera is inside its bounds)
         // One thread: a few nanoseconds an instance. Spread over the worker pool the
         // hand-over cost more than the work (5 ms a frame for 8 500 instances while the
@@ -9120,16 +9145,16 @@ impl Renderer {
             // camera inside the sphere: drawn whatever the frustum says, but the
             // object's LOD still chooses (all levels of a building stood in at once)
             let inside = v.length() <= r;
-            if !inside && z + r < camera.near {
+            if !no_frustum && !inside && z + r < camera.near {
                 return None;
             }
             // (the enhanced sky is not the fog's colour below the horizon: ground
             // left out for the fog let it show through, road-shaped holes in the
             // terrain seen from above, so the ground is always drawn there)
-            if !inside && z - r > fog_far && !(enhanced_frame && (inst.surface || r > 100.0)) {
+            if !no_frustum && !inside && z - r > fog_far && !(enhanced_frame && (inst.surface || r > 100.0)) {
                 return None;
             }
-            if !inside && (v.x.abs() > z * tan_x + r / cos_x || v.y.abs() > z * tan_y + r / cos_y) {
+            if !no_frustum && !inside && (v.x.abs() > z * tan_x + r / cos_x || v.y.abs() > z * tan_y + r / cos_y) {
                 return None;
             }
             // The screen size: the diameter over the distance to the camera (not the
@@ -10325,6 +10350,7 @@ impl Renderer {
         // Weather alone is insufficient: leave the allocation and reflection passes out when
         // the visible batches contain no moisture-tagged surface (a showroom, bare terrain).
         // Enhanced+: the traced reflections (wet roads' too) in place of the puddles' rays
+        // (also with the reflections off: the wet roads' are traced there, a ray tracing build has no puddle pass)
         if rt_frame {
             self.encode_rt_reflections(&mut encoder, width, height, tset.as_ref(), &mut timed);
         }

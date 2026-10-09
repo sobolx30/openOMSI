@@ -79,6 +79,8 @@ pub(crate) struct App {
     pub(crate) frozen_mirrors: Option<FrozenMirrors>,
     /// The mirror panels laid over the picture (see `mirror_hud`).
     pub(crate) mirror_hud: crate::mirror_hud::MirrorHud,
+    /// The panel for the driver's view and the mirrors' angles (see `view_editor.rs`).
+    pub(crate) view_editor: crate::view_editor::ViewEditor,
     /// Cursor and view the hover was last worked out for (see the redraw).
     pub(crate) hover_key: Option<(i32, i32, i32, i32)>,
     pub(crate) view: String,
@@ -1118,12 +1120,21 @@ pub(crate) fn report_missing_content(w: &World, msg: &mut Option<(String, f32)>)
     }
 }
 
-/// How long the glide between two cockpit cameras takes (seconds). The eye, the turn of the
-/// view and the field of view all follow the same curve over this time. 0 = hard cut.
+/// The time the eased return of the head (F1, Space) takes (seconds); 0 on this line was also
+/// the switch of the glide between cockpit cameras (`driverview_smooth`) being off.
 pub(crate) const CAM_BLEND_SECS: f32 = 0.54;
-/// The longest step of time one frame adds to the glide (seconds): a frame that hitches at
-/// the start of a switch does not skip ahead in it.
-pub(crate) const CAM_BLEND_MAX_DT: f32 = 1.0 / 30.0;
+/// OMSI's glide between two cockpit cameras, as the original program does it (Omsi.exe
+/// 0x7ee468, the camera's `SetView` with the `[driverview_smooth]` flag): every frame the
+/// camera comes closer to the wanted one by `1 - exp(-0.005 * ms)` of what is left (`ms`: the
+/// frame's time in milliseconds, at most 200) - the eye, the turn (heading and height, each as
+/// its own number) and the field of view alike. In all, after a time `T` it has covered
+/// `1 - exp(-CAM_GLIDE_RATE * T)` of the way: a quick start and a long soft tail, never a
+/// fixed end. (Our glide is cut off where 99.95% is covered.)
+pub(crate) const CAM_GLIDE_RATE: f32 = 5.0;
+/// How long that takes (seconds): `ln(2000) / CAM_GLIDE_RATE`.
+pub(crate) const CAM_GLIDE_SECS: f32 = 1.5202;
+/// The longest step of time one frame adds to the glide (seconds); the original's 200 ms.
+pub(crate) const CAM_BLEND_MAX_DT: f32 = 0.2;
 
 fn wrap_deg(a: f32) -> f32 {
     (a + 180.0).rem_euclid(360.0) - 180.0
@@ -1142,30 +1153,10 @@ pub(crate) fn blend_local(a: &omsi_vehicle::Camera, b: &omsi_vehicle::Camera, k:
     }
     let rest = 1.0 - k;
     let l = |x: f32, y: f32| y + (x - y) * rest;
-    // The view direction turns along the great circle between the two (a slerp of the
-    // directions), not yaw and pitch each on their own straight line: that swept the view
-    // out in a bow - up and across at once - while the eye went straight, which looked like
-    // a zigzag in the glide.
-    let dir = |c: &omsi_vehicle::Camera| {
-        let (sy, cy) = c.yaw.to_radians().sin_cos();
-        let (sp, cp) = c.pitch.to_radians().sin_cos();
-        glam::Vec3::new(sy * cp, cy * cp, sp)
-    };
-    let (fa, fb) = (dir(a), dir(b));
-    let dot = fa.dot(fb).clamp(-1.0, 1.0);
-    let (yaw, pitch) = if dot < -0.9995 {
-        // (turned right round: no one great circle, so the plain way)
-        (b.yaw - wrap_deg(b.yaw - a.yaw) * rest, l(a.pitch, b.pitch))
-    } else {
-        let f = if dot > 0.9995 {
-            (fa * rest + fb * k).normalize_or(fb)
-        } else {
-            let theta = dot.acos();
-            let s = theta.sin();
-            ((fa * ((rest * theta).sin() / s)) + (fb * ((k * theta).sin() / s))).normalize_or(fb)
-        };
-        (f.x.atan2(f.y).to_degrees(), f.z.clamp(-1.0, 1.0).asin().to_degrees())
-    };
+    // The heading and the height each on their own straight line, as Omsi.exe does it
+    // (0x7ee468: every number of the camera is brought closer on its own) - the heading the
+    // short way round.
+    let (yaw, pitch) = (b.yaw - wrap_deg(b.yaw - a.yaw) * rest, l(a.pitch, b.pitch));
     omsi_vehicle::Camera {
         pos: [l(a.pos[0], b.pos[0]), l(a.pos[1], b.pos[1]), l(a.pos[2], b.pos[2])],
         dist: l(a.dist, b.dist),
@@ -1248,12 +1239,12 @@ impl CamCarry {
 }
 
 impl CamBlend {
-    /// How far along the way from the old camera to the new one: ease-out
-    /// `s = 1-(1-t)^3` — fast off the mark, settling softly, so adjacent
-    /// seats snap round without lagging behind the key.
+    /// How far along the way from the old camera to the new one, as OMSI's glide covers it:
+    /// `1 - exp(-0.005 * ms)` - quick off the mark, a long soft tail (`t`: 0..1 over
+    /// `CAM_GLIDE_SECS`, where 99.95% is covered and the glide is handed over).
     pub fn progress(&self) -> f32 {
         let t = self.t.clamp(0.0, 1.0);
-        1.0 - (1.0 - t) * (1.0 - t) * (1.0 - t)
+        1.0 - (-CAM_GLIDE_RATE * CAM_GLIDE_SECS * t).exp()
     }
 }
 
@@ -1267,9 +1258,14 @@ mod cam_blend_tests {
 
     #[test]
     fn glide_starts_fast_and_settles_softly() {
+        use super::{CAM_GLIDE_RATE, CAM_GLIDE_SECS};
         assert_eq!(blend(0.0), 0.0);
-        assert_eq!(blend(1.0), 1.0);
-        assert!((blend(0.5) - 0.875).abs() < 1e-6);
-        assert!(blend(0.2) > 0.4, "fast off the mark");
+        // (all but 0.05% of the way at the end of the glide)
+        assert!((blend(1.0) - 0.9995).abs() < 1e-4);
+        // after 200 ms: 1 - exp(-0.005 * 200) of the way, as the original program does
+        let t = 0.2 / CAM_GLIDE_SECS;
+        assert!((blend(t) - (1.0 - (-1.0f32).exp())).abs() < 1e-4);
+        assert!(CAM_GLIDE_RATE > 0.0);
+        assert!(blend(0.1) < blend(0.2) && blend(0.2) < blend(0.9), "ever nearer");
     }
 }

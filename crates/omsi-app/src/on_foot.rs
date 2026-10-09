@@ -163,6 +163,21 @@ impl OnFoot {
     }
 }
 
+/// How far in the own bus the walker's camera is, for the sound (1 in the bus, 0 outside, a
+/// smooth fall over the stretch from a little inside its walls to a metre outside them -
+/// across a door the sound goes from the cab's to the street's as the camera does).
+pub(crate) fn foot_cab_mix(cam: Option<DVec3>, p: &crate::player::Player) -> Option<f32> {
+    let cam = cam?;
+    let bb = p.vehicle.ty.def.bounding_box?;
+    let o = Obb::from_box(bb, p.vehicle.position, p.vehicle.heading);
+    let rel = cam.truncate() - o.center;
+    let (sh, ch) = o.heading.sin_cos();
+    let (x, y) = (rel.x * ch - rel.y * sh, rel.x * sh + rel.y * ch);
+    let outside = (x.abs() - o.half.x).max(y.abs() - o.half.y);
+    let t = ((outside + 0.4) / 1.4).clamp(0.0, 1.0);
+    Some((1.0 - t * t * (3.0 - 2.0 * t)) as f32)
+}
+
 fn wrap(a: f64) -> f64 {
     (a + 180.0).rem_euclid(360.0) - 180.0
 }

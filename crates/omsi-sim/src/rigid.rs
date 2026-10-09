@@ -483,6 +483,48 @@ impl RigidBody {
         RigidBody { mass, inertia, cog, position: DVec3::ZERO, orientation: Quat::IDENTITY, velocity: Vec3::ZERO, omega: Vec3::ZERO, wheels, wheel_axle, steer_deg: 0.0, kappa: 0.0, max_steer_deg, rot_pnt_long: def.rot_pnt_long, inv_min_turn_radius, body_freq, holding: true, rolling_resistance: if def.rolling_resistance > 0.0 { def.rolling_resistance } else { 0.008 * mass * 9.81 }, accel_body: Vec3::ZERO, friction: 0.85, wheel_impacts: Vec::new(), coupled: Vec::new(), spawned_inside: None, wheel_walls: true }
     }
 
+    /// `fresh`, a body made again from the definition (edited meanwhile), with the motion of
+    /// this one: where the model's origin stands, how it turns and moves, and what each
+    /// wheel was doing. A moved centre of gravity moves the body's centre, not the model.
+    pub fn refit(&self, fresh: RigidBody) -> RigidBody {
+        let mut n = fresh;
+        let origin = self.position - self.orientation.mul_vec3(self.cog).as_dvec3();
+        n.orientation = self.orientation;
+        n.position = origin + n.orientation.mul_vec3(n.cog).as_dvec3();
+        n.velocity = self.velocity;
+        n.omega = self.omega;
+        n.steer_deg = self.steer_deg;
+        n.kappa = self.kappa;
+        n.holding = self.holding;
+        n.accel_body = self.accel_body;
+        n.friction = self.friction;
+        n.wheel_impacts = self.wheel_impacts.clone();
+        n.coupled = self.coupled.clone();
+        n.spawned_inside = self.spawned_inside.clone();
+        n.wheel_walls = self.wheel_walls;
+        if n.wheels.len() == self.wheels.len() {
+            for (w, o) in n.wheels.iter_mut().zip(&self.wheels) {
+                w.spin = o.spin;
+                w.slipping = o.slipping;
+                w.locked = o.locked;
+                w.steer = o.steer;
+                w.spring_factor = o.spring_factor;
+                w.compression = o.compression;
+                w.compression_rate = o.compression_rate;
+                w.touch = o.touch.clone();
+                w.on_ground = o.on_ground;
+                w.rotation_deg = o.rotation_deg;
+                w.rpm = o.rpm;
+                w.load = o.load;
+                w.ground_z = o.ground_z;
+                w.ground_seen = o.ground_seen;
+                w.walls = o.walls.clone();
+                w.step_force = o.step_force;
+            }
+        }
+        n
+    }
+
     /// Place the body at rest with its wheels on the ground plane at `origin.z`: heading
     /// `heading_deg`, springs already carrying the load (no drop and bounce at the start).
     pub fn place(&mut self, origin: DVec3, heading_deg: f64) {

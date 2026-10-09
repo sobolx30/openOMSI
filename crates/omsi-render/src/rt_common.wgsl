@@ -27,6 +27,8 @@ struct RtParams {
     sky: vec4<f32>,
     // xyz the sun's radiance at the hits (pre-exposed), w the probe's mip count
     sun_light: vec4<f32>,
+    // x 1: the sun's shadow is traced (0: not: the shadow map holds it)
+    flags: vec4<f32>,
 };
 
 struct Record {
@@ -35,6 +37,7 @@ struct Record {
     // bit 0: alpha-tested (stochastic), bit 1: unlit (shows its own colour), bit 2: the
     // coverage is the transmap's alpha
     flags: u32,
+    // the saloon lamps' light on this mesh, as an f32's bits (rt.rs `lamp_level`)
     pad: u32,
     color: vec4<f32>,
 };

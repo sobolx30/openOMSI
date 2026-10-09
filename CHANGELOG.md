@@ -6,11 +6,75 @@ Every push to `main` is released as `MAJOR.MINOR.COMMIT` (see
 
 ## Unreleased
 
-### Added
+### Fixed
+- LED matrices whose `[matl_alpha] 2`, `[matl_nightmap]` and `[matl_transmap] \S:n` stand after a `[matl_change]` (with no `[matl_item]`) showed every dot lit at all times: the slot was drawn opaque and its mask cut nothing. As in Omsi.exe (the parser at 0x5f4763), the commands after `[matl_change]` change the slot's base material, so their `[matl_alpha]` now counts as the slot's own. [ROLLBACK matlchange-42] in `material_alpha` (scene.rs).
+- Enhanced: a pane with a reflection map is lit by the lamps at night without ray traced reflections: the lamps' light on the pane (street lamps, headlamps, lit fronts) lights the photograph it mirrors, in its tints, as a mid-grey surround would send it back (the sky probe alone is dark by night and the glass stood black and artificial). `ENVMAP_LIT_GLASS` / `ENVMAP_LIT_PAINT` / `ENVMAP_LIT_GAIN` in enhanced.wgsl [ROLLBACK envlit-41]; the traced reflections are unchanged.
+- Enhanced: Enhanced+ is merged into Enhanced. The launcher's Graphics list no longer has Enhanced+; Enhanced has two new settings instead: "Ray traced shadows (and occlusion)" (`rt_shadows`) and "Ray traced reflections" (`rt_reflections`: Disabled - the reflection maps as before; On player vehicle only; Full - every reflecting surface). They switch independently (the traced shadows need a ray-tracing GPU; with both off the renderer is built without ray tracing). An old `graphics=enhanced_plus` / `--enhanced-plus` is read as Enhanced with both on (Full). Wet roads are still traced in a ray-tracing build, and the ambient occlusion stays traced there. [ROLLBACK rtsplit-40]
+- Enhanced: the reflection maps (`[matl_envmap]`) turn with the camera, as in OMSI: Omsi.exe sets the sphere map's texture transform from the camera's yaw and pitch (offset -yaw/pi, -pitch/2pi), which the D3D wrappers and openOMSI left out, so the map looked flat and fixed to the screen. `ENV_SCROLL` in shader.wgsl (`sphere_map_uv`; 0 = the old behaviour) [ROLLBACK envscroll-40]. The Enhanced paint also samples the photograph through that sphere map now (`ENVMAP_SPHERE` in enhanced.wgsl; false = the old lookup) [ROLLBACK envmap-40].
+- Enhanced: the `[matl_envmap]` paint (car bodies, bus panels) reflects more, as OMSI's sphere map does: its F0 reaches 0.16 for a full factor (0.08 before), the photograph's tint weighs 1.0 (0.65) and holds more on rougher paint (0.6 against 0.25). In Enhanced+ such a paint is traced as chrome and glass are (`ENVMAP_TRACED`); the old values stand in the comments of `enhanced.wgsl` under `[ROLLBACK envmap-39]`, the pane colour change under `[ROLLBACK glass-38]`.
+- Enhanced: a pane (a window, a windscreen) shows of itself only the sun and sky on its tint and its reflection: the map's lamps, the saloon lamps and a glow of its own no longer add to its colour, which stood a dark tinted window grey and milky by day and at night.
+- Enhanced+: the traced sun shadow showed its 4 x 4 pattern as large squares in the edge of a shadow far away on a road or the ground seen at a grazing angle: the filter that averages the rays took only neighbours at the same depth, and on such a surface the rows above and below lie metres apart. It now follows the surface's slope (the inverse depth is straight across a plane).
+- Enhanced+: what the traced reflections show of the inside of the player's vehicle (the saloon behind the camera in the windscreen) is no longer a flat mean colour per texture. While the camera is in the vehicle, a **cabin probe** draws small pictures (512 px, one a frame) of the vehicle from three places - the camera, the middle of the vehicle and a quarter of its length behind that - six faces each, with the plain shading - real textures, the saloon lamps and all - and a reflection ray that meets anything within 40 m of the eye while the camera is in the vehicle (the dash and pillars and the rear part of a bendy bus lie outside the vehicle's bounding box) reads its colour from them (`render_cab_probe`, `CabProbe`). Where no face has been drawn yet it falls back to the earlier cabin shading. `OMSI_CAB_PROBE=0` switches it off (`OMSI_CAB_REFLECTION=0` too). A point the eye cannot see (a ray from the eye to it meets a surface first: behind the driver's seat, say) is not taken from the probe, which would show what stands in front of it. With the camera outside the vehicle (or in none) the same is done by a probe at the camera, six faces in the world's frame, for what is within 120 m of it. In the `OMSI_DEBUG_RT=11` view magenta marks the hits the probe had; `OMSI_DEBUG_RT=12` shows the probe's own colour there.
+- Enhanced+: the traced reflections of what is off the screen (the saloon behind the camera in a window at night, a lit bus in a shop window) were black by night: a hit there was lit by the sun and the sky alone. A mesh the saloon lamps light now brings their light back (`Record` carries it, `lamp_level`), and a ray that meets the inside of the player's vehicle is lit as its cabin is. `OMSI_DEBUG_RT=11` draws what each reflection ray meets (green: sky, red: off the screen, blue: on it, yellow: the cabin).
+- Sound: entering or leaving the vehicle in walk mode now crossfades the cab and street sound while the camera glides in or out (by the walker's position against the bus), instead of a dip. The own bus's outside sounds open from muffled to clear as they leave the cab.
+- Passengers that stepped off the player's vehicle and found no pavement lane at once no longer stand still: they keep looking for one and set off when they find it.
+- Wheel spray on wet roads is hidden more firmly in and right round the body the camera is in (passenger view included), and so is a vehicle's own `[smoke]` tyre spray (the stock `tire_wet_*` emitters), which was still drawn in the cabin.
 
-* **Developer tools window**: Settings → General → *Enable Developer Tools* opens an extra window
-  beside the game at session start (a process of its own; closing it only closes the window, and
-  it closes by itself when the game ends). Ctrl+Shift+Backspace in the game starts it again. In
+* **`Velocity` and `Velocity_Ground` were one value.** As in Omsi.exe, `Velocity_Ground` is the
+  body's speed over the ground and `Velocity` comes from the driven wheels (the mean of their
+  turning speed times the tyre's size), so wheelspin or a locked wheel shows in it.
+* **Text fields** (the launcher's and the developer tools') copy, cut and paste the selection,
+  Ctrl+Backspace / Ctrl+Delete remove a word, Ctrl+arrows move by word and Shift+arrows select.
+* **The mouse wheel over a cockpit switch** no longer clicks it; it zooms the view (field of view) as everywhere else.
+
+### Changed
+
+* **Smooth viewpoint changes** (`driverview_smooth`) now glide as Omsi.exe does it (found in its
+  camera code): every frame the view comes closer to the new camera by `1 - exp(-0.005 * ms)` of
+  what is left - the eye, the field of view and the heading and height each on their own - so a
+  quick start and a long soft tail instead of a fixed-length curve. The eased return of the view
+  (Space / F1) uses the same law.
+* **The driver's view turns with the steering only in the default driver view** (straight ahead);
+  the other cockpit views no longer turn.
+* **Esc → Camera** no longer carries the seat-position and head-pitch sliders; the view is
+  adjusted in the view editor panel (the single button there), per vehicle. The global field of
+  view slider stays.
+* **The own bus's outside sounds heard in its cab** (the engine from outside and the like) go
+  through a low-pass filter as well as being turned down - but only while the bus's script lets
+  them in: with `Snd_OutsideVol` at 0 they are not heard at all, as before. The filter's
+  cutoff rises with `Snd_OutsideVol` (500 Hz at 0.01 to wide open at 0.95). The traffic gets no
+  filter.
+* **Getting in or out of the bus on foot** no longer cuts the sound between the street and
+  the cab: the sounds of the old view fade out in 0.2 s, those of the new one in over 0.3 s,
+  and the traffic heard through the bodywork slides to its cab level in half a second.
+* **Oncoming cars no longer stop for the player on a bend.** They looked for the player's
+  bus in a box stretched straight ahead of its nose, which on a bend reaches over into the
+  opposite lane. The stretch ahead of the nose now follows the circle the bus is driving
+  (its turn per metre, from the change of its heading).
+* **F4 (map camera)**: a plain click on the ground (no Ctrl) now asks "Do you want to move the
+  vehicle here?" and, on yes, puts the vehicle there - anywhere, not only on a street (Enter =
+  yes, Esc or a click beside the question = no).
+
+### Added
+- `OMSI_NO_FRUSTUM_CULL=1`: the window's picture draws the whole scene whatever the camera sees (behind it, outside the view, beyond the fog) - a test for the traced reflections. Expensive; the size, distance and level-of-detail limits still apply.
+- Enhanced+ (experimental): the player's own windows seen from the cab now mirror the cabin - its walls, seats and, at night, the saloon's lamps - as strongly as the cabin is brighter than the street outside (nothing by day, clearly at night), where they showed a flat 15 % of the sky's reflection at any hour. The ray meets the cabin lit as the cabin is, not by the sun and sky outside. `OMSI_CAB_REFLECTION=0` switches it off.
+
+* **Mirror editor** in the developer tools window (tab *Mirror editor*): every
+  `[add_camera_reflexion]` of the vehicle and its coupled parts with sliders and fields for
+  position, dist, field of view, yaw, pitch and extra, set live in the game (never saved); *Copy*
+  puts the finished `[add_camera_reflexion_2]` block on the clipboard to paste into the `.bus`.
+* **View editor**: Esc → Camera... → *Edit the driver's view and mirror angles* opens a
+  translucent panel on the right with sliders for the driver's eye, view, field of view and for each mirror's
+  angles, kept for that vehicle alone (`driverview.cfg`, `mirrors.cfg`).
+* **Developer tools window**: Ctrl+Shift+Backspace in the game opens an extra window
+  beside it, whatever the setting says (a process of its own; closing it only closes the window, and
+  it closes by itself when the game ends); Settings → General → *Open Developer Tools with every session*
+  starts it automatically. *Reload passenger cabin* and *Reload paths* read the player's
+  `[passengercabin]` or `paths.cfg` again while playing; further buttons read `sound.cfg`,
+  the `.bus` file(s) (cameras, mirrors, bounding boxes, physics), `model.cfg` (lights, animations,
+  object properties) and the constfiles (constants and curves) again, each one all or nothing. Overlays also show mirrors (position and the way they are turned),
+  the center of gravity, driver and passenger views and tyre widths; an *Open log* button opens
+  the game's log. In
   it: switches that draw the seated places (orange dots), the standing places (red dots), the
   passengers' paths, the vehicle's bounding box, the axles and wheels and the interior lights (with
   their number and variable), the numbers and uses of the path points (entry, exit, links,

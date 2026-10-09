@@ -2037,7 +2037,10 @@ impl Humans {
                 let leg = Leg { lane: l, a: s, b: s };
                 p.state = State::Strolling(PedWalk::new(vec![leg], true, 0.0));
             }
-            _ => p.state = State::Standing,
+            _ => {
+                p.state = State::Standing;
+                p.t_state = 0.0;
+            }
         }
     }
 

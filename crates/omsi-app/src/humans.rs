@@ -251,8 +251,32 @@ struct DebugPoint {
     note: String,
 }
 
+/// What a section's files said when the cabin was made: its `[passengercabin]` and its paths.
+type CabinSource = (Option<PassengerCabin>, Option<omsi_vehicle::VehiclePaths>);
+
+/// What a cabin made again keeps from the one it replaces (see `Humans::reload_cabin`).
+#[derive(Clone, Copy)]
+enum Keep<'a> {
+    Nothing,
+    /// The paths as they were: only the `[passengercabin]` files are read again.
+    Paths(&'a [CabinSource]),
+    /// The `[passengercabin]` as it was: only the paths are read again.
+    Cabin(&'a [CabinSource]),
+}
+
+/// What the developer tools can have read again while the game runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CabinReload {
+    /// The `[passengercabin]` file: places, doors, validators, the cash desk.
+    Cabin,
+    /// The `paths.cfg`: the network the passengers walk on.
+    Paths,
+}
+
 /// What passengers need to know about one vehicle type's cabin.
 struct Cabin {
+    /// Each section's files as they were read (for `Keep`).
+    sources: Vec<CabinSource>,
     data: PassengerCabin,
     graph: PathGraph,
     links: Vec<(i32, i32, bool)>,
@@ -395,21 +419,37 @@ impl Cabin {
     /// The cabin of a train of vehicles (see [`train_parts`]): the front one's, with the
     /// sections behind joined on as far as they have a cabin and a path network.
     fn load_train(parts: &[TrainPart<'_>]) -> Option<Cabin> {
+        Self::load_train_with(parts, Keep::Nothing)
+    }
+
+    /// As [`Cabin::load_train`], keeping from an earlier cabin what `keep` says.
+    fn load_train_with(parts: &[TrainPart<'_>], keep: Keep<'_>) -> Option<Cabin> {
         let (lead, _, _) = parts.first()?;
-        let load_cabin = |def: &omsi_vehicle::Vehicle| -> Option<PassengerCabin> {
+        let mut sources: Vec<CabinSource> = Vec::new();
+        let load_cabin = |k: usize, def: &omsi_vehicle::Vehicle| -> Option<PassengerCabin> {
+            if let Keep::Cabin(old) = keep {
+                if let Some(Some(c)) = old.get(k).map(|s| &s.0) {
+                    return Some(c.clone());
+                }
+            }
             let rel = def.passenger_cabin.as_ref()?;
             PassengerCabin::load(&omsi_cfg::resolve_path(def.dir(), rel))
                 .map_err(|e| log::warn!("{e}"))
                 .ok()
         };
-        let load_paths = |def: &omsi_vehicle::Vehicle| {
+        let load_paths = |k: usize, def: &omsi_vehicle::Vehicle| {
+            if let Keep::Paths(old) = keep {
+                if let Some(Some(p)) = old.get(k).map(|s| &s.1) {
+                    return Some(p.clone());
+                }
+            }
             def.paths.as_ref().and_then(|rel| {
                 omsi_vehicle::VehiclePaths::load(&omsi_cfg::resolve_path(def.dir(), rel))
                     .map_err(|e| log::warn!("{e}"))
                     .ok()
             })
         };
-        let data = load_cabin(lead)?;
+        let data = load_cabin(0, lead)?;
         let mut points: Vec<Vec3> = Vec::new();
         let mut links: Vec<(i32, i32, bool)> = Vec::new();
         let mut link_pack: Vec<Option<usize>> = Vec::new();
@@ -436,10 +476,12 @@ impl Cabin {
             let cab = if k == 0 {
                 Some(data.clone())
             } else {
-                load_cabin(def)
+                load_cabin(k, def)
             };
             let Some(cab) = cab else { break };
-            let (own, own_links, own_steps, own_packs, own_rooms): (Vec<Vec3>, Vec<(i32, i32, bool)>, Vec<i32>, Vec<Vec<String>>, Vec<f32>) = match load_paths(def) {
+            let paths = load_paths(k, def);
+            sources.push((Some(cab.clone()), paths.clone()));
+            let (own, own_links, own_steps, own_packs, own_rooms): (Vec<Vec3>, Vec<(i32, i32, bool)>, Vec<i32>, Vec<Vec<String>>, Vec<f32>) = match paths {
                 Some(p) => (
                     p.points
                         .iter()
@@ -686,6 +728,7 @@ impl Cabin {
         let money_var = data.money_points.last().map(|m| (Vec3::from(m.pos), m.var));
         let change_point = data.change_points.last().map(|m| Vec3::from(m.pos));
         Some(Cabin {
+            sources,
             data,
             graph,
             links,
@@ -1372,6 +1415,9 @@ fn seg_cross(a: DVec2, b: DVec2, c: DVec2, d: DVec2) -> Option<DVec2> {
     let u = (c - a).perp_dot(r) / den;
     (t >= 0.0 && t <= 1.0 && u >= 0.0 && u <= 1.0).then(|| a + r * t)
 }
+
+/// How far (m) from where they stand somebody left standing looks for a pavement to walk on.
+const STANDING_REACH: f64 = 30.0;
 
 #[derive(Debug, Clone)]
 enum State {
@@ -3349,10 +3395,75 @@ impl Humans {
         }
     }
 
+    /// Developer tools: the player's passenger cabin is read from its files again - the
+    /// `[passengercabin]` or the paths - and put in the place of the one in use, without
+    /// loading the session again. (Done between two frames; the game does not need to stop.)
+    /// When the new cabin has as many places, doors, validators and path points as the old
+    /// one, the riders stay where they are and walk on the new paths. Otherwise their
+    /// numbers mean nothing in it, and everybody inside a bus (or on the way to one) is put
+    /// out on the ground. A cabin that cannot be read leaves the old one as it is.
+    pub(crate) fn reload_cabin(&mut self, what: CabinReload, vehicle: &mut VehicleInstance) -> String {
+        let parts = train_parts(vehicle);
+        let key: Vec<PathBuf> = parts.iter().map(|p| p.0.path.clone()).collect();
+        let old = self.cabins.get(&key).cloned().flatten();
+        let fresh = {
+            let keep = match (&old, what) {
+                (Some(o), CabinReload::Cabin) => Keep::Paths(&o.sources),
+                (Some(o), CabinReload::Paths) => Keep::Cabin(&o.sources),
+                (None, _) => Keep::Nothing,
+            };
+            Cabin::load_train_with(&parts, keep).map(Arc::new)
+        };
+        let name = match what {
+            CabinReload::Cabin => "passenger cabin",
+            CabinReload::Paths => "paths",
+        };
+        let Some(new) = fresh else {
+            return format!("Reloading the {name}: the vehicle has no cabin that could be read (the old one stays)");
+        };
+        let same = old.as_ref().is_some_and(|o| {
+            o.seats.len() == new.seats.len()
+                && o.entries.len() == new.entries.len()
+                && o.exits.len() == new.exits.len()
+                && o.graph.points.len() == new.graph.points.len()
+                && o.parts.len() == new.parts.len()
+                && o.stampers.len() == new.stampers.len()
+        });
+        self.cabins.insert(key, Some(new.clone()));
+        let summary = format!("{} places, {} entries, {} exits, {} path points", new.seats.len(), new.entries.len(), new.exits.len(), new.graph.points.len());
+        if same {
+            self.player_cabin = Some(new);
+            log::info!("developer tools: {name} read again: {summary}");
+            return format!("Reloaded the {name}: {summary}; the riders stay");
+        }
+        let mut buses: HashSet<BusId> = self.seats.keys().copied().collect();
+        for p in &self.people {
+            if let Place::Bus(b, _) = p.place {
+                buses.insert(b);
+            }
+            if let State::Pax(x) = &p.state {
+                buses.extend(x.bus);
+                buses.extend(x.inside);
+            }
+        }
+        let before = self.people.len();
+        for b in buses {
+            self.evict_bus(b);
+        }
+        let put_out = before - self.people.len();
+        self.set_cabin(vehicle);
+        log::info!("developer tools: {name} read again: {summary}; {put_out} people put out");
+        format!("Reloaded the {name}: {summary}; {put_out} people put out of the buses")
+    }
+
     /// Bus `bus` is gone (the player removed it): whoever was in it stands where they were,
     /// on the ground, and walks off.
     pub fn evict(&mut self, bus: BusId, world: &World) {
         let _ = world;
+        self.evict_bus(bus);
+    }
+
+    fn evict_bus(&mut self, bus: BusId) {
         for i in (0..self.people.len()).rev() {
             let p = &self.people[i];
             let theirs = matches!(p.place, Place::Bus(b, _) if b == bus) || matches!(&p.state, State::Pax(x) if x.bus == Some(bus) || x.inside == Some(bus));
@@ -4246,6 +4357,20 @@ impl Humans {
                 w
             }
             State::Standing => {
+                // somebody who got off with no pavement known beside the stop (or off a stop)
+                // looks for one about once a second - those at a stop whose pavement was not
+                // found, or not loaded yet, stood there for good - and walks on along it
+                let t = self.people[i].t_state;
+                if let (Some(net), true) = (net, t % 1.0 < dt || t == 0.0) {
+                    let at = self.people[i].position;
+                    let found = self.ped.as_ref().and_then(|pn| pn.nearest(net, at, STANDING_REACH));
+                    if let Some((lane, s, _)) = found {
+                        let leg = Leg { lane, a: s, b: s };
+                        self.people[i].state = State::Strolling(PedWalk::new(vec![leg], true, 0.0));
+                        self.people[i].t_state = 0.0;
+                        return Want::stand(None, Activity::Stand);
+                    }
+                }
                 if !self.seen(self.people[i].position) && self.far_from_players(self.people[i].position, STROLL_RADIUS) {
                     remove.push(i);
                 }

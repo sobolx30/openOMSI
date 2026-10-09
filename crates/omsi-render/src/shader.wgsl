@@ -493,8 +493,21 @@ fn sphere_map_uv(world: vec3<f32>, n: vec3<f32>, eye: vec3<f32>) -> vec2<f32> {
     let up = select(camera.cam_up.xyz, vec3<f32>(0.0, 0.0, 1.0), vr_env);
     let rc = vec3<f32>(dot(r, right), dot(r, up), dot(r, cross(up, right)));
     let m = 2.0 * length(rc - vec3<f32>(0.0, 0.0, 1.0));
-    return rc.xy / max(m, 1e-6) + 0.5;
+    // [ROLLBACK envscroll-40 begin] Omsi.exe lays a texture matrix over the sphere map (0x7ffc98..0x7ffd53,
+    // set with D3DTTFF_COUNT2, whose third row is a translation): the map slides with the camera's
+    // turn - u by -yaw / pi, v by -pitch / (2 pi) - of the direction it looks along (the camera
+    // update at 0x7edf28..0x7ee076: atan2(x, z) and the elevation of `at - eye`, in Direct3D's
+    // frame, where the world's y and z are swapped). Without it (a D3D9 wrapper drops the matrix on a
+    // generated coordinate) a sphere map is one flat picture whatever way the camera turns.
+    // Before devtools-40 the return was `rc.xy / max(m, 1e-6) + 0.5` alone. ENV_SCROLL 0 gives that back.
+    let fwd = cross(up, right);
+    let yaw = atan2(fwd.x, fwd.y);
+    let pitch = atan2(fwd.z, length(fwd.xy));
+    let scroll = vec2<f32>(-yaw / 3.14159265, -pitch / 6.2831853) * ENV_SCROLL;
+    return rc.xy / max(m, 1e-6) + 0.5 + scroll;
+    // [ROLLBACK envscroll-40 end]
 }
+const ENV_SCROLL: f32 = 1.0;
 
 // Direct3D's specular term at a vertex (Omsi.exe switches it on in FormActivate, 0x8254e0):
 // Omsi.exe's sun (light 0, 0x7089f0: directional, specular = light A) and the light from

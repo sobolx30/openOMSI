@@ -208,7 +208,7 @@ budget.
    Also: Wheel_Rotation / Axle_Steering in radians and with OMSI's sign, keyboard steering
    that returns only while rolling, the arrow keys driving so that OMSI's own W/S/D keep
    the wipers, the viewpoint and the gearbox; the cockpit switch under the cursor wins the
-   click, and the mouse wheel turns it. **(done)**
+   click (the mouse wheel does not act on it). **(done)**
    Next: bus stop shelters with waiting people inside, wear over a duty (bulb lifetimes,
    battery age), and the depot chooser that tells the workshop whether the bus is standing
    in a depot. **(current)**

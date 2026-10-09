@@ -184,8 +184,29 @@ fn spray_look() -> ([f32; 3], f32) {
 /// Whether a set of particle systems sprays from the tyres itself: a `[smoke]` that the
 /// stock vehicles' `tire_wet_freq` / `tire_wet_live` variables drive.
 pub fn has_own_tyre_spray(set: &omsi_sim::particles::ParticleSet) -> bool {
+    set.emitters.iter().any(|e| is_tyre_spray(&e.def))
+}
+
+/// Whether one particle system is a tyre spray (driven by `tire_wet_*`).
+pub fn is_tyre_spray(def: &omsi_model::ParticleSystemDef) -> bool {
     let wet = |v: &omsi_model::PsValue| matches!(v, omsi_model::PsValue::Var(n) if n.to_ascii_lowercase().starts_with("tire_wet"));
-    set.emitters.iter().any(|e| wet(&e.def.freq.0) || wet(&e.def.life.0))
+    wet(&def.freq.0) || wet(&def.life.0)
+}
+
+/// The bodies of `vehicles` (and their trailers) that hold the camera, for [`cab_fade`].
+pub fn cab_bodies(vehicles: &[&omsi_sim::VehicleInstance], eye: DVec3) -> Vec<Body> {
+    vehicles
+        .iter()
+        .flat_map(|v| crate::rain::vehicle_boxes(v))
+        .map(|(origin, heading, bb)| Body { origin, heading, bb })
+        .filter(|b| b.contains(eye, 0.4))
+        .collect()
+}
+
+/// How much of a puff of `size` at `pos` shows to a camera in one of `cab`: none in or
+/// against the body, all of it clear of it.
+pub fn cab_fade(cab: &[Body], pos: DVec3, size: f32) -> f32 {
+    cab.iter().map(|b| smoothstep(size, 1.4 * size + 0.5, b.outside(pos))).fold(1.0, f32::min)
 }
 
 /// How much more water a vehicle of this mass throws than a car: 1 up to 1.3 t, twice as
@@ -589,7 +610,7 @@ impl Spray {
     /// above the wheels; and a puff the camera is about to pass through fades away rather
     /// than filling the picture.
     pub fn sprites(&self, eye: DVec3, out: &mut Vec<SmokeParticle>) {
-        let cab: Vec<&Body> = self.bodies.iter().filter(|b| b.contains(eye, 0.0)).collect();
+        let cab: Vec<&Body> = self.bodies.iter().filter(|b| b.contains(eye, 0.4)).collect();
         let near: Vec<&Body> = self.bodies.iter().filter(|b| (b.origin - eye).length() < SPAWN_RANGE + 40.0).collect();
         let (color, strength) = spray_look();
         out.reserve(self.puffs.len());
@@ -606,7 +627,7 @@ impl Spray {
                 if cab.iter().any(|c| std::ptr::eq(*c, *b)) {
                     // a billboard faces the eye: one that reaches into the box from beside
                     // it is drawn in the cabin, so it has to be clear of it by its size
-                    alpha *= smoothstep(0.6 * size, size + 0.2, outside);
+                    alpha *= smoothstep(size, 1.4 * size + 0.5, outside);
                 } else if outside < UNDER_BODY_BLEND {
                     // under the body: kept below the floor, half seen - and so, fading out,
                     // over the 30 cm round it, not in a step where it comes out
@@ -857,7 +878,7 @@ mod tests {
         // the same spray from outside: what trails behind the bus is seen
         let mut street = Vec::new();
         s.sprites(DVec3::new(6.0, -20.0, 34.5), &mut street);
-        assert!(street.len() > cab.len() && !cab.is_empty(), "{} puffs from the street, {} from the cab", street.len(), cab.len());
+        assert!(street.len() > cab.len() && !street.is_empty(), "{} puffs from the street, {} from the cab", street.len(), cab.len());
     }
 
     #[test]

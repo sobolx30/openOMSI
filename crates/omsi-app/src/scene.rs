@@ -10491,9 +10491,15 @@ pub(crate) fn material_alpha(
     // (an index of -1 selects the first one, as 0 does).
     let mine: Vec<&MaterialDef> = overrides.iter().filter(|o| !o.item && omsi_sim::vehicle::override_slot(materials, o) == Some(slot)).collect();
     let plain = || mine.iter().filter(|o| o.change.is_none());
-    plain()
+    // [ROLLBACK matlchange-42] Omsi.exe (the parser at 0x5f4763): `[matl_change]` selects the slot's base material
+    // as `[matl]` does, and the commands after it - up to the first `[matl_item]` - change that base material.
+    // So a `[matl_alpha]` there counts as the slot's own, when it was written (`alpha_set`; a change that
+    // says nothing, as in the churaPixel case above, is still no alpha). Before: the alpha was looked for
+    // in `plain()` alone, i.e. `plain().rev().find(|o| o.alpha_set).or_else(|| plain().next())` and so on.
+    mine.iter()
         .rev()
         .find(|o| o.alpha_set)
+        .or_else(|| plain().rev().find(|o| o.alpha_set))
         .or_else(|| plain().next())
         .or(mine.first())
         .map(|o| alpha_mode(o.alpha))
@@ -13912,6 +13918,24 @@ mod material_tests {
     /// A second `[matl]` of the same slot with `[matl_alpha] 1` makes the slot
     /// alpha-tested; a later `[matl_alpha] 0` makes it opaque again,
     /// and a later `[matl]` without one keeps the mode.
+    /// `[matl_change]` selects the base material as `[matl]` does (Omsi.exe): a `[matl_alpha]` after it,
+    /// with no `[matl_item]` in between, is the slot's own (an LED matrix with its `\\S:n` mask).
+    #[test]
+    fn matl_alpha_after_a_matl_change_is_the_slots() {
+        let mats = [omsi_o3d::Material { texture: "LED_1.tga".into(), ..Default::default() }];
+        let plain = MaterialDef { texture: "led_1.tga".into(), ..Default::default() };
+        let change = |alpha: Option<i32>| MaterialDef {
+            texture: "led_1.tga".into(),
+            change: Some(("led_1.tga".into(), 0, "Var".into())),
+            alpha: alpha.unwrap_or(0),
+            alpha_set: alpha.is_some(),
+            ..Default::default()
+        };
+        assert_eq!(material_alpha(&mats, 0, &[plain.clone(), change(Some(2))]), AlphaMode::Blend);
+        assert_eq!(material_alpha(&mats, 0, &[plain.clone(), change(None)]), AlphaMode::Opaque);
+        assert_eq!(material_alpha(&mats, 0, &[change(None), MaterialDef { alpha: 2, alpha_set: true, ..plain }]), AlphaMode::Blend);
+    }
+
     #[test]
     fn later_matl_of_the_same_slot_sets_its_alpha() {
         let mats = [omsi_o3d::Material { texture: "Chain.dds".into(), ..Default::default() }];

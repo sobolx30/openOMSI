@@ -596,9 +596,10 @@ pub fn collect(
     // (the callers list the player's vehicle first, when there is one)
     for (i, v) in vehicles.iter().enumerate() {
         vehicle_lights(v, &mut scene.coronas, &mut scene.lights, night, i == 0);
-        particle_sprites(&v.particles, &mut scene.smoke, &mut scene.coronas);
+        let cab = crate::puddles::cab_bodies(&[*v], camera_pos);
+        particle_sprites_in(&v.particles, &mut scene.smoke, &mut scene.coronas, &cab);
         for t in &v.trailers {
-            particle_sprites(&t.particles, &mut scene.smoke, &mut scene.coronas);
+            particle_sprites_in(&t.particles, &mut scene.smoke, &mut scene.coronas, &cab);
         }
     }
     // the lamps' cones in fog: drawn only while the visibility is
@@ -677,8 +678,17 @@ const SMOKE_Z_OFFSET: f32 = 0.1;
 /// The particles of a particle set as the renderer draws them: smoke blended over the scene,
 /// and the glowing ones (`--PS_emissive--`: sparks, rockets, a flame) as coronas.
 pub fn particle_sprites(set: &omsi_sim::particles::ParticleSet, smoke: &mut Vec<omsi_render::SmokeParticle>, coronas: &mut Vec<Corona>) {
+    particle_sprites_in(set, smoke, coronas, &[]);
+}
+
+/// [`particle_sprites`] for a vehicle's set: its own tyre spray is not drawn in the body
+/// `cab` that the camera sits in (spray shows behind and beside the cab, never in it).
+pub fn particle_sprites_in(set: &omsi_sim::particles::ParticleSet, smoke: &mut Vec<omsi_render::SmokeParticle>, coronas: &mut Vec<Corona>, cab: &[crate::puddles::Body]) {
     for (p, def) in set.particles() {
-        let alpha = p.alpha();
+        let mut alpha = p.alpha();
+        if !cab.is_empty() && !def.emissive && crate::puddles::is_tyre_spray(def) {
+            alpha *= crate::puddles::cab_fade(cab, p.pos, p.size() * 0.5);
+        }
         if alpha <= 0.002 {
             continue;
         }

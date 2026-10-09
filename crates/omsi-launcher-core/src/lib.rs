@@ -1797,6 +1797,15 @@ fn mirror_refresh(x: &str) -> &'static str {
     }
 }
 
+/// `off`, `player` or `full`, from the ways a file may spell the ray-traced reflections.
+pub fn rt_reflections_mode(v: &str) -> &'static str {
+    match v.trim().to_ascii_lowercase().as_str() {
+        "player" | "vehicle" | "1" => "player",
+        "full" | "all" | "2" | "on" | "true" => "full",
+        _ => "off",
+    }
+}
+
 /// The page's view of a `settings.cfg` text (None: no file yet, the game's defaults).
 pub fn settings_from_text(text: Option<&str>) -> Value {
     let mut v = json!({ "msaa": 4, "anisotropy": 8, "ssao": true, "shadows": true, "shadow_size": 2048, "navigator": true, "ui_opacity": 0.85, "navigator_corner": "bottom-left", "boarding": "auto", "detail_textures": true, "exact_fare": true, "enhanced": false, "graphics": "vanilla_plus", "fullscreen": false, "vsync": true, "volume": 0.6, "drive_keys": "simple", "render_scale": "auto", "view_distance": "auto", "language": "ENG", "texture_memory": 0, "texture_compression": true, "chat": true, "tooltips": true, "name_tags": true, "show_fps": false, "clouds": true, "pax_density": 1.0, "vol_ai": 1.0, "vol_scenery": 1.0, "mirror_size": 256, "doppler": true, "driver": true, "max_fps": 0, "min_obj_size": 0.013, "max_obj_dist": "auto" });
@@ -1832,7 +1841,7 @@ pub fn settings_from_text(text: Option<&str>) -> Value {
         v[k] = d;
     }
     // openOMSI's own: what passengers say, OMSI's route arrows, getting up from the seat
-    for (k, d) in [("pax_voices", json!("all")), ("nav_arrows", json!(false)), ("nav_ai", json!(true)), ("get_up", json!(false)), ("time_speed", json!("1")), ("time_sync", json!(false)), ("metar_sync", json!(false)), ("metar_station", json!("")), ("machine_translation", json!(false)), ("shadow_casters", json!("all")), ("shadow_blobs", json!(true)), ("reflections", json!(true)), ("mouse_sens", json!(1.0)), ("graphics_api", json!("auto")), ("ctrl_off", json!("")), ("steering_linear", json!(false)), ("old_steering", json!(false)), ("red_steer_spd", json!(false)), ("ff_invert", json!(false)), ("ff_enabled", json!(true)), ("brake_hold", json!(true)), ("auto_clutch", json!(true)), ("momentary_gears", json!(false)), ("wheel_range", json!(900.0)), ("wheel_lock", json!(0.0)), ("fov", json!(0.0)), ("camera_collision", json!(true)), ("right_stick_look", json!(true)), ("steer_look", json!(false)), ("pedal_throttle", json!(1.0)), ("pedal_brake", json!(1.0)), ("seat_x", json!(0.0)), ("seat_y", json!(0.0)), ("seat_z", json!(0.0)), ("seat_pitch_deg", json!(0.0)), ("head_tracking", json!(false)), ("led_glow", json!(6)), ("radio_fx_speaker", json!(0.0)), ("radio_fx_noise", json!(0.0)), ("radio_fx_dropouts", json!(0.0)), ("developer_tools", json!(false)), ("led_mips", json!(1.3)), ("ui_scale", json!(1.0)), ("ui_scale_window", json!(true)), ("chat_size", json!(1.0)), ("notes", json!(true)), ("mouse_steering", json!(false)), ("mouse_right_off", json!(false)), ("mouse_smooth", json!(true)), ("blinker_cancel", json!(true)), ("ff_road_vib", json!(1.0)), ("ff_engine_vib", json!(1.0)), ("ff_fade", json!(0.28))] {
+    for (k, d) in [("pax_voices", json!("all")), ("nav_arrows", json!(false)), ("nav_ai", json!(true)), ("get_up", json!(false)), ("time_speed", json!("1")), ("time_sync", json!(false)), ("metar_sync", json!(false)), ("metar_station", json!("")), ("machine_translation", json!(false)), ("shadow_casters", json!("all")), ("shadow_blobs", json!(true)), ("reflections", json!(true)), ("rt_reflections", json!("off")), ("rt_shadows", json!(false)), ("mouse_sens", json!(1.0)), ("graphics_api", json!("auto")), ("ctrl_off", json!("")), ("steering_linear", json!(false)), ("old_steering", json!(false)), ("red_steer_spd", json!(false)), ("ff_invert", json!(false)), ("ff_enabled", json!(true)), ("brake_hold", json!(true)), ("auto_clutch", json!(true)), ("momentary_gears", json!(false)), ("wheel_range", json!(900.0)), ("wheel_lock", json!(0.0)), ("fov", json!(0.0)), ("camera_collision", json!(true)), ("right_stick_look", json!(true)), ("steer_look", json!(false)), ("pedal_throttle", json!(1.0)), ("pedal_brake", json!(1.0)), ("seat_x", json!(0.0)), ("seat_y", json!(0.0)), ("seat_z", json!(0.0)), ("seat_pitch_deg", json!(0.0)), ("head_tracking", json!(false)), ("led_glow", json!(6)), ("radio_fx_speaker", json!(0.0)), ("radio_fx_noise", json!(0.0)), ("radio_fx_dropouts", json!(0.0)), ("developer_tools", json!(false)), ("led_mips", json!(1.3)), ("ui_scale", json!(1.0)), ("ui_scale_window", json!(true)), ("chat_size", json!(1.0)), ("notes", json!(true)), ("mouse_steering", json!(false)), ("mouse_right_off", json!(false)), ("mouse_smooth", json!(true)), ("blinker_cancel", json!(true)), ("ff_road_vib", json!(1.0)), ("ff_engine_vib", json!(1.0)), ("ff_fade", json!(0.28))] {
         v[k] = d;
     }
     v["steer_look_angle"] = json!(30.0);
@@ -1846,6 +1855,7 @@ pub fn settings_from_text(text: Option<&str>) -> Value {
     let Some(t) = text else { return v };
     let mut version = 0;
     let mut graphics: Option<&str> = None;
+    let mut rt_seen = (false, false);
     for line in t.lines() {
         let line = line.trim();
         if line.starts_with('#') || line.starts_with(';') {
@@ -1880,6 +1890,14 @@ pub fn settings_from_text(text: Option<&str>) -> Value {
             "ai_max_humans" => v[&k] = json!(val.parse::<f64>().map(|x| x.max(1.0) as i64).unwrap_or(200)),
             "drive_keys" | "navigator_corner" | "boarding" | "render_scale" | "pax_voices" => v[&k] = json!(val),
             "ctrl_off" => v[&k] = json!(val),
+            "rt_reflections" => {
+                rt_seen.0 = true;
+                v[&k] = json!(rt_reflections_mode(val))
+            }
+            "rt_shadows" => {
+                rt_seen.1 = true;
+                v[&k] = json!(b(val))
+            }
             "metar_station" => v[&k] = json!(val.chars().filter(|c| c.is_ascii_alphabetic()).take(4).collect::<String>().to_ascii_uppercase()),
             "discord_app_id" => v[&k] = json!(val),
             "resolution" | "window_size" => v["resolution"] = json!(resolution_text(val)),
@@ -1936,7 +1954,19 @@ pub fn settings_from_text(text: Option<&str>) -> Value {
     // what is now Vanilla+
     let g = graphics.unwrap_or(if v["enhanced"] == json!(true) { "enhanced" } else { "vanilla_plus" });
     v["graphics"] = json!(g);
-    v["enhanced"] = json!(g == "enhanced" || g == "enhanced_plus");
+    // Enhanced+ was merged into Enhanced: an old `enhanced_plus` is Enhanced with everything
+    // traced (unless the file says what is traced)
+    let legacy_plus = g == "enhanced_plus";
+    if legacy_plus {
+        v["graphics"] = json!("enhanced");
+        if !rt_seen.0 {
+            v["rt_reflections"] = json!("full");
+        }
+        if !rt_seen.1 {
+            v["rt_shadows"] = json!(true);
+        }
+    }
+    v["enhanced"] = json!(g == "enhanced" || legacy_plus);
     // before version 2 the launcher wrote its old default `boarding=pay` for everybody
     // (passengers then waited at the cash desk for the driver): the game reads that as auto
     if version < 2 && v["boarding"] == "pay" {
@@ -2247,6 +2277,7 @@ pub fn settings_to_text(v: &Value, old: Option<&str>) -> String {
     text.push_str(&format!("triple_width_mm={}\ntriple_distance_mm={}\ntriple_bezel_mm={}\n", f("triple_width_mm", 600.0).clamp(200.0, 2000.0), f("triple_distance_mm", 650.0).clamp(200.0, 3000.0), f("triple_bezel_mm", 0.0).clamp(0.0, 100.0)));
     text.push_str(&format!("info_bar={}\n", b("info_bar", false)));
     text.push_str(&format!("developer_tools={}\n", b("developer_tools", false)));
+    text.push_str(&format!("rt_shadows={}\nrt_reflections={}\n", b("rt_shadows", false), rt_reflections_mode(v.get("rt_reflections").and_then(|x| x.as_str()).unwrap_or("off"))));
     text.push_str(&format!("triple_left_angle_deg={}\ntriple_right_angle_deg={}\ntriple_eye_height_mm={}\n", f("triple_left_angle_deg", 45.0).clamp(0.0, 90.0), f("triple_right_angle_deg", 45.0).clamp(0.0, 90.0), f("triple_eye_height_mm", 0.0).clamp(-500.0, 500.0)));
     let written: Vec<String> = text.lines().filter_map(|l| l.split_once('=')).map(|(k, _)| k.trim().to_ascii_lowercase()).collect();
     for line in old.unwrap_or("").lines() {

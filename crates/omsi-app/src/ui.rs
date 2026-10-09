@@ -490,6 +490,26 @@ fn mark_line(buf: &mut [u8], w: u32, h: u32, a: (f32, f32), b: (f32, f32), t: f3
 }
 
 /// Everything the interface draws in a frame.
+/// One row of the view editor (see `view_editor.rs`).
+pub enum EditorRow {
+    /// A line of title.
+    Header(String),
+    /// A slider: what it sets, its value as text, and where the knob stands (0..1).
+    Slider { id: u8, label: String, text: String, frac: f32 },
+    /// A choice stepped with two arrows.
+    Picker { id: u8, label: String, text: String },
+    /// Buttons side by side.
+    Buttons(Vec<(u8, String)>),
+}
+
+/// The editor of the driver's view and the mirrors' angles, a translucent panel on the right.
+pub struct EditorView {
+    pub title: String,
+    pub rows: Vec<EditorRow>,
+    /// In the middle of the screen (a question) instead of on its right.
+    pub centered: bool,
+}
+
 pub struct Frame<'a> {
     /// Physical pixels per logical one.
     pub scale: f32,
@@ -560,6 +580,8 @@ pub struct Frame<'a> {
     pub menu_kbd: bool,
     /// The drop-down open over a row of the settings window.
     pub dropdown: Option<DropdownView<'a>>,
+    /// The view editor, while it is open.
+    pub view_editor: Option<EditorView>,
 }
 
 pub struct Ui {
@@ -594,6 +616,10 @@ pub struct Ui {
     /// The text boxes and the buttons of the destination form, where they were drawn.
     pub menu_form_fields: Vec<[f32; 4]>,
     pub menu_form_buttons: Vec<[f32; 4]>,
+    /// Where the view editor's controls were drawn: (row id, part - 0 the slider's track or
+    /// the button, 1 the left arrow, 2 the right one, rect), and its panel.
+    pub edit_hits: Vec<(u8, u8, [f32; 4])>,
+    pub edit_panel: Option<[f32; 4]>,
     /// The colours and positions of the menu's parts that ease to their new state (a line's
     /// light, a switch's knob ...), by what they belong to.
     anim: std::collections::HashMap<u64, f32>,
@@ -705,11 +731,19 @@ impl Ui {
                 rect[2] += x;
             }
         }
+        for hit in self.edit_hits.iter_mut() {
+            hit.2[0] += x;
+            hit.2[2] += x;
+        }
+        if let Some(rect) = self.edit_panel.as_mut() {
+            rect[0] += x;
+            rect[2] += x;
+        }
         self.chat.rect[0] += x;
         self.chat.rect[2] += x;
     }
     pub fn new() -> Option<Ui> {
-        Some(Ui { origin_x: 0.0, text: TextCache::new()?, chat: ChatWidget::default(), menu_rects: Vec::new(), menu_arrows: Vec::new(), menu_scroll_thumb: None, menu_scroll_track: None, menu_ctl: Vec::new(), dd_rects: Vec::new(), dd_top: 0, dd_rows: 8, dd_scroll: None, menu_side: Vec::new(), menu_pane: Vec::new(), menu_pane_start: 0, menu_pane_go: None, menu_pane_box: None, menu_pane_scroll: None, menu_time: Vec::new(), menu_form_fields: Vec::new(), menu_form_buttons: Vec::new(), anim: Default::default(), anim_dt: 0.0, menu_overlay_range: 0..0, vr_cursor_overlay: None, vr_tooltip_overlay: None, menu_start: 0, menu_rows: 0, menu_row_h: 1.0, images: Default::default(), info_rect: None, marks_img: None, marks_buf: Vec::new() })
+        Some(Ui { origin_x: 0.0, text: TextCache::new()?, chat: ChatWidget::default(), menu_rects: Vec::new(), menu_arrows: Vec::new(), menu_scroll_thumb: None, menu_scroll_track: None, menu_ctl: Vec::new(), dd_rects: Vec::new(), dd_top: 0, dd_rows: 8, dd_scroll: None, menu_side: Vec::new(), menu_pane: Vec::new(), menu_pane_start: 0, menu_pane_go: None, menu_pane_box: None, menu_pane_scroll: None, menu_time: Vec::new(), menu_form_fields: Vec::new(), menu_form_buttons: Vec::new(), edit_hits: Vec::new(), edit_panel: None, anim: Default::default(), anim_dt: 0.0, menu_overlay_range: 0..0, vr_cursor_overlay: None, vr_tooltip_overlay: None, menu_start: 0, menu_rows: 0, menu_row_h: 1.0, images: Default::default(), info_rect: None, marks_img: None, marks_buf: Vec::new() })
     }
 
     /// Draw the frame's interface: its overlays go after the HUD's in `scene.overlays`.
@@ -1055,6 +1089,12 @@ impl Ui {
             let plate = self.text.plate(r, scene, 3);
             scene.overlays.push((plate, [x, top, x + w, y]));
             scene.overlays.extend(items);
+        }
+        // --- the view editor, on the right: the driver's view and the mirrors' angles
+        self.edit_hits.clear();
+        self.edit_panel = None;
+        if let Some(ev) = f.view_editor.as_ref() {
+            self.draw_view_editor(r, scene, f, ev, s, corner_top);
         }
         // --- the game menu and its lists, in the middle over a dimmed picture
         self.anim_dt = dt.clamp(0.0, 0.1);
@@ -1470,6 +1510,86 @@ fn strip_more(label: &str) -> (&str, bool) {
 }
 
 impl Ui {
+    /// The view editor: a translucent panel on the right with sliders, drawn so that the
+    /// picture stays in sight. Where its controls are goes to `edit_hits` for the mouse.
+    fn draw_view_editor(&mut self, r: &Renderer, scene: &mut Scene, f: &Frame, ev: &EditorView, s: f32, top: f32) {
+        let w = (320.0 * s).min(f.width * 0.45);
+        let pad = 14.0 * s;
+        let px = (14.0 * s) as u32;
+        let (head_h, slider_h, picker_h, button_h) = (28.0 * s, 44.0 * s, 34.0 * s, 38.0 * s);
+        let mut h = pad * 2.0 + 30.0 * s;
+        for row in &ev.rows {
+            h += match row {
+                EditorRow::Header(_) => head_h,
+                EditorRow::Slider { .. } => slider_h,
+                EditorRow::Picker { .. } => picker_h,
+                EditorRow::Buttons(_) => button_h,
+            };
+        }
+        let x = if ev.centered { (f.width - w) * 0.5 } else { (f.width - w - 16.0 * s).max(8.0 * s) };
+        let y = ((f.height - h) * 0.5).max(if ev.centered { 0.0 } else { top });
+        let plate = self.text.plate(r, scene, 3);
+        scene.overlays.push((plate, [x, y, x + w, y + h]));
+        self.edit_panel = Some([x, y, x + w, y + h]);
+        let tp = (17.0 * s) as u32;
+        self.put(r, scene, &ev.title, tp, [255, 200, 110, 0], x + pad, y + pad + 10.0 * s);
+        let mut cy = y + pad + 30.0 * s;
+        let (mx, my) = f.cursor;
+        let over = |rc: [f32; 4]| mx >= rc[0] && mx <= rc[2] && my >= rc[1] && my <= rc[3];
+        for row in &ev.rows {
+            match row {
+                EditorRow::Header(text) => {
+                    self.put(r, scene, text, px, SOFT, x + pad, cy + head_h * 0.62);
+                    cy += head_h;
+                }
+                EditorRow::Slider { id, label, text, frac } => {
+                    self.put(r, scene, label, px, WHITE, x + pad, cy + 10.0 * s);
+                    self.put_right(r, scene, text, px, AMBER, x + w - pad, cy + 10.0 * s);
+                    let (tx0, tx1, ty) = (x + pad, x + w - pad, cy + 30.0 * s);
+                    let track = [tx0, ty - 2.0 * s, tx1, ty + 2.0 * s];
+                    self.text.rounded(r, scene, track, 2.0 * s, SLIDER_TRACK);
+                    let fr = frac.clamp(0.0, 1.0);
+                    let kx = tx0 + (tx1 - tx0) * fr;
+                    self.text.rounded(r, scene, [tx0, ty - 2.0 * s, kx, ty + 2.0 * s], 2.0 * s, ACCENT);
+                    let kr = 7.0 * s;
+                    self.text.rounded(r, scene, [kx - kr, ty - kr, kx + kr, ty + kr], kr, KNOB);
+                    self.edit_hits.push((*id, 0, [tx0, ty - 12.0 * s, tx1, ty + 12.0 * s]));
+                    cy += slider_h;
+                }
+                EditorRow::Picker { id, label, text } => {
+                    self.put(r, scene, label, px, WHITE, x + pad, cy + picker_h * 0.5);
+                    let bw = 30.0 * s;
+                    let right = [x + w - pad - bw, cy + 2.0 * s, x + w - pad, cy + picker_h - 2.0 * s];
+                    let left = [right[0] - bw - 90.0 * s, right[1], right[0] - 90.0 * s, right[3]];
+                    for (part, rc, glyph) in [(1u8, left, "‹"), (2u8, right, "›")] {
+                        self.text.rounded(r, scene, rc, ROW_R * s, if over(rc) { SELECTED } else { LIT });
+                        let gw = self.text.width(glyph, px as f32 + 4.0);
+                        self.put(r, scene, glyph, px + 4, WHITE, (rc[0] + rc[2]) * 0.5 - gw * 0.5, (rc[1] + rc[3]) * 0.5);
+                        self.edit_hits.push((*id, part, rc));
+                    }
+                    let tw = self.text.width(text, px as f32);
+                    self.put(r, scene, text, px, AMBER, (left[2] + right[0]) * 0.5 - tw * 0.5, cy + picker_h * 0.5);
+                    cy += picker_h;
+                }
+                EditorRow::Buttons(list) => {
+                    let n = list.len().max(1) as f32;
+                    let gap = 6.0 * s;
+                    let bw = (w - pad * 2.0 - gap * (n - 1.0)) / n;
+                    for (k, (id, label)) in list.iter().enumerate() {
+                        let bx = x + pad + k as f32 * (bw + gap);
+                        let rc = [bx, cy + 3.0 * s, bx + bw, cy + button_h - 3.0 * s];
+                        self.text.rounded(r, scene, rc, ROW_R * s, if over(rc) { SELECTED } else { LIT });
+                        let label = clip_to(&self.text, label, px as f32, bw - 8.0 * s);
+                        let lw = self.text.width(&label, px as f32);
+                        self.put(r, scene, &label, px, WHITE, bx + (bw - lw) * 0.5, (rc[1] + rc[3]) * 0.5);
+                        self.edit_hits.push((*id, 0, rc));
+                    }
+                    cy += button_h;
+                }
+            }
+        }
+    }
+
     /// `text` at `x`, its middle on `cy`; returns its width.
     fn put(&mut self, r: &Renderer, scene: &mut Scene, text: &str, px: u32, color: [u8; 4], x: f32, cy: f32) -> f32 {
         let l = self.text.label(r, scene, text, px, color);

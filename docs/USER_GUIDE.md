@@ -107,8 +107,8 @@ speed and on a wet or snowy road, and the engine's is there even at a standstill
 one is. Settings → Driving turns each of them off or up to four times as strong, and sets how
 long a jolt or a scripted shake takes to ease away (off = it stops where it stands, as before).
 
-Left-click a cockpit switch to operate it, hold the button and move the mouse to turn a knob,
-or roll the mouse wheel over it (that is the `<event>_drag` OMSI fires); the name of the switch
+Left-click a cockpit switch to operate it, hold the button and move the mouse to turn a knob
+(the mouse wheel is not a click: over a switch it still zooms the view); the name of the switch
 under the cursor is shown in the HUD.
 Right-drag the mouse (or drag with the wheel pressed, OMSI's pan) to look around in any view
 (the head turns inside, the camera swings around the bus outside), I/J/K/L does the same from
@@ -123,8 +123,9 @@ The mouse wheel (and **=** / **-**) zooms: outside the camera comes closer,
 inside the bus the view narrows, as in OMSI; **Ctrl**+wheel outside narrows the view instead
 (a telephoto, the camera stays where it is). F1-F4 driver / passenger / outside / map (free) camera, F5-F8 the destination
 sign and roller blind keys as in OMSI, Ctrl+S quick save, F9 write the run into the personnel
-file, WASD+QE in the free camera (**Ctrl**+click on the ground there moves the bus to the
-nearest street), left click on cockpit elements, **V** the chat line in a
+file, WASD+QE in the free camera (a click on the ground there asks "Do you want to move the
+vehicle here?"; Yes, or Enter, puts the vehicle there - anywhere, not only on a street; No,
+Esc or a click elsewhere leaves it), left click on cockpit elements, **V** the chat line in a
 LAN session. Esc opens the game menu: drive the next placed vehicle, place any vehicle of
 the installation in front of the camera (or beside the bus), couple what stands close behind
 the bus and uncouple it again, save the situation or load the quicksave, the next weather, the clock an hour on or back, refuel and wash (only at a
@@ -346,8 +347,10 @@ night). The camera exposes like one: for daylight, part of the way towards the l
 moment, with a camera's middle-tone contrast; street lamps are bright points with a little
 glare in clear air and wide halos in mist and rain.
 
-`graphics=enhanced_plus` (Enhanced+ in the launcher, `--enhanced-plus`) is Enhanced with
-hardware ray tracing, where the graphics card traces rays (Apple M3/M4 and newer, RTX and
+Enhanced with `rt_shadows=1` (ray traced shadows and occlusion) and/or `rt_reflections=player|full`
+(ray traced reflections on the player's vehicle only, or on every surface; `off` keeps the
+reflection maps) uses hardware ray tracing (the old `graphics=enhanced_plus` and `--enhanced-plus`
+mean both, in full), where the graphics card traces rays (Apple M3/M4 and newer, RTX and
 RDNA 2 cards and newer through Vulkan and Direct3D 12; elsewhere it draws as Enhanced, and
 should a driver refuse the ray tracing it falls back to Enhanced as well). Every solid mesh within
 420 m of the camera goes into an acceleration structure each frame, and the window's
@@ -433,13 +436,21 @@ view into the steering direction, independently of the bus's head-motion simulat
 **Steering view angle** sets the full-lock rotation (0–60°, default 30°), and **Steering
 view response** sets the smoothing time (50–1000 ms, default 250 ms; larger values follow
 more slowly). Manual looking remains available. The automatic turn is suppressed while
-VR or an active head tracker controls the view. It is off by default.
+VR or an active head tracker controls the view. It is off by default. The view turns only in the
+vehicle's default driver view (straight ahead); the other cockpit views stay put.
 
-Under **Seat position**, **Head pitch** adjusts the driver's neutral view angle up or down
-(-45° to +45°). It applies to the driver's view with any display setup, not just triple
-screens, and is included when taking offscreen screenshots. Manual looking and head tracking
-remain relative to this setting; **Reset the seat position** resets it along with the seat
-offsets.
+**Edit the driver's view and mirror angles** (Esc → Camera...) opens a translucent panel on the
+right of the screen, so the picture stays in sight while you adjust: sliders move the driver's
+eye (forward and back, up and down, left and right, up to 1 m), turn or tilt the view and change
+its field of view (±40° from the vehicle's own), and
+the mirror picker with two sliders turns each mirror (across, up and down) - the same turn
+Ctrl+Alt+arrows makes. Everything is kept for the vehicle you are driving alone (the eye and the
+view in `driverview.cfg`, the mirrors in `mirrors.cfg`, per `.bus` file), so the next session in
+that vehicle starts with it and other vehicles are not touched. *Reset view* and *Reset mirror*
+take the settings back, *Done* or Esc closes the panel. They come on top of the seat position
+above. **Smooth viewpoint changes** glide the way Omsi.exe does: each frame the view covers
+a fixed part of what is left (about 63% in 200 ms, 95% in 0.6 s); the eased return of the view
+with Space (F1) does the same.
 
 In Settings → Camera, **Right stick turns the view** switches automatic gamepad
 camera movement on or off. It is on by default. Switch it off to keep using the
@@ -632,10 +643,11 @@ sets, also when the glass is not in the view.
 
 ## Developer tools
 
-Settings → General → **Enable Developer Tools** opens an extra window ("openOMSI Developer Tools")
-beside the game whenever a session starts. It is a process of its own: closing it only closes
-the window, and it closes by itself when the game ends. **Ctrl+Shift+Backspace** in the game
-opens it again (or replaces a window that is still open).
+**Ctrl+Shift+Backspace** in the game opens an extra window ("openOMSI Developer Tools") beside it
+(or replaces one that is still open) - whatever the setting says. Settings → General →
+**Open Developer Tools with every session** only decides whether it opens by itself whenever a
+session starts. It is a process of its own: closing it only closes the window, and it closes
+by itself when the game ends.
 
 * **Over the picture in the game** - a list of switches (click its heading to fold it up)  for what the game draws over the player's vehicle:
   the seated places (orange dots) and the standing places (red dots) - told apart by the seat
@@ -653,11 +665,44 @@ opens it again (or replaces a window that is still open).
   kinds) with their names; the `_2` ones with their variables and parent.
 * **Axles and wheels** (blue) - each axle of `[axle]` where the physics puts it: the wheel
   centres at half the maximum width, a ring of the wheel's diameter round each, a white dot where
-  it meets the ground, a line across and the axle's number (and "driven"). To check that the
-  physics entries sit where the model's wheels are.
+  it meets the ground, a line across and the axle's number (and "driven"). Each wheel also shows
+  its tyre width: a short bar from the inner edge (`min_width`) to the outer edge (`max_width`)
+  and the width in the label. To check that the physics entries sit where the model's wheels are.
+* **Center of gravity** - the point the physics uses (`[cog]`, with the height from `cog_height`).
+* **Mirrors** - each mirror of the `.bus` at its position, with a white bar for the way the
+  file turns it.
+* **Driver views / Passenger views** - the F1 driver cameras (white) and the passenger views
+  (lavender), each with a short line for the direction it looks.
 * **Interior lights** (yellow) - every `[interiorlight]` of the vehicle at its position, with
   its number (the index scripts and `[illumination_interior]` use) and the variable that
   switches it; bright while the variable is 0.5 or more, dim while it is off.
+* **Reload while playing** - **Reload passenger cabin** reads the vehicle's `[passengercabin]`
+  file again (places, doors, validators, cash desk) and **Reload paths** its `paths.cfg`, without
+  loading the session again; the game goes on and says how it went under the buttons. When the
+  new cabin has as many places, doors, validators and path points as before, the riders stay and
+  walk on the new paths; otherwise everybody inside a bus (or on the way to one) is put out on
+  the ground, as their numbers mean nothing in the new cabin. A file that cannot be read leaves
+  the old cabin as it was.
+  The second row reads more files again: **sound.cfg** (all sounds restart), **.bus file(s)**
+  (vehicle and coupled parts: cameras, mirror positions, bounding boxes, physics; speed, position
+  and wheel state are kept), **model.cfg** (lights, animations, object properties, particles) and
+  **constfiles** (only the constants and curves of the scripts; the script files themselves must
+  be unchanged). Each reload is all or nothing: it is first prepared on the side and only
+  applied if everything worked; on any error (or a change the running scene cannot follow, such
+  as another number of axles, mirrors or meshes, other script lists, other textures) the vehicle
+  stays exactly as it was and the reason is shown under the buttons - that needs a new session.
+* **Mirror editor** (second tab of the window) - the vehicle's mirror cameras
+  (`[add_camera_reflexion]`, `_2`, `_static`; the coupled parts' after the vehicle's) one at a
+  time: sliders and typed fields for x, y, z, dist, fov, yaw, pitch and extra change the mirror
+  in the game at once (they replace the file's values and your Ctrl+Alt+arrows turn of that
+  mirror while set; nothing is written anywhere). **Copy this mirror** / **Copy all** put the
+  block(s) on the clipboard as they go into the `.bus`; **Back to the file** / **All back**
+  undo the changes. A `*` after a mirror's number marks one that is set.
+* **Open log** (top right of the window) opens the game's log file (`game.log`, or
+  `game-n.log` when several games run) in the system's viewer.
+* **Text fields** (the search and the values) take the usual keys: Ctrl+A, Ctrl+C, Ctrl+V,
+  Ctrl+X (the selection, or the whole text when nothing is selected), Ctrl+Backspace and
+  Ctrl+Delete (a word), Ctrl+arrows (by word), Shift+arrows and Shift+Home/End (select).
 * **Variables of the vehicle** - the numeric variables and the strings of the player's
   vehicle: search a name, click it to watch it, see its value five times a second, type a new
   one and **Set** it once or **Hold** it (written again every frame, as long as the vehicle's

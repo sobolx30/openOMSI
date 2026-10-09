@@ -956,6 +956,10 @@ pub(crate) fn run_move(app: &mut App, kind: &ListKind, action: &str, mv: Move) -
                         app.menu_edit = Some(String::new());
                     }
                 }
+                "view_edit" if step && app.player.is_some() => {
+                    app.view_editor_open();
+                    return None;
+                }
                 "seat_reset" if step => {
                     app.settings.seat = [0.0; 3];
                     app.settings.seat_pitch_deg = 0.0;
@@ -1246,6 +1250,9 @@ fn steps_of(verb: &str) -> Option<Vec<f32>> {
         "look_sens" => (2..=40).map(|v| v as f32 * 0.05).collect(),
         "look_smoothing_ms" => (0..=20).map(|v| v as f32 * 10.0).collect(),
         "seat" => (-50..=50).map(|v| v as f32 / 100.0).collect(),
+        "dview_x" | "dview_y" | "dview_z" => (-200..=200).map(|v| v as f32 / 200.0).collect(),
+        "dview_yaw" => (-90..=90).map(|v| v as f32).collect(),
+        "dview_pitch" => (-60..=60).map(|v| v as f32).collect(),
         "seat_pitch" => (-45..=45).map(|v| v as f32).collect(),
         "hour" => (0..24).map(|v| v as f32).collect(),
         "minute" => (0..60).map(|v| v as f32).collect(),
@@ -1358,6 +1365,17 @@ fn option_now(app: &App, verb: &str, arg: &str) -> Option<f32> {
     if let Some(field) = verb.strip_prefix("vr_nav_") {
         return if app.vr_active() && app.player.is_some() { app.vr_nav_profile().value(field) } else { None };
     }
+    if let Some(k) = verb.strip_prefix("dview_") {
+        let adj = app.player.as_ref()?.view_adj;
+        return Some(match k {
+            "x" => adj[0],
+            "y" => adj[1],
+            "z" => adj[2],
+            "yaw" => adj[3],
+            "pitch" => adj[4],
+            _ => return None,
+        });
+    }
     let s = &app.settings;
     Some(match verb {
         "speed" => s.time_speed as f32,
@@ -1423,6 +1441,21 @@ fn option_set(app: &mut App, verb: &str, arg: &str, v: f32) -> Option<(&'static 
     if let Some(field) = verb.strip_prefix("vr_nav_") {
         app.vr_nav_set(field, v);
         return None; // Stored per bus, never in the desktop settings file.
+    }
+    if let Some(k) = verb.strip_prefix("dview_") {
+        // (this vehicle's driver view: kept per vehicle, never in the settings file)
+        let p = app.player.as_mut()?;
+        let at = match k {
+            "x" => 0,
+            "y" => 1,
+            "z" => 2,
+            "yaw" => 3,
+            "pitch" => 4,
+            _ => return None,
+        };
+        p.view_adj[at] = if at < 3 { (v * 200.0).round() / 200.0 } else { v.round() };
+        crate::settings::save_driver_view(&p.vehicle.ty.def.path, &p.view_adj);
+        return None;
     }
     match verb {
         "speed" => {
@@ -1665,6 +1698,7 @@ fn toggle_now(app: &App, id: &str) -> Option<bool> {
         "trip_summary" => s.trip_summary,
         "collision_pedestrians" => s.collision_pedestrians,
         "ssao" => s.ssao,
+        "rt_shadows" => s.rt_shadows,
         "detail_textures" => s.detail_textures,
         "reflections" => s.reflections,
         "clouds" => s.clouds,
@@ -1851,6 +1885,14 @@ fn toggle_set(app: &mut App, id: &str, on: bool) -> Option<(&'static str, String
         "collision_pedestrians" => {
             app.settings.collision_pedestrians = on;
             Some(("collision_pedestrians", bit))
+        }
+        "rt_shadows" => {
+            app.settings.rt_shadows = on;
+            if on {
+                app.settings.shadows = true;
+                app.settings.ssao = true;
+            }
+            Some(("rt_shadows", bit))
         }
         "ssao" => {
             app.settings.ssao = on;
@@ -2245,7 +2287,8 @@ fn same_value(a: &str, b: &str) -> bool {
 
 fn select_options(key: &str) -> Vec<(&'static str, &'static str)> {
     match key {
-        "graphics" => vec![("vanilla", "Vanilla (as OMSI 2)"), ("vanilla_plus", "Vanilla+"), ("enhanced", "Enhanced"), ("enhanced_plus", "Enhanced+")],
+        "graphics" => vec![("vanilla", "Vanilla (as OMSI 2)"), ("vanilla_plus", "Vanilla+"), ("enhanced", "Enhanced")],
+        "rt_reflections" => vec![("off", "Disabled"), ("player", "On player vehicle only"), ("full", "Full")],
         "msaa" => vec![("1", "Off"), ("2", "2x MSAA"), ("4", "4x MSAA"), ("8", "8x MSAA")],
         "render_scale" => vec![("auto", "Auto"), ("1", "100%"), ("0.85", "85%"), ("0.75", "75%"), ("0.67", "67%"), ("0.5", "50%")],
         "anisotropy" => vec![("1", "Off"), ("2", "2x"), ("4", "4x"), ("8", "8x"), ("16", "16x")],
@@ -2383,15 +2426,17 @@ fn options_pages(app: &App) -> Vec<Page> {
         pick("msaa", "Anti-aliasing", later),
         pick("render_scale", "Render scale", later),
         pick("anisotropy", "Anisotropic", later),
-        // (Enhanced+ traces its shadows, occlusion and reflections: always on there)
-        switch_row(app, "shadows", "Sun shadows", "Enables/Disabled shadows").filter(|_| !app.settings.ray_tracing()),
+        // (traced shadows bring the traced occlusion: always on then)
+        switch_row(app, "rt_shadows", "Ray traced shadows (and occlusion)", "Needs a GPU with ray queries").filter(|_| app.settings.enhanced),
+        pick("rt_reflections", "Ray traced reflections", later).filter(|_| app.settings.enhanced),
+        switch_row(app, "shadows", "Sun shadows", "Enables/Disabled shadows").filter(|_| !app.settings.rt_shadows),
         pick("shadow_size", "Shadow map", later),
-        switch_row(app, "ssao", "Ambient occlusion", later).filter(|_| !app.settings.ray_tracing()),
+        switch_row(app, "ssao", "Ambient occlusion", later).filter(|_| !app.settings.rt_shadows),
         pick("shadow_casters", "Shadows cast by", later),
         switch_row(app, "detail_textures", "Detail texturing up close", "The ground and large walls get fine grain when close"),
         slider_row(app, "led_glow", "LED glow", "How strongly the dots of LED destination displays glow", &|v| format!("{}/15", v as i64)),
         slider_row(app, "led_mips", "LED mask mipmaps", "Keep the mip chain of the LED masks (smoother from a distance).", &|v| format!("{v:.2}")),
-        switch_row(app, "reflections", "Reflection maps (paint, chrome, glass)", later).filter(|_| !app.settings.ray_tracing()),
+        switch_row(app, "reflections", "Reflection maps (paint, chrome, glass)", later).filter(|_| app.settings.rt_reflections == "off"),
         switch_row(app, "clouds", "Clouds", later),
     ]
         .into_iter()
@@ -2510,15 +2555,15 @@ fn options_pages(app: &App) -> Vec<Page> {
         switch_row(app, "alt_view", "Right mouse button turns the view", "Shift+right zooms; off: right zooms as in OMSI, the wheel button turns"),
         switch_row(app, "precision_zoom", "Precision mouse zoom", "The mouse zoom follows the FOV curve instead of OMSI's linear way"),
         slider_row(app, "fov", "Field of view", "Vertical field of view; in triple screen Default uses physical measurements, an override moves the virtual eye", &|v| if v < 20.0 { "Default".to_string() } else { format!("{v:.0}°") }),
-        slider_row(app, "seat 1", "Seat forward and back", "Adjust the driver's seat position forward or backward", &cm),
-        slider_row(app, "seat 2", "Seat height", "Adjust the driver's seat height", &cm),
-        slider_row(app, "seat 0", "Seat left and right", "Adjust the driver's seat position from side to side", &cm),
-        slider_row(app, "seat_pitch", "Head pitch", "Set the driver's neutral head tilt up or down, independent of the display setup", &|v| format!("{v:+.0}°")),
     ]
         .into_iter()
         .flatten()
         .collect();
-    camera.push(button("Reset the seat position", "Reset", "Put the seat back where the vehicle has it.", "seat_reset"));
+    // the driver's view and the mirrors' angles of this vehicle, set in a panel at the side
+    // of the picture (view_editor.rs)
+    if app.player.is_some() {
+        camera.push(button("Edit the driver's view and mirror angles", "Open", "Opens a panel on the right with sliders for this vehicle's driver view and its mirrors, so the picture stays in sight while you adjust. Kept for this vehicle only.", "view_edit"));
+    }
     if cfg!(windows) {
         camera.extend(
             vec![

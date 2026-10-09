@@ -581,6 +581,12 @@ impl AudioEngine {
         }
     }
 
+    /// Forget every clip read so far (the sets and voices that hold one keep theirs): the
+    /// next set made reads its files again, for a sound config edited while the game runs.
+    pub fn forget_clips(&self) {
+        self.clips.lock().clear();
+    }
+
     /// A clip from the cache, read now if it is not there.
     pub fn load_clip(&self, path: &Path) -> Option<Arc<Clip>> {
         if let Some(c) = self.clips.lock().get_mut(path) {

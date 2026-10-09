@@ -24,6 +24,18 @@ override REFL_DIV: i32 = 1;
 @group(0) @binding(10) var t_probe: texture_cube<f32>;
 @group(0) @binding(11) var<uniform> enh: Enhanced;
 @group(0) @binding(12) var t_hist: texture_2d<f32>;
+// The cabin probe (rt.rs `CabProbe`): six pictures of the player's vehicle from the camera inside
+// it, and each one's matrix from a point of the vehicle's frame (x right, y ahead, z up).
+struct CabProbe {
+    vp: array<mat4x4<f32>, 24>,
+    // each face's centre in its frame, w 1 once a face of the vehicle's frame has been drawn, 2 one of the
+    // world's (faces 18..24, the camera outside the vehicle; the anchor's frame)
+    centre: array<vec4<f32>, 24>,
+    // the world frame's anchor relative to the render origin
+    anchor: vec4<f32>,
+}
+@group(0) @binding(13) var t_cab: texture_2d_array<f32>;
+@group(0) @binding(14) var<uniform> cabp: CabProbe;
 
 fn sh_irradiance(n: vec3<f32>) -> vec3<f32> {
     let c = enh.sh;
@@ -82,7 +94,85 @@ fn on_screen(pt: vec3<f32>) -> vec3<f32> {
 
 // The light a reflected ray brings back from where it meets the scene: the picture's own
 // colour there, else the mesh's mean colour in the sun and the sky's light.
-fn hit_light(o: vec3<f32>, d: vec3<f32>, h: Hit, rough: f32) -> vec3<f32> {
+// Whether a point (render-origin relative) is inside the player's vehicle's box.
+fn in_player_vehicle(pt: vec3<f32>) -> bool {
+    if (p.vehicle_box.w < 0.5) {
+        return false;
+    }
+    let dv = pt - p.vehicle_now.xyz;
+    let sh = sin(p.vehicle_now.w);
+    let ch = cos(p.vehicle_now.w);
+    let x = dv.x * ch - dv.y * sh - p.vehicle_centre.x;
+    let y = dv.x * sh + dv.y * ch - p.vehicle_centre.y;
+    let z = dv.z - p.vehicle_centre.z;
+    return abs(x) < p.vehicle_box.x && abs(y) < p.vehicle_box.y && abs(z) < p.vehicle_box.z;
+}
+
+// What the cabin probes show at a point (render-origin relative): rgb its colour as the main pass
+// presents a picture drawn already lit (enhanced.wgsl `display_level`, undone of the tone curve and at
+// the exposure of self-lit things), w 1; w 0 where no face has it. Three probes (the eye, the middle of
+// the vehicle, its rear) of six faces each: of the faces that hold the point and whose centre can see it
+// (a ray from the centre to the point meets nothing first: a seat, a partition would stand in the picture
+// in its place) the nearest centre is taken - the finest picture of it.
+fn cab_probe_at(pt: vec3<f32>) -> vec4<f32> {
+    let dv = pt - p.vehicle_now.xyz;
+    let sh = sin(p.vehicle_now.w);
+    let ch = cos(p.vehicle_now.w);
+    let q = vec3<f32>(dv.x * ch - dv.y * sh, dv.x * sh + dv.y * ch, dv.z);
+    let qw = pt - cabp.anchor.xyz;
+    var best_d = 1e9;
+    var face = -1;
+    var uv = vec2<f32>(0.0);
+    for (var f = 0; f < 24; f++) {
+        let cc = cabp.centre[f];
+        if (cc.w < 0.5) {
+            continue;
+        }
+        let world = cc.w > 1.5;
+        let qq = select(q, qw, world);
+        let c = cabp.vp[f] * vec4<f32>(qq, 1.0);
+        if (c.w > 0.05 && max(abs(c.x), abs(c.y)) < c.w * 0.97) {
+            let dd = length(qq - cc.xyz);
+            // (what is near the eye in the vehicle; out in the world as far as a picture of this size holds up)
+            if (dd < best_d && dd < select(CAB_PROBE_REACH, CAB_PROBE_REACH_WORLD, world)) {
+                // (the centre in the render origin's frame, as the vehicle stands now)
+                let o = select(p.vehicle_now.xyz + vec3<f32>(cc.x * ch + cc.y * sh, -cc.x * sh + cc.y * ch, cc.z), cabp.anchor.xyz + cc.xyz, world);
+                var seen = true;
+                if (dd >= 0.1) {
+                    let occ = ray_hit(RT_FORCE_OPAQUE | RT_FIRST_HIT, MASK_SEEN, 0.0, dd - (0.06 + dd * 0.02), o, (pt - o) / max(length(pt - o), 1e-4));
+                    seen = occ.kind == RAY_QUERY_INTERSECTION_NONE;
+                }
+                if (seen) {
+                    best_d = dd;
+                    face = f;
+                    uv = vec2<f32>(c.x / c.w * 0.5 + 0.5, 0.5 - c.y / c.w * 0.5);
+                }
+            }
+        }
+    }
+    if (face < 0) {
+        return vec4<f32>(0.0);
+    }
+    let t = textureSampleLevel(t_cab, s_lin, uv, face, 0.0).rgb;
+    let peak = max(t.r, max(t.g, t.b));
+    let tk = t * min(1.0, 0.64 / max(peak, 1e-3));
+    let k = max(enh.debug.w, 1.0);
+    let x = 0.18 * pow(tk / 0.18 + vec3<f32>(1e-7), vec3<f32>(1.0 / k));
+    let lvl = x + 0.04 * smoothstep(vec3<f32>(0.0), vec3<f32>(0.08), x);
+    return vec4<f32>(lvl * enh.exposure.y, 1.0);
+}
+
+// The light in a cab relative to the average light outside (enhanced.wgsl's CAB_AMBIENT).
+const CAB_AMBIENT_RT: f32 = 1.15;
+// How far from the eye the cabin probe stands in for the hit's own shading (metres).
+const CAB_PROBE_REACH: f32 = 40.0;
+// ... and that of the probe at the camera outside the vehicle.
+const CAB_PROBE_REACH_WORLD: f32 = 120.0;
+
+// `cab`: 0, or 1 + the cabin lamps' light for a pane of the player's own vehicle that mirrors
+// the cabin (enhanced.wgsl, `cab_pane`): what it meets inside the vehicle is lit as the cabin
+// is - its even ambient and the lamps - not by the sun and the sky outside.
+fn hit_light(o: vec3<f32>, d: vec3<f32>, h: Hit, rough: f32, cab: f32) -> vec3<f32> {
     let pt = o + d * h.t;
     let sc = on_screen(pt);
     if (sc.x == 1.0) {
@@ -98,6 +188,26 @@ fn hit_light(o: vec3<f32>, d: vec3<f32>, h: Hit, rough: f32) -> vec3<f32> {
     }
     // (the face turned towards the ray: no normal is known at the hit)
     let nf = -d;
+    // the saloon lamps' light on this mesh (a lit bus seen in a pane by night), warm as they are
+    let lamp_tint = vec3<f32>(1.0, 0.96, 0.84) * bitcast<f32>(r.pad);
+    // (the probe's picture of what is near the eye while the camera is in the vehicle - any pane, not
+    // only the cabin-mirroring ones (`cab`) -, lit as the plain shading lights it,
+    // lamps and all: all of what is near the eye, not only what the vehicle's bounding box holds - the
+    // dash, the pillars and the rear part of a bendy bus lie outside it)
+    if (length(pt - p.eye.xyz) < CAB_PROBE_REACH_WORLD + 20.0) {
+        let seen = cab_probe_at(pt);
+        if (seen.w > 0.5) {
+            return finite(seen.rgb);
+        }
+    }
+    if (cab > 0.5 && in_player_vehicle(pt)) {
+        let lum3 = vec3<f32>(0.2126, 0.7152, 0.0722);
+        let avg_e = enh.fog_color.rgb * (PI / 0.9);
+        let e = mix(sh_irradiance(nf), vec3<f32>(dot(avg_e, lum3)) * CAB_AMBIENT_RT, 0.6);
+        // (0.75: the saloon's corners and the seats' shade, which the screen-space occlusion
+        // gives in the picture)
+        return finite(albedo / PI * e * enh.exposure.x * 0.75 + albedo * lamp_tint);
+    }
     var sun = vec3<f32>(0.0);
     if (p.sun.w > 0.0 && dot(nf, p.sun.xyz) > -0.2) {
         if (ray_hit(RT_FORCE_OPAQUE | RT_FIRST_HIT, MASK_SHADOW, 0.0, 1500.0, pt - d * 0.05, p.sun.xyz).kind == RAY_QUERY_INTERSECTION_NONE) {
@@ -105,7 +215,7 @@ fn hit_light(o: vec3<f32>, d: vec3<f32>, h: Hit, rough: f32) -> vec3<f32> {
         }
     }
     let sky = mix(sh_irradiance(vec3<f32>(0.0, 0.0, 1.0)), sh_irradiance(nf), 0.5) * 0.8;
-    var l = albedo / PI * (sun + sky) * enh.exposure.x;
+    var l = albedo / PI * (sun + sky) * enh.exposure.x + albedo * lamp_tint;
     // the air along the way: from the eye to the surface and on to the hit
     let dist = length(o - p.eye.xyz) + h.t;
     let ext = exp(-(enh.fog.x + enh.fog.w) * dist);
@@ -145,6 +255,7 @@ fn cs_reflect(@builtin(global_invocation_id) gid: vec3<u32>) {
     let n = normalize(g.xyz / w);
     let dist = aux.r / w;
     let rough = clamp(aux.g / w, 0.0, 1.0);
+    let cab = aux.b / w;
     let uv = (vec2<f32>(px) + vec2<f32>(0.5)) * p.size.zw;
     let view = normalize(world_pos(uv, 0.001) - p.eye.xyz);
     let pt = p.eye.xyz + view * dist;
@@ -168,6 +279,10 @@ fn cs_reflect(@builtin(global_invocation_id) gid: vec3<u32>) {
         d = normalize(d + n * (0.02 - below));
     }
     var l: vec3<f32>;
+    // (OMSI_DEBUG_RT=11 draws what each ray met: green nothing - the sky probe, red a hit off the
+    // screen, blue a hit on it, yellow a hit in the player's vehicle lit as its cabin)
+    var dbg = vec3<f32>(0.0, 0.6, 0.0);
+    var dbgp = vec3<f32>(0.0);
     if (dist > p.proj.z) {
         l = sky_probe(d, rough);
     } else {
@@ -189,7 +304,15 @@ fn cs_reflect(@builtin(global_invocation_id) gid: vec3<u32>) {
                 start = h.t + 0.01;
                 continue;
             }
-            l = hit_light(o, d, h, rough);
+            l = hit_light(o, d, h, rough, cab);
+            let at = o + d * h.t;
+            dbg = select(select(vec3<f32>(1.0, 0.0, 0.0), vec3<f32>(1.0, 1.0, 0.0), cab > 0.5 && in_player_vehicle(at)), vec3<f32>(0.0, 0.0, 1.0), on_screen(at).x == 1.0);
+            if (p.temporal.z >= 11.0 && length(at - p.eye.xyz) < CAB_PROBE_REACH_WORLD + 20.0 && on_screen(at).x != 1.0) {
+                // (magenta: the cabin probe had it; mode 12 shows the probe's own colour there, red where it had not)
+                let pr = cab_probe_at(at);
+                dbg = select(dbg, vec3<f32>(1.0, 0.0, 1.0), pr.w > 0.5);
+                dbgp = select(vec3<f32>(1.0, 0.0, 0.0) * enh.exposure.x, pr.rgb, pr.w > 0.5);
+            }
             if (cut) {
                 // (off the screen or hidden: as much of the sky through it as its texels leave)
                 let sc = on_screen(o + d * h.t).x;
@@ -207,6 +330,12 @@ fn cs_reflect(@builtin(global_invocation_id) gid: vec3<u32>) {
     l = l * min(1.0, cap / max(lum, 1e-5));
     if (p.temporal.z == 8.0) {
         l = vec3<f32>(f32(dist > p.proj.z), rough, 0.0);
+    }
+    if (p.temporal.z == 12.0) {
+        l = dbgp;
+    }
+    if (p.temporal.z == 11.0) {
+        l = dbg * enh.exposure.x;
     }
     textureStore(t_out, hp, vec4<f32>(l, dist));
 }
