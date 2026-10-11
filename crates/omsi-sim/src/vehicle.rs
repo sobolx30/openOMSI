@@ -1014,6 +1014,10 @@ pub struct VehicleInstance {
     /// the coupled parts and the scripts still run every frame.
     pub ai_visuals: bool,
     ai_visuals_missed: f32,
+    /// [ROLLBACK aiparked-73] An AI bus standing out a long layover: the engine is off
+    /// (`AI_Engine` 0), the lights are out and, in the dark, only the side lights burn.
+    pub ai_parked: bool,
+    ai_sidelit: bool,
     var_index: HashMap<String, omsi_script::VarId>,
     /// Where each mesh's material properties come from, resolved against `var_index`
     /// (rebuilt when the vehicle gains engine variables).
@@ -1287,6 +1291,8 @@ impl VehicleInstance {
             km_started: false,
             cabin_air: None,
             ai_visuals: true,
+            ai_parked: false,
+            ai_sidelit: false,
             ai_visuals_missed: 0.0,
             var_index,
             props_plan: PropsPlan::default(),
@@ -1308,6 +1314,19 @@ impl VehicleInstance {
             numeric += usize::from(self.set_var(name, *value));
             if name.eq_ignore_ascii_case("Dirt_Norm") {
                 self.dirt = value.clamp(0.0, 1.0);
+            }
+        }
+        // [ROLLBACK odometer-63] The odometer is not a plain variable: `update_engine_vars`
+        // writes it every frame from `km_base` (drawn at random for a bus without one) and the
+        // kilometres driven, so the saved `kmcounter_*` was overwritten at once and the
+        // counter started afresh with every load. The saved reading becomes the base.
+        let saved = |key: &str| vars.iter().find(|(n, _)| n.eq_ignore_ascii_case(key)).map(|(_, v)| *v as f64);
+        if let Some(km) = saved("kmcounter_km") {
+            let total = km + saved("kmcounter_m").unwrap_or(0.0) / 1000.0;
+            if total.is_finite() && total > 0.0 {
+                self.host.km_base = total;
+                self.driven_km = 0.0;
+                self.km_started = true;
             }
         }
         for (name, value) in strings {
@@ -2457,11 +2476,11 @@ impl VehicleInstance {
             ("AI_Blinker_L", matches!(ai.blinker, 1 | 3) as i32 as f32),
             ("AI_Blinker_R", matches!(ai.blinker, 2 | 3) as i32 as f32),
             ("AI_Brakelight", ai.brake as i32 as f32),
-            ("AI_Light", ai.lights as i32 as f32),
+            ("AI_Light", (ai.lights && !self.ai_parked) as i32 as f32),
             // (the engine's field +0x638: an AI bus lights its saloon when it drives with
             // its lights on - the LiAZ's `lights_AI` switches both saloon circuits on it)
-            ("AI_Interiorlight", ai.lights as i32 as f32),
-            ("AI_Engine", 1.0),
+            ("AI_Interiorlight", (ai.lights && !self.ai_parked) as i32 as f32),
+            ("AI_Engine", if self.ai_parked { 0.0 } else { 1.0 }),
             ("AI_Scheduled_AtStation", station),
             // Which side's doors: OMSI hands the stop's side to the script, and a vehicle
             // with doors on both sides opens only the platform's (the BRT stops in
@@ -2471,6 +2490,16 @@ impl VehicleInstance {
             ("TrafficPriorityWarningNeeded", ai.priority_warning as i32 as f32),
         ] {
             self.set_var(name, v);
+        }
+        // [ROLLBACK aiparked-73] the side lights of a bus parked in the dark: its own switch for
+        // them, pressed once on the way in and once on the way out
+        let side = self.ai_parked && ai.lights;
+        if side != self.ai_sidelit {
+            self.ai_sidelit = side;
+            if self.ty.program.triggers.contains_key("kw_standlicht_toggle") {
+                self.trigger("kw_standlicht_toggle");
+                self.trigger("kw_standlicht_toggle_off");
+            }
         }
         for &(id, v) in inputs.iter().chain(pinned) {
             self.put(Some(id), v);

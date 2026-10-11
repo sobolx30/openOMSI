@@ -31,6 +31,8 @@ pub struct PagesView {
     pub settings_tab: usize,
     pub pads: PadsView,
     pub tt: super::timetable::TimetableView,
+    /// [ROLLBACK ailist-73]
+    pub ai: super::ailist::AiView,
 }
 
 /// The game controllers tab: the devices `gamectrler.cfg` sets up, the ones connected now,
@@ -564,6 +566,7 @@ fn graphics_tab(ui: &mut Ui, s: &mut Value, dirty: &mut f32, cols: [Rect; 2]) ->
         }
         sel_setting(ui, s, dirty, "s-casters", c.row(), "Shadows cast by", "shadow_casters", &[("all", "Every solid mesh"), ("omsi", "[shadow] meshes, as OMSI")]);
         toggle_setting(ui, s, dirty, c.row(), "Detail texturing up close", "detail_textures");
+        // [ROLLBACK lampfill-47] the "Lamp fill light" switch (key `lamp_fill`) is no longer offered: always on
         // (an LED panel's dots are its own light: how bright they burn, and how much of the
         // mip chain the panel's picture and its mask are held at - 0 point-samples them,
         // the sharpest dots and the worst shimmer; higher holds them at the level the
@@ -995,6 +998,12 @@ fn gameplay_tab(ui: &mut Ui, s: &mut Value, dirty: &mut f32, cols: [Rect; 2]) ->
         s["pax_density"] = json!((pd * 100.0).round() / 100.0);
         *dirty = 0.3;
     }
+    // [ROLLBACK seatpick-69] passengers' wish to sit (0: the original's random place)
+    let mut ps = get(s, "pax_sit").as_f64().unwrap_or(1.0) as f32;
+    if ui.slider("s-pax-sit", c.row(), &mut ps, 0.0, 2.0, 0.05, "Passengers' wish to sit", &|v| if v < 0.025 { "Original".to_string() } else { format!("{v:.2}x") }) {
+        s["pax_sit"] = json!((ps * 20.0).round() / 20.0);
+        *dirty = 0.3;
+    }
     toggle_setting(ui, s, dirty, c.row(), "Ability to get up (Ctrl+Shift+G)", "get_up");
     c.section(ui, "Traffic");
     sel_setting(ui, s, dirty, "s-unsched", c.row(), "Random traffic", "ai_unsched_factor", &[("25", "25%"), ("50", "50%"), ("75", "75%"), ("100", "100%"), ("150", "150%"), ("200", "200%")]);
@@ -1078,6 +1087,7 @@ fn general_tab(ui: &mut Ui, s: &mut Value, dirty: &mut f32, out: &mut Outside, c
     }
     toggle_setting(ui, s, dirty, c.row(), "Name of the button under the mouse", "tooltips");
     toggle_setting(ui, s, dirty, c.row(), "Frame rate in the corner", "show_fps");
+    toggle_setting(ui, s, dirty, c.row(), "Imperial units (mph, miles, yards)", "imperial_units");
     toggle_setting(ui, s, dirty, c.row(), "Notes in the top-left corner", "notes");
     toggle_setting(ui, s, dirty, c.row(), "Chat in online games", "chat");
     // (the chat's own size on top of the interface's; Ctrl + the wheel over it in the game)
@@ -1090,6 +1100,8 @@ fn general_tab(ui: &mut Ui, s: &mut Value, dirty: &mut f32, out: &mut Outside, c
     c.section(ui, "Navigator");
     toggle_setting(ui, s, dirty, c.row(), "Navigator (Shift+N: map, schedule, off)", "navigator");
     toggle_setting(ui, s, dirty, c.row(), "Route arrows (as in OMSI 2)", "nav_arrows");
+    // [ROLLBACK helpers-50]
+    toggle_setting(ui, s, dirty, c.row(), "Generated route arrows (junctions and stops ahead)", "nav_arrows_auto");
     toggle_setting(ui, s, dirty, c.row(), "AI vehicles on the map", "nav_ai");
     // the corner: a little screen with four corners to click
     let r = Rect::new(c.inner.x, c.y, c.inner.w, 70.0);
@@ -1203,6 +1215,15 @@ fn known_action(a: &str) -> Option<String> {
         ("view_set_outside", "Outside view"),
         ("view_toggle_viewpoint", "Next view"),
         ("view_toggle_interior", "Cabin and outside, one key"),
+        ("view_toggle_gui", "Show / hide the interface (map, notes, ...)"),
+        ("walk_forward", "On foot: forward"),
+        ("walk_back", "On foot: back"),
+        ("walk_left", "On foot: left"),
+        ("walk_right", "On foot: right"),
+        ("walk_use", "On foot: sit down / use"),
+        ("walk_jump", "On foot: jump / stand up"),
+        ("walk_kneel", "On foot: kneel"),
+        ("walk_flashlight", "On foot: torch"),
         ("vr_recenter", "VR: Reset view"),
         ("vr_toggle_desktop_mirror", "VR: Monitor preview"),
         ("vr_toggle_mode", "VR: Switch VR / desktop"),
@@ -2694,8 +2715,8 @@ mod settings_tests {
             "s-maint", "set-collision_vehicles", "set-collision_objects", "set-collision_pedestrians", "set-use_real_date", "set-time_sync", "set-metar_sync", "s-timespeed",
         ];
         let general = vec![
-            "s-lang", "set-machine_translation", "set-discord_status", "set-voice_chat", "set-developer_tools", "s-uiscale", "set-ui_scale_window", "s-uiop", "set-tooltips", "set-show_fps", "set-notes", "set-chat", "s-chatsize", "set-name_tags",
-            "set-navigator", "set-nav_arrows", "set-nav_ai", "corner-top-left", "corner-top-right", "corner-bottom-left", "corner-bottom-right",
+            "s-lang", "set-machine_translation", "set-discord_status", "set-voice_chat", "set-developer_tools", "s-uiscale", "set-ui_scale_window", "s-uiop", "set-tooltips", "set-show_fps", "set-imperial_units", "set-notes", "set-chat", "s-chatsize", "set-name_tags",
+            "set-navigator", "set-nav_arrows", "set-nav_arrows_auto", "set-nav_ai", "corner-top-left", "corner-top-right", "corner-bottom-left", "corner-bottom-right",
             "s-upd-github", "s-reset",
         ];
         vec![graphics, driving, camera, sound, gameplay, general]

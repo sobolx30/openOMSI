@@ -50,13 +50,14 @@ pub enum Sheet {
 }
 
 /// The pages More opens.
-const MORE: [(Page, &str, &str, &str); 7] = [
+const MORE: [(Page, &str, &str, &str); 8] = [
     (Page::Profile, "Profile", "badge", "Your driver, level and records"),
     (Page::Settings, "Settings", "tune", "Graphics, sound, gameplay"),
     (Page::Controls, "Controls", "sports_esports", "Touch, wheels and gamepads"),
     (Page::Sessions, "Sessions", "terminal", "Games running and their logs"),
     (Page::Tutorials, "Tutorials", "help", "Learn to drive the buses"),
     (Page::Timetable, "Timetable", "schedule", "The map's lines and trips"),
+    (Page::AiList, "AI list", "garage", "The buses on the map"),
     (Page::Setup, "Setup", "folder_open", "The OMSI 2 folder and content"),
 ];
 
@@ -1190,6 +1191,7 @@ fn embedded(l: &mut Launcher, page: Page, body: Rect, back: bool) {
         Page::Mods => super::pages::mods(l, content),
         Page::Tutorials => super::pages::tutorials(l, content),
         Page::Timetable => super::timetable::draw(l, content),
+        Page::AiList => super::ailist::draw(l, content),
         Page::Setup => super::pages::setup(l, content),
     }
     l.ui.pop_clip();

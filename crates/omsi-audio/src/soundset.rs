@@ -37,11 +37,14 @@ struct RuntimeSound {
     last_gain: f32,
     /// The buffer's playback rate relative to the clip, as last taken by `SetFrequency`.
     last_pitch: f32,
+    /// [ROLLBACK doorlatch-52] A triggered entry's gain at the moment its trigger fired: it is
+    /// held for the whole playback (see `update_fired`).
+    latched: Option<f32>,
 }
 
 impl RuntimeSound {
     fn new(def: SoundEntry, clip: Option<Arc<Clip>>) -> RuntimeSound {
-        RuntimeSound { def, clip, voice: None, held: false, active_since: None, last_gain: 1.0, last_pitch: 1.0 }
+        RuntimeSound { def, clip, voice: None, held: false, active_since: None, last_gain: 1.0, last_pitch: 1.0, latched: None }
     }
 }
 
@@ -142,6 +145,9 @@ fn direct_sound_volume(v: f32, last: f32) -> (f32, bool) {
         (10f32.powf(hundredths / 2000.0), hundredths > -10000.0)
     }
 }
+
+/// [ROLLBACK doorlatch-52] false = a triggered sound's volume follows its curves while it plays.
+const LATCH_TRIGGERED: bool = true;
 
 /// DirectSound's frequency range (`DSBFREQUENCY_MIN`/`MAX`).
 const FREQ_MIN: f32 = 100.0;
@@ -285,9 +291,25 @@ impl SoundSet {
         part_to_world: &dyn Fn(usize) -> Option<Mat4>,
         triggers: &[String],
     ) {
+        self.update_parts_fired(engine, var, part_to_world, triggers, &|_, _| None);
+    }
+
+    /// [`SoundSet::update_parts`] with `at_fire(trigger, variable)`, as for
+    /// [`SoundSet::update_fired`]. [ROLLBACK doorpart-51] The parts' entries read their volume
+    /// curves at the frame's end, where the door script had already reversed `doorSpeed_<n>`:
+    /// a door's hit sound in the second section of an articulated bus (`[volcurve]
+    /// doorSpeed_7`) came out silent, though the same entry in the front section was heard.
+    pub fn update_parts_fired(
+        &mut self,
+        engine: &AudioEngine,
+        var: &dyn Fn(&str) -> Option<f32>,
+        part_to_world: &dyn Fn(usize) -> Option<Mat4>,
+        triggers: &[String],
+        at_fire: &dyn Fn(&str, &str) -> Option<f32>,
+    ) {
         for (i, p) in &mut self.parts {
             match part_to_world(*i) {
-                Some(xf) => p.update(engine, var, &xf, triggers),
+                Some(xf) => p.update_fired(engine, var, &xf, triggers, at_fire),
                 None => p.stop_all(engine),
             }
         }
@@ -406,6 +428,14 @@ impl SoundSet {
                 }
             }
         }
+        // [ROLLBACK doorpart-51] the coupled parts' entries too
+        for (_, part) in &self.parts {
+            for t in part.curve_triggers() {
+                if !out.contains(&t) {
+                    out.push(t);
+                }
+            }
+        }
         out
     }
 
@@ -506,11 +536,20 @@ impl SoundSet {
                     engine.stop(id);
                 }
                 s.voice = Some(engine.play(clip, params));
+                // [ROLLBACK doorlatch-52] a trigger that started audibly stays so: the curves
+                // read a variable the script has reversed a moment later (`doorSpeed_<n>`
+                // after a door's hit), which silenced the sound within a frame of its start
+                s.latched = (fired && triggered && LATCH_TRIGGERED).then_some(params.gain);
             } else if let Some(id) = s.voice {
                 if engine.is_playing(id) {
+                    let mut params = params;
+                    if let Some(g) = s.latched {
+                        params.gain = g;
+                    }
                     engine.set_params(id, params);
                 } else {
                     s.voice = None;
+                    s.latched = None;
                 }
             }
         }

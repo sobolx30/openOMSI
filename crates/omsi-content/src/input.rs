@@ -125,6 +125,18 @@ impl KeyboardCfg {
         // presses one twice and passes through a view they did not want). On the list unbound,
         // as the indicator toggles are: whoever wants it gives it a key, and nobody else loses
         // one to it.
+        // [ROLLBACK guitoggle-65] hides and shows the interface layer (map, notes, timetable,
+        // tags, ...): Ctrl+Shift+H (H = scan code 35) unless the player moved or cleared it
+        // [ROLLBACK walkkeys-65] the keys of the walker (on foot), rebindable like the rest;
+        // Shift (run) stays Shift
+        for (action, scan_code) in [("walk_forward", 17), ("walk_back", 31), ("walk_left", 30), ("walk_right", 32), ("walk_use", 34), ("walk_jump", 57), ("walk_kneel", 46), ("walk_flashlight", 33)] {
+            if !self.game.iter().any(|b| b.action.eq_ignore_ascii_case(action)) {
+                self.game.push(KeyBinding { action: action.into(), scan_code, modifier: 0 });
+            }
+        }
+        if !self.game.iter().any(|b| b.action.eq_ignore_ascii_case("view_toggle_gui")) {
+            self.game.push(KeyBinding { action: "view_toggle_gui".into(), scan_code: 35, modifier: KEY_SHIFT | KEY_CTRL });
+        }
         if !self.game.iter().any(|b| b.action.eq_ignore_ascii_case("view_toggle_interior")) {
             self.game.push(KeyBinding { action: "view_toggle_interior".into(), scan_code: 0, modifier: 0 });
         }

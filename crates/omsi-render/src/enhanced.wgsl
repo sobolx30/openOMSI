@@ -288,6 +288,13 @@ fn cookie_color(to_surface: vec3<f32>, f: vec3<f32>, up: vec3<f32>, layer: i32) 
 //NOCK     return vec3<f32>(1.0);
 }
 
+// [ROLLBACK lampfill-44 begin] (devtools-44: the fill of the lamps' light, Settings "Lamp fill light")
+// How far round the lamp's terminator its diffuse light wraps (0: none), and how much of the light a lamp
+// puts on the ground below a surface comes back to it from there (the albedo of a lit road).
+const LAMP_WRAP: f32 = 0.25;
+const LAMP_BOUNCE: f32 = 0.22;
+// [ROLLBACK lampfill-44 end]
+
 // The point and spot lights of the pixel's grid cell: diffuse and specular.
 // `thin`: foliage, lit from whichever side the lamp is on (see the sun below).
 fn lamp_light(p: vec3<f32>, n: vec3<f32>, v: vec3<f32>, sf: Surface, thin: bool) -> vec3<f32> {
@@ -305,6 +312,8 @@ fn lamp_light(p: vec3<f32>, n: vec3<f32>, v: vec3<f32>, sf: Surface, thin: bool)
     }
     let a = max(sf.rough * sf.rough, 0.02);
     let nv = max(dot(n, v), 1e-4);
+    // (Settings: "Lamp fill light", enh.led.w 1; 0 = off)
+    let lamp_wrap = LAMP_WRAP * enh.led.w;
     let base = (u32(y) * side + u32(x)) * CELL_CAP;
     for (var j = 0u; j < CELL_CAP; j = j + 1u) {
         let li = grid[base + j];
@@ -378,12 +387,20 @@ fn lamp_light(p: vec3<f32>, n: vec3<f32>, v: vec3<f32>, sf: Surface, thin: bool)
             sum = sum + irr * (0.45 + 0.25 * nl) * sf.albedo / PI;
             continue;
         }
-        if (nl <= 0.0) {
+        // [ROLLBACK lampfill-44] before: `if (nl <= 0.0) { continue; }` and `sum + irr * nl * (sf.albedo / PI + spec)`.
+        // Wrapped diffuse: a surface turned a little away from the lamp still gets some of its light (the
+        // road and the walls round it would send it there); the highlight stays with the lit side. With
+        // `wrap` 0 (Settings: lamp fill off) this is the plain Lambert term as before.
+        let nlw = max((nl + lamp_wrap) / (1.0 + lamp_wrap), 0.0);
+        if (nlw <= 0.0) {
             continue;
         }
-        let h = normalize(ld + v);
-        let spec = d_ggx(max(dot(n, h), 0.0), a) * v_smith(nv, nl, a) * f_schlick(sf.f0, dot(v, h));
-        sum = sum + irr * nl * (sf.albedo / PI + spec);
+        var spec = vec3<f32>(0.0);
+        if (nl > 0.0) {
+            let h = normalize(ld + v);
+            spec = d_ggx(max(dot(n, h), 0.0), a) * v_smith(nv, nl, a) * f_schlick(sf.f0, dot(v, h)) * nl;
+        }
+        sum = sum + irr * (nlw * sf.albedo / PI + spec);
     }
     return sum;
 }
@@ -491,6 +508,42 @@ fn fs_enhanced(in: FsIn) -> EnhancedOut {
     //RT out.gbuf = rt_gbuf;
     //RT out.aux = rt_aux;
     return out;
+}
+
+// [ROLLBACK mirrordark-49] see the unlit branch of shade_enhanced.
+const MIRROR_EMISSIVE: bool = true;
+// [ROLLBACK mirrorada-52] how much of the eye adaptation's correction (the metering) the
+// mirror's picture follows, like the street: 1 = all (it whites out and settles with the
+// window), 0 = none (the picture stays at its own brightness, as a display does).
+const MIRROR_FOLLOW_EV: f32 = 1.0;
+// [ROLLBACK mirrorpre-54] The mirror's baseline level by the hour, from the same pre-exposure
+// the window's picture is made with (log2: 0 by day, about 6 in the blue hour, 9 and more
+// at night) instead of the sun's height alone: the street in the window is lifted by it, the
+// plain light of the mirror's picture was not, and at dusk the mirrors stood dark beside a
+// window the eye had adapted to. The lift is a bump over the dusk (zero by day and at
+// night, where the light's own dimming in camera_util.rs is right); 0 = none.
+const MIRROR_DUSK_BOOST: f32 = 3.0;
+const MIRROR_RISE: vec2<f32> = vec2<f32>(0.5, 3.0);
+// [ROLLBACK mirroreye-55] The mirror's picture is lit by the hour at once (its light is
+// OMSI's plain light, tuned for the hour at rest), while the street in the window is lit at
+// once and exposed by the pre-exposure that takes 1.5 s to follow the light. The window's
+// street is therefore its rest picture times pre / pre_target (white out after a jump from
+// night to day, dark after one to night), and now the mirror's is too: both settle together
+// with the eye. `enh.eye.w` is pre_target (0 where it is not given: no transient).
+const MIRROR_EYE_SYNC: bool = true;
+fn mirror_dusk_gain() -> f32 {
+    let pre_want = enh.eye.w;
+    let known = pre_want > 1.0e-3;
+    // (the dusk bump belongs to the hour the light asks for, not to the pre-exposure the eye
+    // has got to: the mirror's rest level must not move with the eye's lag)
+    let lp = log2(max(select(enh.exposure.x, pre_want, known), 1.0));
+    // [ROLLBACK mirrorrise-56] the lift rises from lp 0.5 to 3 (was 2 to 5): in the first part of
+    // the dawn the eye already sees the street bright (the pre-exposure is a few times the
+    // day's) while the lift had hardly begun
+    let up = smoothstep(MIRROR_RISE.x, MIRROR_RISE.y, lp);
+    let down = 1.0 - smoothstep(7.0, 9.5, lp);
+    let transient = select(1.0, clamp(enh.exposure.x / max(pre_want, 1.0e-3), 0.002, 500.0), known && MIRROR_EYE_SYNC);
+    return (1.0 + MIRROR_DUSK_BOOST * up * down) * transient;
 }
 
 // A self-lit picture (a display, a light-mapped surface lit fully) at its own colour after
@@ -628,11 +681,23 @@ fn shade_enhanced(in: FsIn, puddle_weight: ptr<function, vec2<f32>>, capture: bo
         // unlit (mirror glass, script and text textures): shown at their own brightness,
         // under the tone curve's knee (`display_level`), and `exposure.y` undoes the
         // metering (see ExposureLog in lib.rs)
-        let t = tex.rgb * material.color.rgb;
+        // [ROLLBACK mirrordark-49] A mirror's glass is lit as the plain shading lights an
+        // unlit surface: texture x (diffuse + emissive colour). The emissive colour was left
+        // out here, so a mirror whose material is dark in its diffuse colour and bright in its
+        // emissive one (Direct3D's way of making a surface show a picture at full brightness)
+        // came out a fraction of what the same mirror shows in the plain picture. Rollback:
+        // MIRROR_EMISSIVE = false.
+        let is_mirror = material.params.y < 0.95;
+        let t = tex.rgb * (material.color.rgb + select(vec3<f32>(0.0), material.emissive.rgb, MIRROR_EMISSIVE && is_mirror)) * select(1.0, mirror_dusk_gain(), is_mirror);
         // A mirror (params.y 0.9) is no display: its picture is the street drawn a moment
         // ago, dark at night. Brightened like a display by the metering (up to 1.6 in the
         // dark) it showed a street far brighter than the one through the windscreen.
-        let lift = select(enh.exposure.y, min(enh.exposure.y, 1.0), material.params.y < 0.95);
+        // [ROLLBACK mirrordark-49] The other way the metering also acted on it: in a bright
+        // picture (the metering takes up to 0.6 EV off) the tone mapping darkened the mirror
+        // by a third as well, though its picture is the street already at its own brightness.
+        // Now the metering is undone both ways (night is still the sun-height dimming of the
+        // mirror's light in camera_util.rs).
+        let lift = select(enh.exposure.y, pow(enh.exposure.y, 1.0 - MIRROR_FOLLOW_EV), is_mirror);
         let c = display_level(t) * lift;
         return vec4<f32>(c * aer.a + aer.rgb * pre, alpha);
     }
@@ -1098,7 +1163,18 @@ fn shade_enhanced(in: FsIn, puddle_weight: ptr<function, vec2<f32>>, capture: bo
     // --- the lamps, the cabin light and what glows by itself
     // ([nomaplighting] objects are not lit by the map's lamps; light-mapped roads are, with
     // the tile light map on top)
-    let lamps = lamp_light(in.world, n, v, sf, thin) * select(1.0, 0.0, material.params.y > 0.2 && material.params.y < 0.3);
+    var lamps = lamp_light(in.world, n, v, sf, thin) * select(1.0, 0.0, material.params.y > 0.2 && material.params.y < 0.3);
+    // [ROLLBACK lampfill-44] The light a lamp puts on the ground comes back from there to the surfaces that
+    // face away from it (the far side of a bus from the street lamp): what a horizontal surface at this
+    // point receives, times the albedo of the road, over the lower hemisphere the surface sees. Left out
+    // (delete this `if`) those sides are black at night.
+    let bounce_w = clamp(0.5 - 0.5 * n.z, 0.0, 1.0);
+    if (enh.led.w > 0.5 && bounce_w > 0.02 && !terrain) {
+        let up = vec3<f32>(0.0, 0.0, 1.0);
+        let white = Surface(vec3<f32>(1.0), vec3<f32>(0.0), 1.0);
+        let on_ground = lamp_light(in.world, up, up, white, false);
+        lamps = lamps + sf.albedo * on_ground * (LAMP_BOUNCE * bounce_w) * select(1.0, 0.0, material.params.y > 0.2 && material.params.y < 0.3);
+    }
     // [interiorlight]: OMSI adds its lamps' light to the lit meshes whatever the daylight,
     // so a switched-on saloon is brighter by day as well and only stands out more at night.
     // Taken as a lamp against the daylight exposure it vanished by day altogether.
@@ -1187,7 +1263,12 @@ fn shade_enhanced(in: FsIn, puddle_weight: ptr<function, vec2<f32>>, capture: bo
     // the dark tint of a window, by day and at night (a 31454A pane of alpha 80 stood grey).
     // Before devtools-38 there was no block here: the pane kept `rgb = (direct + ambient + lamps) * pre + cabin`
     // (computed above) and `emit` as computed above. To roll back, delete the `if` below.
-    if (glass) {
+    // [ROLLBACK glass-48] before: `if (glass) {` - a blended, no-Z-write material with a transmap (a LED matrix or a
+    // display's text layer: `[matl_alpha] 2`, `[matl_noZwrite]`, `[matl_transmap] \S:1`) counts as a pane here, and the
+    // block took away its light map, night map and LED light with the rest of `emit`. A material with a light
+    // of its own keeps its colour and its `emit` as they were before devtools-38.
+    let own_light = material.params2.x > 0.5 || material.extra.w > 0.5 || material.emissive.w < -0.5;
+    if (glass && !own_light) {
         rgb = (direct + ambient) * pre;
         emit = vec3<f32>(0.0);
     }

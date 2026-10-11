@@ -35,6 +35,212 @@
 
 use super::*;
 
+// [ROLLBACK seatpick-69]
+/// From this age on a passenger counts as elderly: tries to sit, gets a seat given up.
+const ELDERLY_AGE: f32 = 65.0;
+/// Seconds before a passenger who changed places changes again.
+const SEAT_MOVE_PAUSE: f64 = 60.0;
+/// How far (m) a standing passenger goes for a freed seat.
+const SEAT_MOVE_REACH: f32 = 7.0;
+/// How near (m) the giver of a seat sits to the elderly passenger, and the least seconds between
+/// two seats given up in one bus.
+const SEAT_GIFT_REACH: f32 = 4.5;
+const SEAT_GIFT_PAUSE: f64 = 150.0;
+
+/// [ROLLBACK party-70] The chance that a granny goes for the pilot's seat, and how many seconds
+/// the places planned for a party are held for it.
+const PILOT_SEAT_CHANCE: f32 = 0.75;
+const PARTY_PLAN_TIME: f64 = 40.0;
+
+/// How many minutes a passenger rides: by the timetable, else a guess from the kilometres.
+fn ride_minutes(p: &Pax) -> f32 {
+    if p.ride_min > 0.0 {
+        p.ride_min
+    } else {
+        p.ride_km * 1.5
+    }
+}
+
+/// 0 for a ride of a few minutes, 1 for a long one (smooth between 3 and 8 minutes in the
+/// bus, by the timetable). [ROLLBACK ridemin-71]
+fn longness(ride_min: f32) -> f32 {
+    let t = ((ride_min - 3.0) / 5.0).clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
+}
+
+/// Whether a passenger is of those who give a seat up (about four in ten, by who they are).
+fn kind_person(id: u32) -> bool {
+    (id.wrapping_mul(2_654_435_761) >> 16) % 100 < 40
+}
+
+/// The chance that a boarding passenger looks for a seat rather than a standing place: more
+/// for a long ride, much more for an elderly one, a little for a child less; fewer seats left
+/// make the short rider stand, an empty bus makes even them sit; `bias` (the setting) scales
+/// the odds.
+fn sit_wish(ride_min: f32, age: f32, free_seats: usize, seats: usize, bias: f32) -> f32 {
+    let long = longness(ride_min);
+    let free = if seats == 0 { 0.0 } else { (free_seats as f32 / seats as f32).clamp(0.0, 1.0) };
+    // [ROLLBACK ridemin-71] the last seats are taken only by those who ride far
+    let room = (free * 4.0).min(1.0);
+    let scarce = (0.25 + 0.75 * room) * (1.0 - long) + (0.7 + 0.3 * room) * long;
+    let mut p = (0.12 + 0.80 * long) * scarce + (1.0 - long) * 0.3 * free * free;
+    if age >= ELDERLY_AGE {
+        p = 1.0 - (1.0 - p) * 0.08;
+    } else if age < 12.0 {
+        p *= 0.7;
+    }
+    let p = p.clamp(0.01, 0.99);
+    let odds = p / (1.0 - p) * bias.max(0.0);
+    odds / (1.0 + odds)
+}
+
+/// How willingly the places of `list` are taken (not a chance: weights to pick from). Seats:
+/// a bench with nobody on it, and the windows (far from the bus's middle) first, then the
+/// ones next to somebody; the short rider and the elderly like to sit by the doors, the one
+/// riding far deeper in. Standing places: the short rider by the doors (near their exits), the
+/// one riding far in the saloon and not standing in the way; not close to somebody standing.
+fn place_weights(bn: &BusNow, taken: &[bool], list: &[usize], seated: bool, ride_min: f32, age: f32, mates: &[usize]) -> Vec<f32> {
+    let cab = &bn.cabin;
+    let long = longness(ride_min);
+    let old = age >= ELDERLY_AGE;
+    let half_x = (bn.half.x as f32).max(0.5);
+    let mut doors: Vec<Vec3> = cab.exits.iter().map(|d| d.inside).collect();
+    if old {
+        doors.extend(cab.entries.iter().map(|d| d.inside));
+    }
+    let near_door = |k: usize| -> f32 {
+        let p = cab.seats[k].pos;
+        let d = doors.iter().map(|q| (*q - p).truncate().length()).fold(f32::INFINITY, f32::min);
+        if d.is_finite() { (1.0 - d / 6.0).clamp(0.0, 1.0) } else { 0.5 }
+    };
+    let neighbours = |k: usize, r: f32, seated: bool| -> usize {
+        let s = &cab.seats[k];
+        cab.seats.iter().enumerate().filter(|(j, o)| *j != k && !mates.contains(j) && taken.get(*j).copied().unwrap_or(false) && o.seated == seated && o.group == s.group && (o.pos - s.pos).truncate().length() < r).count()
+    };
+    list.iter()
+        .map(|&k| {
+            let near = near_door(k);
+            let w = if seated {
+                let lat = ((cab.seats[k].pos.x - bn.centre.x as f32).abs() / half_x).clamp(0.0, 1.0);
+                let mut w = 0.35;
+                if neighbours(k, 0.62, true) == 0 {
+                    w += 1.0 + 1.4 * lat;
+                } else {
+                    w += 0.35;
+                }
+                w += (1.0 - long) * 1.2 * near + long * 0.5 * (1.0 - near);
+                // [ROLLBACK party-70] who goes deep into the bus wants the window
+                w += 1.2 * lat * (1.0 - near);
+                if old {
+                    w += 1.6 * near;
+                }
+                w
+            } else {
+                let mut w = 0.4 + (1.0 - long) * 2.6 * near + long * 0.7 * (1.0 - near);
+                if long > 0.5 && near > 0.85 {
+                    w *= 0.5;
+                }
+                w / (1.0 + 1.5 * neighbours(k, 0.8, false) as f32)
+            };
+            // [ROLLBACK party-70] near the others of the party
+            let close = mates.iter().filter_map(|m| cab.seats.get(*m)).map(|m| (1.0 - (m.pos - cab.seats[k].pos).truncate().length() / 2.5).clamp(0.0, 1.0)).fold(0.0f32, f32::max);
+            (w * (1.0 + 4.0 * close)).max(0.05)
+        })
+        .collect()
+}
+
+/// The pilot's seat: the seat across the aisle from the driver, a little way behind the cab (the
+/// driver's side is by where their place lies against the middle of the bus, so a bus with the
+/// wheel on the other side works the same). None where the bus has no such seat.
+fn pilot_seat(bn: &BusNow) -> Option<usize> {
+    let d = bn.cabin.data.driver_positions.first()?;
+    let dp = Vec3::from(d.pos);
+    let cx = bn.centre.x as f32;
+    if (dp.x - cx).abs() < 0.2 {
+        return None;
+    }
+    let side = (dp.x - cx).signum();
+    let target = glam::Vec2::new(2.0 * cx - dp.x, dp.y - 1.3);
+    bn.cabin
+        .seats
+        .iter()
+        .enumerate()
+        .filter(|(_, s)| s.seated && (s.pos.x - cx) * side < -0.2 && s.pos.y < dp.y && dp.y - s.pos.y < 3.5)
+        .map(|(k, s)| (k, (s.pos.truncate() - target).length()))
+        .filter(|(_, dist)| *dist < 2.2)
+        .min_by(|a, b| a.1.total_cmp(&b.1))
+        .map(|(k, _)| k)
+}
+
+/// Places for a party of `n` among the free seats `sit`: two seats side by side (a bench of
+/// two, a window one liked), for three or four a "four" - two such pairs facing each other.
+/// All of them (four for a "four"), the first for whoever asks. None where there is none.
+fn party_places(bn: &BusNow, taken: &[bool], sit: &[usize], n: u8, rand: &mut dyn FnMut() -> f64) -> Option<Vec<usize>> {
+    let seats = &bn.cabin.seats;
+    let half_x = (bn.half.x as f32).max(0.5);
+    let cx = bn.centre.x as f32;
+    let turn = |a: usize, b: usize| angle_between(seats[a].rot as f64, seats[b].rot as f64);
+    let mut pairs: Vec<(usize, usize)> = Vec::new();
+    for (x, &a) in sit.iter().enumerate() {
+        for &b in &sit[x + 1..] {
+            if seats[a].group == seats[b].group && (seats[a].pos - seats[b].pos).truncate().length() < 0.62 && turn(a, b) < 35.0 {
+                pairs.push((a, b));
+            }
+        }
+    }
+    // (a bench of two next to somebody is as good as any, but not squeezed in a row of seats:
+    // the pair must not have a free neighbour that makes it three)
+    let _ = taken;
+    let lat = |p: &(usize, usize)| (((seats[p.0].pos.x + seats[p.1].pos.x) * 0.5 - cx).abs() / half_x).clamp(0.0, 1.0);
+    let centre = |p: &(usize, usize)| (seats[p.0].pos + seats[p.1].pos).truncate() * 0.5;
+    if n <= 2 {
+        if pairs.is_empty() {
+            return None;
+        }
+        let w: Vec<f32> = pairs.iter().map(|p| 0.4 + lat(p)).collect();
+        let idx: Vec<usize> = (0..pairs.len()).collect();
+        let p = pairs[pick_weighted(&idx, &w, rand())];
+        return Some(vec![p.0, p.1]);
+    }
+    let mut blocks: Vec<[usize; 4]> = Vec::new();
+    for (x, p) in pairs.iter().enumerate() {
+        for q in &pairs[x + 1..] {
+            if seats[p.0].group != seats[q.0].group || turn(p.0, q.0) < 145.0 {
+                continue;
+            }
+            let (cp, cq) = (centre(p), centre(q));
+            let r = (seats[p.0].rot as f32).to_radians();
+            let f = glam::Vec2::new(r.sin(), r.cos());
+            let d = cq - cp;
+            let (along, side) = (d.dot(f), d.dot(glam::Vec2::new(f.y, -f.x)));
+            let facing = |a: f32| (0.8..2.4).contains(&a);
+            if (facing(along) || facing(-along)) && side.abs() < 0.6 {
+                blocks.push([p.0, p.1, q.0, q.1]);
+            }
+        }
+    }
+    if blocks.is_empty() {
+        return None;
+    }
+    let idx: Vec<usize> = (0..blocks.len()).collect();
+    let w: Vec<f32> = blocks.iter().map(|b| 0.4 + lat(&(b[0], b[1])).max(lat(&(b[2], b[3])))).collect();
+    let b = blocks[pick_weighted(&idx, &w, rand())];
+    Some(b.to_vec())
+}
+
+/// One of `list` by the weights `w`; `r` in 0..1.
+fn pick_weighted(list: &[usize], w: &[f32], r: f64) -> usize {
+    let sum: f32 = w.iter().sum();
+    let mut t = r as f32 * sum;
+    for (k, wk) in list.iter().zip(w) {
+        if t < *wk {
+            return *k;
+        }
+        t -= *wk;
+    }
+    *list.last().unwrap()
+}
+
 /// Omsi.exe's tasks (+0x6c5).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum Task {
@@ -114,6 +320,11 @@ pub(super) struct Pax {
     pub alt_seen: bool,
     pub alt_m: f32,
     pub ride_km: f32,
+    /// [ROLLBACK ridemin-71] The minutes to ride by the timetable (0: not known).
+    pub ride_min: f32,
+    /// [ROLLBACK party-70] The party travelling together (0: alone) and how many it was made of.
+    pub party: u32,
+    pub party_n: u8,
     pub km_start: f64,
     /// Drawn once per passenger: where between departure and the approach they ask
     /// to get off. The stop and its request distance are settled when that leg begins.
@@ -202,6 +413,9 @@ impl Pax {
             alt_seen: false,
             alt_m: 0.0,
             ride_km: 0.0,
+            ride_min: 0.0,
+            party: 0,
+            party_n: 0,
             km_start: 0.0,
             stop_request_random,
             stop_request_at: None,
@@ -868,6 +1082,235 @@ impl Humans {
         Some(k)
     }
 
+    // [ROLLBACK seatpick-69] [ROLLBACK party-70]
+    /// Where a boarding passenger goes: a seat or a standing place, instead of a random one.
+    /// Alone by what they are like and what is free (see `sit_wish` and `place_weights`); of a
+    /// party (two to four people), together: the first to board who sits plans a bench of two
+    /// side by side or a "four" (two pairs facing each other) for all, the others take what is
+    /// planned or else the place nearest to their own. With the setting at 0 the original's random
+    /// free place (`reserve_place`).
+    pub(super) fn choose_place(&mut self, i: usize, bn: &BusNow) -> Option<usize> {
+        if self.sit_bias <= 0.0 {
+            return self.reserve_place(bn.id, bn.cabin.seats.len(), &bn.places_off);
+        }
+        let n = bn.cabin.seats.len();
+        let seats = self.seats.entry(bn.id).or_insert_with(|| vec![false; n]);
+        if seats.len() < n {
+            seats.resize(n, false);
+        }
+        let taken = seats.clone();
+        let off = &bn.places_off;
+        let off_k = |k: usize| off.get(k).copied().unwrap_or(false);
+        let now = self.time;
+        self.party_plan.retain(|_, v| now - v.2 < PARTY_PLAN_TIME);
+        let (party, party_n) = self.pax(i).map(|p| (p.party, p.party_n)).unwrap_or((0, 0));
+        // places planned for the parties of others are not free
+        let mut held = vec![false; n];
+        for (pid, (b, ks, _)) in &self.party_plan {
+            if *b == bn.id && *pid != party {
+                for k in ks.iter().filter(|k| **k < n) {
+                    held[*k] = true;
+                }
+            }
+        }
+        // the party's own plan
+        if party != 0 {
+            let planned = self.party_plan.get(&party).filter(|v| v.0 == bn.id).and_then(|v| v.1.iter().copied().find(|k| *k < n && !taken[*k] && !off_k(*k)));
+            if let Some(k) = planned {
+                self.seats.get_mut(&bn.id).unwrap()[k] = true;
+                return Some(k);
+            }
+        }
+        let is_free = |k: usize| !taken[k] && !held[k] && !off_k(k);
+        let sit: Vec<usize> = (0..n).filter(|k| is_free(*k) && bn.cabin.seats[*k].seated).collect();
+        let stand: Vec<usize> = (0..n).filter(|k| is_free(*k) && !bn.cabin.seats[*k].seated).collect();
+        if sit.is_empty() && stand.is_empty() {
+            return None;
+        }
+        let age = self.people[i].age;
+        let ride = self.pax(i).map(ride_minutes).unwrap_or(8.0);
+        // the others of the party already in the bus
+        let mates: Vec<usize> = if party == 0 {
+            Vec::new()
+        } else {
+            self.people
+                .iter()
+                .filter_map(|o| match &o.state {
+                    State::Pax(x) if x.party == party && x.bus == Some(bn.id) => x.seat.filter(|k| *k < n),
+                    _ => None,
+                })
+                .collect()
+        };
+        let total_seats = (0..n).filter(|k| bn.cabin.seats[*k].seated && !off_k(*k)).count();
+        let sits = if sit.is_empty() {
+            false
+        } else if stand.is_empty() {
+            true
+        } else {
+            let mut wish = sit_wish(ride, age, sit.len(), total_seats, self.sit_bias);
+            if !mates.is_empty() {
+                // with the party: sit if they sit, stand if they stand
+                let seated = mates.iter().filter(|k| bn.cabin.seats[**k].seated).count();
+                wish = if seated * 2 >= mates.len() { wish.max(0.85) } else { wish.min(0.25) };
+            }
+            (self.rand_f() as f32) < wish
+        };
+        // a granny takes the pilot's seat, if the bus has one
+        if sits && age >= ELDERLY_AGE && (self.rand_f() as f32) < PILOT_SEAT_CHANCE {
+            if let Some(k) = pilot_seat(bn).filter(|k| sit.contains(k)) {
+                self.seats.get_mut(&bn.id).unwrap()[k] = true;
+                return Some(k);
+            }
+        }
+        // the first of a party to sit plans the places for all
+        if sits && party != 0 && party_n >= 2 && mates.is_empty() {
+            if let Some(ks) = party_places(bn, &taken, &sit, party_n, &mut || self.rand_f()) {
+                self.party_plan.insert(party, (bn.id, ks.clone(), now));
+                self.seats.get_mut(&bn.id).unwrap()[ks[0]] = true;
+                return Some(ks[0]);
+            }
+        }
+        let list = if sits { &sit } else { &stand };
+        let w = place_weights(bn, &taken, list, sits, ride, age, &mates);
+        let k = pick_weighted(list, &w, self.rand_f());
+        self.seats.get_mut(&bn.id).unwrap()[k] = true;
+        Some(k)
+    }
+
+    /// Moves passenger `i` (settled in `bn`) to place `new_k`: walking there in the player's
+    /// bus, at once in any other. `free_old`: whether the place left is free for others.
+    fn relocate_pax(&mut self, i: usize, new_k: usize, free_old: bool, bn: &BusNow, buses: &[BusNow], bus_ix: &HashMap<BusId, usize>, world: &World) {
+        let old = self.pax(i).and_then(|p| p.seat);
+        // [ROLLBACK ridemin-71] the new place is taken (it was not: others sat down in the same one)
+        if let Some(t) = self.seats.get_mut(&bn.id).and_then(|v| v.get_mut(new_k)) {
+            *t = true;
+        }
+        if free_old {
+            if let Some(o) = old {
+                self.free_seat(bn.id, o);
+            }
+        }
+        let (id, now) = (self.people[i].id, self.time);
+        if self.seat_moved.len() > 4000 {
+            self.seat_moved.clear();
+        }
+        self.seat_moved.insert(id, now);
+        let all = bn.cabin.all_points();
+        let from = old.and_then(|k| bn.cabin.seats.get(k)).map(|s| s.pos).or_else(|| self.pax(i).map(|p| p.pos.as_vec3()));
+        let start = from.and_then(|f| bn.cabin.omsi_nearest(f, &all, false, true, None, None));
+        let p = self.pax_mut(i).unwrap();
+        p.seat = Some(new_k);
+        p.ticket = TICKET_NONE;
+        p.task = Task::InBusToPlace;
+        if bn.id == BusId::Player {
+            p.pax_state = 1.0;
+            p.pt = start;
+            if let Some(q) = start.and_then(|k| bn.cabin.graph.points.get(k)) {
+                p.pos = q.as_dvec3();
+            }
+            self.route_to_place(i, bn);
+        } else {
+            self.set_task(i, Task::SittingInBus, buses, bus_ix, world);
+        }
+    }
+
+    /// Passengers changing places in a bus (once every second or two): a standing passenger
+    /// who rides far takes a seat that has been freed, an elderly one first; and now and then
+    /// somebody gives their seat to an elderly passenger who stands and no seat is free.
+    pub(super) fn seat_dynamics(&mut self, dt: f32, world: &World, buses: &[BusNow], bus_ix: &HashMap<BusId, usize>) {
+        if self.sit_bias <= 0.0 {
+            return;
+        }
+        self.seat_clock -= dt;
+        if self.seat_clock > 0.0 {
+            return;
+        }
+        self.seat_clock = 1.2 + self.rand_f() as f32 * 1.2;
+        let now = self.time;
+        for bn in buses {
+            let n = bn.cabin.seats.len();
+            let Some(taken) = self.seats.get(&bn.id).cloned() else { continue };
+            if taken.len() < n || n == 0 {
+                continue;
+            }
+            // who has settled in this bus: (person, place, age, ride)
+            let mut riders: Vec<(usize, usize, f32, f32)> = Vec::new();
+            for (i, person) in self.people.iter().enumerate() {
+                let State::Pax(p) = &person.state else { continue };
+                if p.task != Task::SittingInBus || p.inside != Some(bn.id) {
+                    continue;
+                }
+                let Some(k) = p.seat.filter(|k| *k < n) else { continue };
+                if self.seat_moved.get(&person.id).is_some_and(|t| now - t < SEAT_MOVE_PAUSE) {
+                    continue;
+                }
+                riders.push((i, k, person.age, ride_minutes(p)));
+            }
+            if riders.is_empty() {
+                continue;
+            }
+            let seats = &bn.cabin.seats;
+            let dist = |a: usize, b: usize| (seats[a].pos - seats[b].pos).truncate().length();
+            let free_seats: Vec<usize> = (0..n).filter(|k| seats[*k].seated && !taken[*k] && !bn.places_off.get(*k).copied().unwrap_or(false)).collect();
+            if !free_seats.is_empty() {
+                // a standing passenger takes a seat that is free: the elderly first, then the
+                // ones with a long ride, nearest first
+                let mut best: Option<(f32, usize, usize)> = None;
+                for &(i, k, age, ride) in &riders {
+                    if seats[k].seated {
+                        continue;
+                    }
+                    let old = age >= ELDERLY_AGE;
+                    if !old && longness(ride) < 0.45 {
+                        continue;
+                    }
+                    for &f in &free_seats {
+                        let d = dist(k, f);
+                        if seats[f].group != seats[k].group || d > SEAT_MOVE_REACH {
+                            continue;
+                        }
+                        let key = d + if old { 0.0 } else { 100.0 };
+                        if best.is_none_or(|b| key < b.0) {
+                            best = Some((key, i, f));
+                        }
+                    }
+                }
+                if let Some((key, i, f)) = best {
+                    let go = key < 100.0 || (self.rand_f() as f32) < (0.35 * self.sit_bias).min(0.9);
+                    if go {
+                        self.relocate_pax(i, f, true, bn, buses, bus_ix, world);
+                    }
+                }
+                continue;
+            }
+            // no seat free: somebody gives up theirs to an elderly passenger who stands (rarely)
+            if self.seat_gift.get(&bn.id).is_some_and(|t| now - t < SEAT_GIFT_PAUSE) {
+                continue;
+            }
+            let Some(&(ei, ek, _, _)) = riders.iter().find(|(_, k, age, _)| *age >= ELDERLY_AGE && !seats[*k].seated) else { continue };
+            if (self.rand_f() as f32) >= (0.12 * self.sit_bias).min(0.6) {
+                continue;
+            }
+            let giver = riders
+                .iter()
+                .filter(|(i, k, age, _)| *i != ei && seats[*k].seated && *age < ELDERLY_AGE && *age >= 14.0 && seats[*k].group == seats[ek].group && dist(*k, ek) <= SEAT_GIFT_REACH && kind_person(self.people[*i].id))
+                .min_by(|a, b| dist(a.1, ek).total_cmp(&dist(b.1, ek)))
+                .copied();
+            let Some((gi, gk, _, _)) = giver else { continue };
+            // where the giver stands instead: the free standing place nearest to the seat
+            let stand = (0..n)
+                .filter(|k| !seats[*k].seated && !taken[*k] && !bn.places_off.get(*k).copied().unwrap_or(false) && seats[*k].group == seats[gk].group && dist(*k, gk) <= SEAT_GIFT_REACH)
+                .min_by(|a, b| dist(*a, gk).total_cmp(&dist(*b, gk)));
+            let Some(sk) = stand else { continue };
+            self.seats.get_mut(&bn.id).unwrap()[sk] = true;
+            self.seat_gift.insert(bn.id, now);
+            // the seat goes from the giver to the elderly passenger (it stays taken), the
+            // elderly passenger's standing place is left
+            self.relocate_pax(gi, sk, false, bn, buses, bus_ix, world);
+            self.relocate_pax(ei, gk, true, bn, buses, bus_ix, world);
+        }
+    }
+
     /// sub_5ce4e0: stamp (stamper_prop) or buy (ticketbuy_prop) at a bus that has a
     /// validator / a cash desk, else nothing to do; the ticket bought (sub_5ce2dc).
     pub(super) fn decide_pax_ticket(&mut self, i: usize, bn: &BusNow) -> (u8, u8) {
@@ -932,6 +1375,8 @@ impl Humans {
             }
             self.pax_tick(i, dt, world, buses, bus_ix, at_stops, player_bus, renderer, scene, taken_ticket, remove);
         }
+        // [ROLLBACK seatpick-69] places changed between the riders
+        self.seat_dynamics(dt, world, buses, bus_ix);
         // (where every passenger stands: in a bus's frame, or the world's - and the people
         // walking the pavement, among them a rider who has just stepped off, still on the
         // step until they are clear of the door. Not those who stand where they got off
@@ -1620,7 +2065,10 @@ impl Humans {
         let group = p.seat.and_then(|k| bn.cabin.seats.get(k)).map(|s| s.group);
         let list = bn.cabin.in_group(bn.cabin.entry_points(), group);
         let flags = bn.cabin.entry_flags();
-        let open: Vec<bool> = (0..list.len()).map(|k| bn.entry_open.get(k).copied().unwrap_or(false)).collect();
+        // [ROLLBACK doorwait-66] a door that is opening counts as open, so nobody turns away to
+        // another door before the script flags this one
+        let moving = self.door_moving.get(&bn.id).map(|m| m.0.clone()).unwrap_or_default();
+        let open: Vec<bool> = (0..list.len()).map(|k| bn.entry_open.get(k).copied().unwrap_or(false) || moving.get(k).copied().unwrap_or(false)).collect();
         let pt = bn.cabin.omsi_nearest(here, &list, p.ticket == TICKET_BUY, false, Some(&flags), Some(&open));
         let p = self.pax_mut(i).unwrap();
         if let Some(q) = pt.and_then(|k| bn.cabin.graph.points.get(k)) {
@@ -1725,7 +2173,7 @@ impl Humans {
                 let Some(stop) = p.stop else { return };
                 if let Some(bn) = bn {
                     if bn.speed.abs() < 3.0 && self.in_stop_box(stop, bn.id) {
-                        if let Some(k) = self.reserve_place(bn.id, bn.cabin.seats.len(), &bn.places_off) {
+                        if let Some(k) = self.choose_place(i, bn) {
                             let (tk, id) = self.decide_pax_ticket(i, bn);
                             let price = self.tickets.as_ref().and_then(|t| t.tickets.get(id.saturating_sub(1) as usize)).map(|t| t.value).unwrap_or(0.0);
                             let pp = self.pax_mut(i).unwrap();
@@ -1973,12 +2421,14 @@ impl Humans {
                 // to it - the people coming down from the upper deck never got off the stairs.
                 self.pax_mut(i).unwrap().timer = 1.0;
                 let all = bn.cabin.all_points();
+                // [ROLLBACK doorwait-66] an exit that is opening counts as open
+                let moving = self.door_moving.get(&bn.id).map(|m| m.1.clone()).unwrap_or_default();
                 let pp = self.pax_mut(i).unwrap();
                 let here = pp.pos.as_vec3();
                 // (the exits of the sections they are in)
                 let group = bn.cabin.group_at(pp.pt.or_else(|| bn.cabin.omsi_nearest(here, &all, false, false, None, None)));
                 let exits = bn.cabin.in_group(bn.cabin.exit_points(), group);
-                let open: Vec<bool> = (0..exits.len()).map(|k| bn.exit_open.get(k).copied().unwrap_or(false)).collect();
+                let open: Vec<bool> = (0..exits.len()).map(|k| bn.exit_open.get(k).copied().unwrap_or(false) || moving.get(k).copied().unwrap_or(false)).collect();
                 let target = bn.cabin.omsi_nearest(here, &exits, false, false, None, Some(&open));
                 if pp.st == 5 {
                     // walking: on from the point walked to, towards the new door (Omsi.exe
@@ -2014,6 +2464,18 @@ impl Humans {
             log::info!("t={:.1} pax {} gets off at stop {:?} by exit {:?}", self.time, self.people[i].label(), stop, p.door);
         }
         self.walk_street(i, w, h, stop, world, remove);
+        // [ROLLBACK stepout-70] straight away from the bus's side first (1.8 m), whatever the
+        // pavement's path does: just off, they stood up to eight seconds - the standing bus
+        // was "in the way" of the first step along its side
+        if let Some(d) = p.door.and_then(|d| bn.cabin.exits.get(d)) {
+            if matches!(self.people[i].state, State::Strolling(_)) {
+                let dir = (d.outside - d.inside).truncate().normalize_or_zero();
+                if dir != glam::Vec2::ZERO {
+                    let tgt = bn.world(d.outside + Vec3::new(dir.x, dir.y, 0.0) * 1.3);
+                    self.people[i].step_out = Some((tgt.truncate(), 4.0));
+                }
+            }
+        }
     }
 
     /// sub_626818 / task 8: on as a pedestrian along the pavement from the stop - or gone

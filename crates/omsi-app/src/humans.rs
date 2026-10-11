@@ -1416,8 +1416,18 @@ fn seg_cross(a: DVec2, b: DVec2, c: DVec2, d: DVec2) -> Option<DVec2> {
     (t >= 0.0 && t <= 1.0 && u >= 0.0 && u <= 1.0).then(|| a + r * t)
 }
 
+/// [ROLLBACK doorwait-68] How long (s) the people wait for a door that is opening before they
+/// look for another.
+const DOOR_OPENING_GRACE: f64 = 3.0;
+
 /// How far (m) from where they stand somebody left standing looks for a pavement to walk on.
 const STANDING_REACH: f64 = 30.0;
+/// [ROLLBACK respawn-61] How long (s) somebody who got off and finds no pavement stands before
+/// being respawned: sooner when nobody sees them.
+const STANDING_GIVE_UP: f32 = 1.0;
+/// [ROLLBACK party-70] The share of the waiting who wait with others (two to four).
+const PARTY_CHANCE: f32 = 0.22;
+const STANDING_GIVE_UP_UNSEEN: f32 = 1.0;
 
 #[derive(Debug, Clone)]
 enum State {
@@ -1501,6 +1511,9 @@ pub struct Person {
     /// passing through others.
     stuck: f32,
     ghost: f32,
+    /// [ROLLBACK stepout-70] Just off a bus: where to walk straight to (1.8 m off its side) and the
+    /// seconds left for it, before the pavement's path takes over; no waiting for the standing bus.
+    step_out: Option<(DVec2, f32)>,
     /// Seconds a standing vehicle has stood in the way (see the crowd step).
     car_wait: f32,
     /// Seconds left going round something in the way off the pavement's line (a lamp post
@@ -1621,6 +1634,15 @@ pub struct Humans {
     pax_req: HashMap<BusId, (Vec<bool>, Vec<bool>)>,
     /// Its `PAX_Entry<n>_Busy` / `PAX_Exit<n>_Busy`: somebody in that doorway.
     pax_busy: HashMap<BusId, (Vec<bool>, Vec<bool>)>,
+    /// [ROLLBACK doorwait-66] Doors (entries, exits) of each bus that are opening: the door
+    /// variable is rising and the script has not flagged the entry / exit open yet. Whoever
+    /// chooses a door counts them as open, so nobody turns away from the door being opened.
+    door_moving: HashMap<BusId, (Vec<bool>, Vec<bool>)>,
+    /// The last reading of a door variable: (bus, exit?, index).
+    door_prev: HashMap<(BusId, bool, usize), f32>,
+    /// [ROLLBACK doorwait-68] When each door began to open (bus, exit?, index): the wait for a
+    /// door that is being opened ends after `DOOR_OPENING_GRACE` seconds.
+    door_since: HashMap<(BusId, bool, usize), f64>,
     /// The occupancy variables its places name, and whether somebody is on each (#721).
     pax_places: HashMap<BusId, Vec<(String, bool)>>,
     /// Who is at the player's cash desk (+0x7a8), how often the driver has been asked
@@ -1705,6 +1727,19 @@ pub struct Humans {
     /// What passengers may say (the `pax_voices` setting): 0 everything, 1 only the
     /// ticket they ask for, 2 nothing.
     pub voices: u8,
+    /// [ROLLBACK seatpick-69] How much passengers want to sit (the `pax_sit` setting): 0 the
+    /// original's random place, else the odds of looking for a seat are scaled by it.
+    pub sit_bias: f32,
+    seat_clock: f32,
+    /// When a passenger last changed places (by person id), and when a seat was last given up
+    /// in a bus.
+    seat_moved: HashMap<u32, f64>,
+    seat_gift: HashMap<BusId, f64>,
+    /// The party being made at a stop (stop, party, destination, line, ride, people still to come),
+    /// the next party number, and the seats planned for a party in a bus (bus, places, when).
+    party_open: Option<(i64, u32, Option<String>, Option<usize>, f32, u8, u8)>,
+    party_next: u32,
+    party_plan: HashMap<u32, (BusId, Vec<usize>, f64)>,
     /// When anybody last greeted or complained (seconds of `time`).
     last_chat: f64,
     /// Avatars (the player on foot, other players' walkers): key → person id, and what
@@ -1728,6 +1763,8 @@ pub struct Humans {
     /// The timetable's name of each stop object (`Schedule::stop_names`), the names the
     /// targets above are made of.
     pub stop_names: Option<HashMap<i64, String>>,
+    /// [ROLLBACK ridemin-71] Minutes by the timetable between two stops by name (`Schedule::ride_minutes`).
+    pub ride_minutes: Option<HashMap<(String, String), f32>>,
     /// The player's duty (`set_duty`): its trip, the stop of it the duty is due at, and
     /// whether the trip has reached its last stop. None: free drive, and nobody waiting
     /// boards the player's bus.
@@ -1917,6 +1954,9 @@ impl Humans {
             odometer: HashMap::new(),
             pax_req: HashMap::new(),
             pax_busy: HashMap::new(),
+            door_moving: HashMap::new(),
+            door_prev: HashMap::new(),
+            door_since: HashMap::new(),
             pax_places: HashMap::new(),
             desk_busy: None,
             pardons: 0,
@@ -1959,6 +1999,13 @@ impl Humans {
             voice_lines: Vec::new(),
             voice_said: HashMap::new(),
             voices: 0,
+            sit_bias: 1.0,
+            seat_clock: 0.0,
+            seat_moved: HashMap::new(),
+            seat_gift: HashMap::new(),
+            party_open: None,
+            party_next: 1,
+            party_plan: HashMap::new(),
             last_chat: -1e9,
             avatars: HashMap::new(),
             avatar_cmds: HashMap::new(),
@@ -1968,6 +2015,7 @@ impl Humans {
             driver_away: false,
             stop_targets: None,
             stop_names: None,
+            ride_minutes: None,
             duty: None,
             stamped: Vec::new(),
             pedestrians: 14,
@@ -2471,6 +2519,7 @@ impl Humans {
             age,
             stuck: 0.0,
             ghost: 0.0,
+            step_out: None,
             car_wait: 0.0,
             detour: 0.0,
             detour_side: 0.0,
@@ -2810,9 +2859,34 @@ impl Humans {
         }
         let k = self.take_spot(id)?;
         let sp = self.stops[&id].spots[k].clone();
-        let (dest, line) = self.draw_dest(id);
+        // [ROLLBACK party-70] some wait in twos to fours: one destination, one ride, together
+        let mut party = (0u32, 0u8, 0.0f32);
+        let (dest, line) = match self.party_open.take() {
+            Some((st, pid, d, l, ride, n, left)) if st == id && left > 0 => {
+                party = (pid, n, ride);
+                if left > 1 {
+                    self.party_open = Some((st, pid, d.clone(), l, ride, n, left - 1));
+                }
+                (d, l)
+            }
+            _ => {
+                let (d, l) = self.draw_dest(id);
+                if self.sit_bias > 0.0 && (self.rand_f() as f32) < PARTY_CHANCE {
+                    let r = self.rand_f();
+                    let n: u8 = if r < 0.6 { 2 } else if r < 0.88 { 3 } else { 4 };
+                    let pid = self.party_next;
+                    self.party_next += 1;
+                    let ride = self.rand_f() as f32 * 19.0 + 1.0;
+                    party = (pid, n, ride);
+                    self.party_open = Some((id, pid, d.clone(), l, ride, n, n - 1));
+                }
+                (d, l)
+            }
+        };
         let walk = 1.1 + (self.rand_f() as f32 * 2.0 - 1.0) * 0.2;
         let mut pax = Pax::new(walk, self.rand_f());
+        pax.party = party.0;
+        pax.party_n = party.1;
         pax.stop = Some(id);
         pax.spot = Some(k);
         pax.pos = sp.pos;
@@ -2827,6 +2901,20 @@ impl Humans {
         let dummy_b: Vec<BusNow> = Vec::new();
         let dummy_ix: HashMap<BusId, usize> = HashMap::new();
         self.set_task(i, Task::WalkingToBusstop, &dummy_b, &dummy_ix, world);
+        if party.0 != 0 {
+            if let Some(p) = self.pax_mut(i) {
+                p.ride_km = party.2;
+            }
+        }
+        // [ROLLBACK ridemin-71] the ride by the timetable
+        let from = self.stops.get(&id).map(|s| if s.alias.is_empty() { s.name.trim().to_string() } else { s.alias.trim().to_string() });
+        let mins = match (from, self.pax(i).and_then(|p| p.dest.clone()), self.ride_minutes.as_ref()) {
+            (Some(f), Some(d), Some(t)) => t.get(&(f, d.trim().to_string())).copied(),
+            _ => None,
+        };
+        if let (Some(m), Some(p)) = (mins, self.pax_mut(i)) {
+            p.ride_min = m;
+        }
         if debug_pax() {
             let d = self.pax(i).and_then(|p| p.dest.clone());
             log::info!("t={:.1} pax {} waits at stop {id} place {k}, for {:?}", self.time, self.people[i].label(), d);
@@ -3067,6 +3155,31 @@ impl Humans {
     }
 
 
+    /// [ROLLBACK doorwait-66] Note which doors of `v` are opening now (see `door_moving`).
+    fn note_door_motion(&mut self, id: BusId, v: &VehicleInstance, entry_open: &[bool], exit_open: &[bool]) {
+        let pos = |k: usize| v.var(&format!("door_{k}")).or_else(|| v.var(&format!("door{k}")));
+        let exit_base = if entry_open.len() <= 1 { 1 } else { 2 };
+        let mut moving = (vec![false; entry_open.len()], vec![false; exit_open.len()]);
+        // [ROLLBACK doorwait-68] only the entries: whoever leaves goes to an exit when it is flagged
+        // open, as before (they walked into the exit point of a door still shut)
+        for (exit, flags, out) in [(false, entry_open, &mut moving.0)] {
+            for k in 0..flags.len() {
+                let d = if exit { (exit_base + k).min(7) } else { k.min(7) };
+                if let Some(x) = pos(d) {
+                    let prev = self.door_prev.insert((id, exit, k), x).unwrap_or(x);
+                    let rising = !flags[k] && x > 0.02 && x >= prev - 1e-4;
+                    // (and only for a few seconds: a door that never gets flagged is given up)
+                    let since = *self.door_since.entry((id, exit, k)).or_insert(self.time);
+                    if !rising {
+                        self.door_since.remove(&(id, exit, k));
+                    }
+                    out[k] = rising && self.time - since < DOOR_OPENING_GRACE;
+                }
+            }
+        }
+        self.door_moving.insert(id, moving);
+    }
+
     pub fn set_player_next_stop(&mut self, stop: Option<&crate::schedule::PlannedStop>) {
         // (called once a frame: worked out again only when the duty moves on to another stop)
         if let (Some(s), Some(cur)) = (stop, self.player_next_stop.as_ref()) {
@@ -3176,6 +3289,7 @@ impl Humans {
             let speed = b.physics.velocity_kmh() as f64 / 3.6;
             let (entry_open, exit_open) =
                 Self::doors_open(b, cabin.entries.len(), cabin.exits.len());
+            self.note_door_motion(BusId::Player, b, &entry_open, &exit_open);
             let (half, centre) = bb_of(b);
             let trailers = part_frames(b, &cabin);
             let terminus = match (b.var("target_index_int"), b.host.hof.as_ref()) {
@@ -3275,6 +3389,7 @@ impl Humans {
                 self.seats
                     .entry(BusId::Ai(c.id))
                     .or_insert_with(|| vec![false; cabin.seats.len()]);
+                self.note_door_motion(BusId::Ai(c.id), &c.vehicle, &entry_open, &exit_open);
                 let (half, centre) = bb_of(&c.vehicle);
                 let trailers = part_frames(&c.vehicle, &cabin);
                 out.push(BusNow {
@@ -4235,7 +4350,7 @@ impl Humans {
         // a standing vehicle in the way: wait, then go round it
         for i in 0..self.people.len() {
             let p = &self.people[i];
-            if remove.contains(&i) || p.puppet.is_some() || p.remote || !matches!(p.state, State::Strolling(_)) {
+            if remove.contains(&i) || p.puppet.is_some() || p.remote || !matches!(p.state, State::Strolling(_)) || p.step_out.is_some() {
                 continue;
             }
             let want = wants[i].vel;
@@ -4352,6 +4467,19 @@ impl Humans {
                     remove.push(i);
                     return Want::stand(None, Activity::Stand);
                 }
+                // [ROLLBACK stepout-70] off a bus: first straight away from its side
+                if let Some((tgt, left)) = self.people[i].step_out {
+                    let pos2 = self.people[i].position.truncate();
+                    let d = tgt - pos2;
+                    if d.length() < 0.25 || left <= 0.0 {
+                        self.people[i].step_out = None;
+                    } else {
+                        self.people[i].step_out = Some((tgt, left - dt));
+                        self.people[i].state = State::Strolling(walk);
+                        let pace = self.people[i].pace;
+                        return Want { vel: d.normalize() * pace, face: None, give: 1.0, corridor: None, idle: Activity::Stand };
+                    }
+                }
                 let w = self.walk_want(i, &mut walk, net, traffic, cars, dt);
                 self.people[i].state = State::Strolling(walk);
                 w
@@ -4371,7 +4499,11 @@ impl Humans {
                         return Want::stand(None, Activity::Stand);
                     }
                 }
-                if !self.seen(self.people[i].position) && self.far_from_players(self.people[i].position, STROLL_RADIUS) {
+                // [ROLLBACK respawn-61] as in OMSI 2, somebody who finds no pavement is respawned
+                // (taken away; the spawner puts a pedestrian where one belongs): at once when out
+                // of sight, after about a second, in sight or not (STANDING_GIVE_UP)
+                let gone = !self.seen(self.people[i].position) && self.far_from_players(self.people[i].position, STROLL_RADIUS);
+                if gone || t >= STANDING_GIVE_UP || (t >= STANDING_GIVE_UP_UNSEEN && !self.seen(self.people[i].position)) {
                     remove.push(i);
                 }
                 Want::stand(None, Activity::Stand)
@@ -6720,6 +6852,26 @@ mod tests {
         v.update(0.02);
         assert_eq!((v.var("PAX_Entry7_Busy"), v.var("PAX_Exit1_Busy")), (Some(0.0), Some(0.0)));
     }
+
+    // [ROLLBACK seatpick-69]
+    #[test]
+    fn seat_choice_follows_ride_age_and_room() {
+        // a long ride sits more than a short one, the elderly nearly always, a full bus less
+        let short = sit_wish(2.0, 40.0, 10, 20, 1.0);
+        let long = sit_wish(15.0, 40.0, 10, 20, 1.0);
+        assert!(short < 0.35 && long > 0.7, "{short} {long}");
+        assert!(sit_wish(2.0, 80.0, 10, 20, 1.0) > 0.85);
+        // the last seats go to those who ride far, not to the ones with a short ride
+        assert!(sit_wish(2.0, 40.0, 1, 20, 1.0) < 0.1 && sit_wish(15.0, 40.0, 1, 20, 1.0) > 0.5);
+        assert!(sit_wish(15.0, 40.0, 1, 20, 1.0) < long);
+        // the setting scales the odds either way
+        assert!(sit_wish(5.0, 40.0, 10, 20, 2.0) > sit_wish(5.0, 40.0, 10, 20, 1.0));
+        assert!(sit_wish(5.0, 40.0, 10, 20, 0.5) < sit_wish(5.0, 40.0, 10, 20, 1.0));
+        // weights pick in proportion, the last one at the end of the range
+        assert_eq!(pick_weighted(&[3, 7], &[1.0, 3.0], 0.1), 3);
+        assert_eq!(pick_weighted(&[3, 7], &[1.0, 3.0], 0.9), 7);
+        assert_eq!(pick_weighted(&[3, 7], &[1.0, 3.0], 0.999_999), 7);
+    }
 }
 
 
@@ -6728,6 +6880,7 @@ mod tests {
 pub struct VoiceLine {
     pub position: DVec3,
     pub path: std::path::PathBuf,
+
 }
 
 /// How much of its probability a day ticket keeps at a time of day (seconds): rising from

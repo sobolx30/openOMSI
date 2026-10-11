@@ -267,6 +267,8 @@ pub(crate) struct App {
     /// air and cabin temperatures, the passengers aboard, the trip and its next stop along
     /// the top of the picture.
     pub(crate) info_bar: bool,
+    /// [ROLLBACK guitoggle-65] The interface layer is hidden (`view_toggle_gui`, Ctrl+Shift+H).
+    pub(crate) gui_hidden: bool,
     /// The developer tools window (a process of its own), when Settings → General has it on.
     pub(crate) devtools: crate::devtools_proc::DevToolsProc,
     /// A time of day the bus's script wrote (`(S.S.Time)`), for the clock at the next frame.

@@ -249,6 +249,10 @@ impl ApplicationHandler for App {
             }
             WindowEvent::CursorMoved { position, .. } => {
                 if self.vr_nav_edit.is_some() { return; }
+                // [ROLLBACK navzoom-72]
+                if let Some(n) = self.navigator.as_mut() {
+                    n.cursor_over(position.x as f32, position.y as f32);
+                }
                 // (both physical pixels)
                 if let Some((x, y)) = self.cursor_hidden {
                     if (position.x as f32 - x).abs() + (position.y as f32 - y).abs() > 8.0 {
@@ -932,10 +936,12 @@ impl ApplicationHandler for App {
                         let k = ((at.x / omsi_map::tile_size()).floor() as i32, (at.y / omsi_map::tile_size()).floor() as i32);
                         w.terrains.read().contains_key(&k) || w.surfaces.read().contains_key(&k)
                     });
+                    // (the walker's cabin walk is on the player's own bus: inside, whatever its boxes)
+                    let own_bus_inside = self.on_foot.as_ref().and_then(|f| f.inside).is_some_and(|(b, _)| b == crate::humans::BusId::Player);
                     if !self.paused && ground_here {
                         // (the sound crossfades between the street and the cab as the
                         // walker's camera goes in or out of the bus)
-                        p.foot_mix = if self.view == "foot" { crate::on_foot::foot_cab_mix(self.camera.as_ref().map(|c| c.position), p) } else { None };
+                        p.foot_mix = if self.view == "foot" { crate::on_foot::foot_cab_mix(self.camera.as_ref().map(|c| c.position), p, own_bus_inside) } else { None };
                         p.tick(
                             dt,
                             self.audio.as_ref(),
@@ -1343,6 +1349,7 @@ impl ApplicationHandler for App {
                     if h.stop_targets.is_none() {
                         h.stop_targets = self.schedule.as_ref().map(|s| s.stop_targets());
                         h.stop_names = self.schedule.as_ref().map(|s| s.stop_names());
+                        h.ride_minutes = self.schedule.as_ref().map(|s| s.ride_minutes());
                         if let Some(t) = &h.stop_targets {
                             log::info!("people: {} bus stops with timetable targets", t.len());
                         }
@@ -1737,7 +1744,10 @@ impl ApplicationHandler for App {
                         // at most, or no further than the mouse had it); let go, it comes back
                         // to the road - held, it went round and round, and the other key never
                         // brought it back straight
-                        let (l, r) = (self.keys.contains(&KeyCode::ArrowLeft), self.keys.contains(&KeyCode::ArrowRight));
+                        // [ROLLBACK camswitch-59] Left/Right that [game] binds to view_interiorcam_*
+                        // switch cameras (input_script.rs) and must not also turn the head
+                        let cam_key = |scan: u32| self.game_keys.iter().any(|b| b.scan_code as u32 == scan && b.action.starts_with("view_interiorcam_"));
+                        let (l, r) = (self.keys.contains(&KeyCode::ArrowLeft) && !cam_key(203), self.keys.contains(&KeyCode::ArrowRight) && !cam_key(205));
                         if l || r {
                             let y = self.look.0 + step * 1.5 * (r as i32 - l as i32) as f32;
                             self.look.0 = if self.view == "pax" { y } else { y.clamp(self.look.0.min(-140.0), self.look.0.max(140.0)) };
@@ -1866,8 +1876,11 @@ impl ApplicationHandler for App {
                     if self.keys.contains(&KeyCode::KeyQ) {
                         v -= Vec3::Z;
                     }
+                    // [ROLLBACK ctrlslow-65] Shift flies faster, Ctrl slower (a fifth of the speed)
                     let boost = if self.keys.contains(&KeyCode::ShiftLeft) {
                         5.0
+                    } else if self.keys.contains(&KeyCode::ControlLeft) || self.keys.contains(&KeyCode::ControlRight) {
+                        0.2
                     } else {
                         1.0
                     };
@@ -1971,6 +1984,11 @@ impl ApplicationHandler for App {
                     vehicles.extend(self.remotes.remotes.values().map(|r| r.vehicle()));
                     let __tc = Instant::now();
                     lights::collect(w, scene, &daylight, cam.position, &vehicles);
+                    // [ROLLBACK flashlight-65] the walker's torch, from the eyes along the look
+                    // (not in the cab: the walker is gone from the map when seated at the wheel)
+                    if self.on_foot.as_ref().is_some_and(|f| f.flashlight) && self.view == "foot" {
+                        lights::push_flashlight(&mut scene.lights, cam.position + glam::DVec3::new(0.0, 0.0, -0.15), cam.forward());
+                    }
                     *self.profile.entry("lights.collect").or_default() += __tc.elapsed().as_secs_f64();
                     // the object editor's pick: a magenta glow over it
                     if let Some(id) = self.editor.as_ref().and_then(|e| e.selected) {
@@ -2305,12 +2323,16 @@ impl ApplicationHandler for App {
                             info_rect: self.ui.as_ref().and_then(|u| u.info_rect).filter(|_| !vr_active),
                         };
                         let __tn = Instant::now();
-                        nav.frame_at(r, scene, &frame, hud[0]);
+                        // [ROLLBACK guitoggle-65] the interface hidden (Ctrl+Shift+H): no map or panel drawn
+                        if !(self.gui_hidden && self.game_menu.is_none() && self.chooser.is_none() && !vr_active) {
+                            nav.frame_at(r, scene, &frame, hud[0]);
+                        }
                         nav.enabled = old_enabled;
                         nav.opacity = old_opacity;
                         *self.profile.entry("hud.navigator").or_default() += __tn.elapsed().as_secs_f64();
                         // OMSI 2's dynamic route arrows over the junctions ahead
-                        if nav.arrows {
+                        // [ROLLBACK helpers-50] the generated ones only with `nav_arrows_auto`
+                        if nav.arrows && self.settings.nav_arrows_auto {
                             if let Some(w) = self.world.as_ref() {
                                 let spots = nav.arrow_spots(self.traffic.as_ref().map(|t| &t.net), 350.0, &|id| w.object_positions.lock().get(&id).map(|p| (p.0, p.1[0])));
                                 self.route_arrows.tick(dt, w, r, scene, &spots);
@@ -2437,6 +2459,8 @@ impl ApplicationHandler for App {
                         // (the game menu's greyed-out lines: the timetable needs an active route)
                         let menu_disabled: &[&str] = &[];
                         let (menu_kind, menu_head, menu_preview) = crate::game_lists::menu_extras(self.list_kind.as_ref(), self.admin_list.as_deref(), chooser_sel, self.schedule.as_ref(), self.clock.time);
+                        // [ROLLBACK guitoggle-65] hidden: only the menus stay
+                        let hide_gui = self.gui_hidden && self.game_menu.is_none() && self.chooser.is_none() && !vr_active;
                         let frame = ui::Frame {
                             scale,
                             ui_scale: ui::size_factor(h, scale, self.settings.ui_scale, self.settings.ui_scale_window),
@@ -2448,11 +2472,11 @@ impl ApplicationHandler for App {
                                 #[cfg(windows)] { self.vr.is_some() }
                                 #[cfg(not(windows))] { false }
                             },
-                            tooltip: tooltip.filter(|_| self.settings.tooltips && !self.dragging && !covered && self.game_menu.is_none()),
+                            tooltip: tooltip.filter(|_| self.settings.tooltips && !self.dragging && !covered && self.game_menu.is_none() && !hide_gui),
                             // (switched off: none, `Settings::notes`; nor over the city map,
                             // whose header they covered once they stood on the timetable's line)
-                            notes: if self.settings.notes && !map_open && self.game_menu.is_none() { &notes } else { &[] },
-                            fps: self.settings.show_fps.then_some(self.fps),
+                            notes: if self.settings.notes && !map_open && self.game_menu.is_none() && !hide_gui { &notes } else { &[] },
+                            fps: self.settings.show_fps.then_some(self.fps).filter(|_| !hide_gui),
                             paused: self.paused,
                             menu: match chooser_sel {
                                 Some(k) => Some((k, &chooser_items[..])),
@@ -2471,15 +2495,15 @@ impl ApplicationHandler for App {
                             menu_top: self.menu_top,
                             // (not over the city map, which has the stops and their times: it
                             // covered the map's zoom and close buttons)
-                            timetable: (self.timetable && !map_open).then(|| timetable_rows(self.duty.as_ref(), self.player.as_ref().map(|p| p.vehicle.host.tt_delay as f64))).flatten(),
-                            info: self.info_bar.then(|| info_line(&self.clock, self.player.as_ref(), self.duty.as_ref(), self.humans.as_ref().map(|h| h.riding()))),
+                            timetable: (self.timetable && !map_open && !hide_gui).then(|| timetable_rows(self.duty.as_ref(), self.player.as_ref().map(|p| p.vehicle.host.tt_delay as f64))).flatten(),
+                            info: (self.info_bar && !hide_gui).then(|| info_line(&self.clock, self.player.as_ref(), self.duty.as_ref(), self.humans.as_ref().map(|h| h.riding()))),
                             info_room: self.touch.info_room.filter(|_| self.touch.enabled),
-                            tutorial: self.tutorial.as_ref().filter(|t| !t.hidden && self.game_menu.is_none()).and_then(|t| t.page().map(|p| (p.title.as_str(), p.text.as_str(), p.image.as_deref(), t.at, t.pages.len()))),
-                            chat,
+                            tutorial: self.tutorial.as_ref().filter(|t| !t.hidden && self.game_menu.is_none() && !hide_gui).and_then(|t| t.page().map(|p| (p.title.as_str(), p.text.as_str(), p.image.as_deref(), t.at, t.pages.len()))),
+                            chat: if hide_gui { None } else { chat },
                             chat_size: self.settings.chat_size,
-                            tags,
+                            tags: if hide_gui { Vec::new() } else { tags },
                             marks: dev_marks,
-                            notices: &self.notices,
+                            notices: if hide_gui { &[][..] } else { &self.notices[..] },
                             notice_anchor: self.navigator.as_ref().and_then(|n| n.screen_rect()),
                         };
                         ui.draw_at(r, scene, &frame, dt, hud[0]);
@@ -3170,6 +3194,11 @@ impl App {
             n.map_wheel(amount, self.cursor.0, self.cursor.1);
             return;
         }
+        // [ROLLBACK navzoom-72] the wheel over the small navigator zooms its map
+        if let Some(n) = self.navigator.as_mut().filter(|n| n.over_panel(self.cursor.0, self.cursor.1)) {
+            n.panel_wheel(amount);
+            return;
+        }
         // the wheel over the chat (or while typing) scrolls its history
         if let Some(ui) = self.ui.as_mut() {
             if self.lan.is_some() && (ui.chat.hovered || lan::chat_open(&self.remotes)) {
@@ -3475,9 +3504,15 @@ fn info_line(clock: &omsi_sim::SimClock, player: Option<&Player>, duty: Option<&
     let t = clock.time;
     let mut parts = vec![format!("{:02}:{:02}:{:02}", ((t / 3600.0) as i64).rem_euclid(24), ((t % 3600.0) / 60.0) as i64, (t % 60.0) as i64)];
     if let Some(p) = player {
-        parts.push(format!("{:.0} km/h", p.vehicle.physics.velocity_kmh().abs()));
+        parts.push(crate::units::speed_text(p.vehicle.physics.velocity_kmh().abs()));
         let (outside, inside) = vehicle_temperatures(p);
         parts.push(format!("EXT {:.0} °C / INT {:.0} °C", outside, inside));
+        // the odometer (the bus's kmcounter: whole km and the metres beyond)
+        if let Some(km) = p.vehicle.var("kmcounter_km").filter(|v| v.is_finite()) {
+            let m = p.vehicle.var("kmcounter_m").filter(|v| v.is_finite()).unwrap_or(0.0);
+            // (the tenth is cut off, not rounded, and the thousands set apart: 1 433 243.3 km)
+            parts.push(format!("ODO {}", crate::units::odometer(km.trunc() as i64, m.floor() as i64)));
+        }
         // the tank as the bus's script says it (OMSI's RL_TankContent: tank_percent)
         if let Some(tank) = p.vehicle.var("tank_percent").filter(|v| v.is_finite()) {
             parts.push(format!("tank {:.0} %", (tank * 100.0).round()));

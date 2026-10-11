@@ -82,6 +82,9 @@ pub(crate) struct OnFoot {
     pub arrive: Option<Then>,
     /// Down on the knees (C, #1148): the eyes low, for a picture from below.
     pub kneel: bool,
+    /// [ROLLBACK flashlight-65] The torch is on (`walk_flashlight`, F); it goes out with the walker
+    /// (sitting at the wheel ends this state).
+    pub flashlight: bool,
     /// How far down the eyes are on their way (0 standing .. 1 kneeling).
     pub crouch: f32,
 }
@@ -166,16 +169,73 @@ impl OnFoot {
 /// How far in the own bus the walker's camera is, for the sound (1 in the bus, 0 outside, a
 /// smooth fall over the stretch from a little inside its walls to a metre outside them -
 /// across a door the sound goes from the cab's to the street's as the camera does).
-pub(crate) fn foot_cab_mix(cam: Option<DVec3>, p: &crate::player::Player) -> Option<f32> {
+///
+/// [ROLLBACK footsound-46] Before: only the box of the first section (`p.vehicle`) counted, so in the
+/// second section of an articulated bus (and in its joint, which has no box) the sound went out into the
+/// street. Now: (1) the walker's own flag - `inside_own_bus`, the cabin walk is on the player's bus - says
+/// 1 whatever the boxes are (a bus with a wrong `[boundingbox]` sounds right too); (2) else the highest of
+/// the boxes of every section and of a bridge over each joint (centre to centre, as wide as the narrower
+/// section), so that the crossfade at a door works as before.
+pub(crate) fn foot_cab_mix(cam: Option<DVec3>, p: &crate::player::Player, inside_own_bus: bool) -> Option<f32> {
+    if inside_own_bus {
+        return Some(1.0);
+    }
     let cam = cam?;
-    let bb = p.vehicle.ty.def.bounding_box?;
-    let o = Obb::from_box(bb, p.vehicle.position, p.vehicle.heading);
-    let rel = cam.truncate() - o.center;
-    let (sh, ch) = o.heading.sin_cos();
-    let (x, y) = (rel.x * ch - rel.y * sh, rel.x * sh + rel.y * ch);
-    let outside = (x.abs() - o.half.x).max(y.abs() - o.half.y);
-    let t = ((outside + 0.4) / 1.4).clamp(0.0, 1.0);
-    Some((1.0 - t * t * (3.0 - 2.0 * t)) as f32)
+    let mix_of = |o: &Obb| -> f32 {
+        let rel = cam.truncate() - o.center;
+        let (sh, ch) = o.heading.sin_cos();
+        let (x, y) = (rel.x * ch - rel.y * sh, rel.x * sh + rel.y * ch);
+        let outside = (x.abs() - o.half.x).max(y.abs() - o.half.y);
+        let t = ((outside + 0.4) / 1.4).clamp(0.0, 1.0);
+        (1.0 - t * t * (3.0 - 2.0 * t)) as f32
+    };
+    let mut sections: Vec<Obb> = Vec::new();
+    if let Some(bb) = p.vehicle.ty.def.bounding_box {
+        sections.push(Obb::from_box(bb, p.vehicle.position, p.vehicle.heading));
+    }
+    for t in &p.vehicle.trailers {
+        if let Some(bb) = t.ty.def.bounding_box {
+            sections.push(Obb::from_box(bb, t.position, t.heading));
+        }
+    }
+    if sections.is_empty() {
+        return None;
+    }
+    let mut best = sections.iter().map(&mix_of).fold(0.0f32, f32::max);
+    for w in sections.windows(2) {
+        let d = w[1].center - w[0].center;
+        let len = d.length();
+        if len > 1e-3 {
+            let bridge = Obb { center: (w[0].center + w[1].center) * 0.5, half: DVec2::new(w[0].half.x.min(w[1].half.x), len * 0.5), heading: d.x.atan2(d.y), z0: 0.0, z1: 0.0, velocity: DVec2::ZERO, mass: 0.0, pole: None, id: -1 };
+            best = best.max(mix_of(&bridge));
+        }
+    }
+    Some(best)
+}
+
+/// [ROLLBACK walkcoll-48] The boxes a walker meets of one vehicle: its own, those of its coupled sections and
+/// a bridge over each joint (centre to centre, as wide as the narrower section: the joint has no box of its
+/// own, so that one could walk into the bellows from outside). Before, only `ty.def.bounding_box` of the first
+/// section counted and the second section of an articulated bus could be walked through.
+fn vehicle_sections(v: &omsi_sim::VehicleInstance) -> Vec<Obb> {
+    let mut sections: Vec<Obb> = Vec::new();
+    if let Some(bb) = v.ty.def.bounding_box {
+        sections.push(Obb::from_box(bb, v.position, v.heading));
+    }
+    for t in &v.trailers {
+        if let Some(bb) = t.ty.def.bounding_box {
+            sections.push(Obb::from_box(bb, t.position, t.heading));
+        }
+    }
+    let mut all = sections.clone();
+    for w in sections.windows(2) {
+        let d = w[1].center - w[0].center;
+        let len = d.length();
+        if len > 1e-3 {
+            all.push(Obb { center: (w[0].center + w[1].center) * 0.5, half: DVec2::new(w[0].half.x.min(w[1].half.x), len * 0.5), heading: d.x.atan2(d.y), z0: w[0].z0, z1: w[0].z1, velocity: DVec2::ZERO, mass: 0.0, pole: None, id: -1 });
+        }
+    }
+    all
 }
 
 fn wrap(a: f64) -> f64 {
@@ -225,10 +285,9 @@ fn outside_spot(h: &mut Humans, world: Option<&crate::scene::World>, v: &omsi_si
 /// Where one stands outside vehicle `v` by its door (outside point) `door`: clear of the
 /// body, on the ground; None where a wall or another vehicle is in the way.
 fn outside_at(world: Option<&crate::scene::World>, v: &omsi_sim::VehicleInstance, others: &[Obb], door: DVec3) -> Option<DVec3> {
-    let own = v.ty.def.bounding_box.map(|bb| Obb::from_box(bb, v.position, v.heading));
     let mut p = door.truncate();
-    // clear of the own bus's body
-    if let Some(o) = own.as_ref() {
+    // clear of the own bus's body (every section and joint: [ROLLBACK walkcoll-48], before the first section's box alone)
+    for o in vehicle_sections(v).iter() {
         p = push_out(p, o, RADIUS + 0.15);
     }
     let z = world.and_then(|w| w.walk_height_near(p.x, p.y, v.position.z)).unwrap_or(v.position.z);
@@ -258,11 +317,12 @@ impl App {
     fn vehicle_boxes(&self, at: DVec2, r: f64) -> Vec<Obb> {
         let mut boxes = Vec::new();
         let mut add = |v: &omsi_sim::VehicleInstance| {
-            if (v.position.truncate() - at).length() > r {
-                return;
-            }
-            if let Some(bb) = v.ty.def.bounding_box {
-                boxes.push(Obb::from_box(bb, v.position, v.heading));
+            // [ROLLBACK walkcoll-48] before: `if (v.position.truncate() - at).length() > r { return; }` and the first
+            // section's box alone
+            for o in vehicle_sections(v) {
+                if (o.center - at).length() <= r + o.half.x.max(o.half.y) {
+                    boxes.push(o);
+                }
             }
         };
         if let Some(p) = self.player.as_ref() {
@@ -295,8 +355,8 @@ impl App {
         // the other vehicles round the own bus (room to step out)
         let others: Vec<Obb> = {
             let at = self.player.as_ref().map(|p| p.vehicle.position.truncate()).unwrap_or_default();
-            let own = self.player.as_ref().and_then(|p| p.vehicle.ty.def.bounding_box.map(|bb| Obb::from_box(bb, p.vehicle.position, p.vehicle.heading)));
-            self.vehicle_boxes(at, 30.0).into_iter().filter(|o| own.map(|w| (w.center - o.center).length() > 0.01).unwrap_or(true)).collect()
+            let own: Vec<Obb> = self.player.as_ref().map(|p| vehicle_sections(&p.vehicle)).unwrap_or_default();
+            self.vehicle_boxes(at, 30.0).into_iter().filter(|o| !own.iter().any(|w| (w.center - o.center).length() <= 0.01)).collect()
         };
         let Some(p) = self.player.as_mut() else { return };
         p.axes.release_all();
@@ -380,6 +440,7 @@ impl App {
             transit,
             arrive: None,
             kneel: false,
+            flashlight: false,
             crouch: 0.0,
         });
         self.view = "foot".into();
@@ -395,8 +456,8 @@ impl App {
         let spot = if bus == BusId::Player {
             // out of the side the walker looks at (else the side of the nearest door)
             let others: Vec<Obb> = {
-                let own = self.player.as_ref().and_then(|p| p.vehicle.ty.def.bounding_box.map(|bb| Obb::from_box(bb, p.vehicle.position, p.vehicle.heading)));
-                self.vehicle_boxes(pos.truncate(), 30.0).into_iter().filter(|o| own.map(|w| (w.center - o.center).length() > 0.01).unwrap_or(true)).collect()
+                let own: Vec<Obb> = self.player.as_ref().map(|p| vehicle_sections(&p.vehicle)).unwrap_or_default();
+                self.vehicle_boxes(pos.truncate(), 30.0).into_iter().filter(|o| !own.iter().any(|w| (w.center - o.center).length() <= 0.01)).collect()
             };
             match (self.player.as_ref(), self.humans.as_mut()) {
                 (Some(p), Some(h)) => {
@@ -509,6 +570,7 @@ impl App {
             transit: None,
             arrive: None,
             kneel: false,
+            flashlight: false,
             crouch: 0.0,
         });
         self.view = "foot".into();
@@ -756,6 +818,17 @@ impl App {
             }
             return false;
         }
+        // [ROLLBACK guitoggle-68] the interface key (Ctrl+Shift+H unless moved) works on foot too:
+        // the walker takes every key before the [game] list is looked at
+        if pressed && !repeat {
+            let alt = self.keys.contains(&KeyCode::AltLeft) || self.keys.contains(&KeyCode::AltRight);
+            let m = omsi_content::input::chord(shift, ctrl, alt);
+            let hit = crate::keys::dik_code(code).is_some_and(|sc| self.game_keys.iter().any(|b| b.action.eq_ignore_ascii_case("view_toggle_gui") && b.scan_code == sc && b.matches(m)));
+            if hit {
+                self.gui_hidden = !self.gui_hidden;
+                return true;
+            }
+        }
         match code {
             // the game's own keys stay (menu, pause, screenshots, chat)
             KeyCode::Escape | KeyCode::F12 | KeyCode::KeyP | KeyCode::KeyV | KeyCode::Slash => false,
@@ -799,7 +872,7 @@ impl App {
             }
             // the free camera's keys are its own
             _ if self.on_foot.as_ref().map(|f| f.cam == FootCam::Free).unwrap_or(false) => false,
-            KeyCode::KeyG => {
+            _ if self.walk_is(code, "walk_use") => {
                 if pressed && !repeat {
                     if ctrl && shift && self.on_foot.as_ref().map(|f| f.inside.is_some()).unwrap_or(false) {
                         self.step_out();
@@ -809,7 +882,7 @@ impl App {
                 }
                 true
             }
-            KeyCode::Space => {
+            _ if self.walk_is(code, "walk_jump") => {
                 if let (true, false, Some(f)) = (pressed, repeat, self.on_foot.as_mut()) {
                     // (on the knees: up first)
                     if f.kneel {
@@ -820,9 +893,18 @@ impl App {
                 }
                 true
             }
-            KeyCode::KeyC => {
+            _ if self.walk_is(code, "walk_kneel") => {
                 if pressed && !repeat {
                     self.kneel();
+                }
+                true
+            }
+            // [ROLLBACK flashlight-65] the torch
+            _ if self.walk_is(code, "walk_flashlight") => {
+                if pressed && !repeat {
+                    if let Some(f) = self.on_foot.as_mut() {
+                        f.flashlight = !f.flashlight;
+                    }
                 }
                 true
             }
@@ -830,6 +912,35 @@ impl App {
             // pavement)
             _ => true,
         }
+    }
+
+    /// [ROLLBACK walkkeys-65] The scan code of a walking action: the player's binding in the
+    /// `[game]` list (0 = cleared), the stock key where the file has none.
+    fn walk_scan(&self, action: &str) -> i32 {
+        let stock = match action {
+            "walk_forward" => 17,
+            "walk_back" => 31,
+            "walk_left" => 30,
+            "walk_right" => 32,
+            "walk_use" => 34,
+            "walk_jump" => 57,
+            "walk_kneel" => 46,
+            "walk_flashlight" => 33,
+            _ => 0,
+        };
+        self.game_keys.iter().find(|b| b.action.eq_ignore_ascii_case(action)).map(|b| b.scan_code).unwrap_or(stock)
+    }
+
+    /// Whether `code` is the key of the walking action `action`.
+    fn walk_is(&self, code: KeyCode, action: &str) -> bool {
+        let scan = self.walk_scan(action);
+        scan != 0 && crate::keys::dik_code(code) == Some(scan)
+    }
+
+    /// Whether the key of the walking action `action` is held.
+    fn walk_held(&self, action: &str) -> bool {
+        let scan = self.walk_scan(action);
+        scan != 0 && self.keys.iter().any(|k| crate::keys::dik_code(*k) == Some(scan))
     }
 
     /// C on foot (or the screen's button): down on the knees for a picture from low down, or
@@ -872,6 +983,7 @@ impl App {
             _ => {}
         }
         let Some(mut f) = self.on_foot.take() else { return };
+        let walk = [self.walk_held("walk_forward"), self.walk_held("walk_back"), self.walk_held("walk_right"), self.walk_held("walk_left")];
         let dt64 = dt as f64;
         f.ease_crouch(dt);
         let key = |k: KeyCode| self.keys.contains(&k);
@@ -932,16 +1044,17 @@ impl App {
             let y = (f.yaw as f64).to_radians();
             let (fwd, right) = (DVec2::new(y.sin(), y.cos()), DVec2::new(y.cos(), -y.sin()));
             let mut dir = DVec2::ZERO;
-            if key(KeyCode::KeyW) {
+            // [ROLLBACK walkkeys-65] the keys of Controls → Walking (W A S D unless moved)
+            if walk[0] {
                 dir += fwd;
             }
-            if key(KeyCode::KeyS) {
+            if walk[1] {
                 dir -= fwd;
             }
-            if key(KeyCode::KeyD) {
+            if walk[2] {
                 dir += right;
             }
-            if key(KeyCode::KeyA) {
+            if walk[3] {
                 dir -= right;
             }
             let run = key(KeyCode::ShiftLeft) || key(KeyCode::ShiftRight);
@@ -1263,6 +1376,7 @@ mod tests {
             transit: None,
             arrive: None,
             kneel: false,
+            flashlight: false,
             crouch: 0.0,
         }
     }

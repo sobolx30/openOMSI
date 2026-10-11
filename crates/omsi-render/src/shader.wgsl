@@ -538,6 +538,17 @@ fn vertex_specular(wp: vec3<f32>, n: vec3<f32>) -> array<vec3<f32>, 2> {
     return out;
 }
 
+// [ROLLBACK zbow-57]
+const ZBOW_PLANAR: bool = true;
+// [ROLLBACK zpull-60] The pull towards the eye is a share of the distance (0.3 %: 30 cm at 100 m),
+// which swallowed whatever lay within that height beyond some distance - a road a few
+// centimetres over another showed through, hid, or did both at once as the camera moved.
+// Now the share is a tenth of that and capped at a few centimetres, so a surface that is
+// really higher wins at every distance and the pull only breaks ties between flush layers.
+// `ZPULL_SHARE` 0.003 and `ZPULL_CAP` 1000 give the old pull back.
+const ZPULL_SHARE: f32 = 0.0006;
+const ZPULL_CAP: f32 = 0.03;
+
 @vertex
 fn vs_main(in: VsIn) -> VsOut {
     let e = draw_list[in.inst];
@@ -564,8 +575,23 @@ fn vs_main(in: VsIn) -> VsOut {
         // over the road it lies on - with the road's own pull alone the two fought for
         // every pixel and the road mostly won; a few centimetres more bring it through the
         // road and still leave it behind the body and the wheels standing on it)
-        let decal = select(select(0.0, 0.01 + 0.001 * d, surf > 1.1 && surf < 1.5), 0.05 + 0.002 * d, surf > 1.5);
-        let pull = min(0.003 * d + decal, d * 0.3);
+        // [ROLLBACK zbow-57] The fixed part of the decals' pull (1 cm, 5 cm for the blob) was taken
+        // along each vertex's own line of sight, which is not a translation: across a large
+        // triangle seen from close by, the lines of sight differ by tens of degrees and the
+        // pulled triangle bows (the 2 cm of #1196 made it millimetres, the 1 cm still makes a
+        // few near the eye). A big asphalt triangle was pulled over the small triangles of
+        // the markings laid 2 mm above it, close up and at an angle, and the markings vanished
+        // (far off the lines of sight are parallel and nothing bows). The share of the way
+        // alone is a scaling about the eye, which keeps every triangle a plane, and with the
+        // depth buffer's float precision (millionths of a metre close up, reversed Z) its
+        // 0.1 % over the splines (0.2 % for the blob) is margin enough. `ZBOW_PLANAR` false:
+        // the old fixed part again.
+        let fixed = select(select(0.0, 0.01, surf > 1.1 && surf < 1.5), 0.05, surf > 1.5);
+        // [ROLLBACK zpull-60] base pull, and for the layers laid on the road the same again
+        // (twice for the blob), each capped: height wins over distance
+        let step = min(ZPULL_SHARE * d, ZPULL_CAP);
+        let layers = select(select(0.0, 1.0, surf > 1.1 && surf < 1.5), 2.0, surf > 1.5);
+        let pull = min(step * (1.0 + layers) + select(fixed, 0.0, ZBOW_PLANAR), d * 0.3);
         cp = wp.xyz - to / max(d, 1e-3) * pull;
     }
     out.clip = camera.view_proj * vec4<f32>(cp, 1.0);

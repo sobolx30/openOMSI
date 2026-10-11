@@ -350,8 +350,9 @@ impl App {
                 // plain Left/Right are OMSI's view_interiorcam_minus/plus, except when a wheel
                 // steers: then the arrows glance (held, the head turns) and only Ctrl+Left/Right
                 // switch the interior camera, below. (Where the arrows drive, `ours` skips this.)
-                let plain_arrow = matches!(code, KeyCode::ArrowLeft | KeyCode::ArrowRight) && !ctrl
-                    && self.controllers.as_ref().is_some_and(|c| c.wheel_steering());
+                // [ROLLBACK camswitch-59] the exemption is gone: plain Left/Right switch the interior
+                // camera whenever [game] binds them so (a wheel no longer turns them into a glance)
+                let plain_arrow = false;
                 // (the keys that fly the camera are the camera's, unmodified: S, OMSI's
                 // view_toggle_viewpoint, threw the free camera back to the driver's view,
                 // and with no bus of one's own every view flies - #868; a chord such as
@@ -364,6 +365,7 @@ impl App {
                 if let Some(scan) = keys::dik_code(code).filter(|_| !ours && !flying && !mirror_aim) {
                     let action = self.game_keys.iter().find(|b| b.scan_code == scan && b.matches(m)
                         && !b.action.starts_with("vr_")
+                        && !b.action.starts_with("walk_")
                         && !(plain_arrow && b.action.starts_with("view_interiorcam_"))).map(|b| b.action.clone());
                     // (a key bound in [game] and in [vehicles] does both, as in Omsi.exe: the
                     // parking brake put on Space, the stock view_reset_all_directions key,
@@ -418,7 +420,8 @@ impl App {
 
                     // the duty's next stop given up (#1015), as the game menu's line ("H" for
                     // Haltestelle: Ctrl+Shift+N is the VR navigator's)
-                    KeyCode::KeyH if ctrl && shift_now && !alt && self.duty.is_some() && !self.chord_bound(code, shift_now, ctrl, alt) => {
+                    // [ROLLBACK guitoggle-65] Ctrl+Alt+H now: Ctrl+Shift+H hides the interface
+                    KeyCode::KeyH if ctrl && alt && !shift_now && self.duty.is_some() && !self.chord_bound(code, shift_now, ctrl, alt) => {
                         self.skip_next_stop();
                         return;
                     }
@@ -1989,7 +1992,8 @@ impl App {
 
     /// A click on box `i` of the destination form: typing starts in it.
     pub(crate) fn dest_field_click(&mut self, i: usize) {
-        crate::game_lists::dest_begin(self, i.min(2) as u8);
+        // (the boxes are in the window's order: `DEST_ORDER`)
+        crate::game_lists::dest_begin(self, crate::game_lists::DEST_ORDER[i.min(crate::game_lists::DEST_ORDER.len() - 1)]);
         log::info!("destination form: box {i} clicked (typing: {:?})", self.dest_form.field);
         self.refresh_list();
     }
@@ -2018,6 +2022,11 @@ impl App {
                 crate::game_lists::dest_clear(self);
                 self.close_list_menu();
             }
+            // [ROLLBACK destwin-67] another depot file (.hof) for this bus
+            2 => {
+                crate::game_lists::dest_commit(self);
+                self.open_list(crate::game_lists::ListKind::Hofs);
+            }
             _ => self.close_list_menu(),
         }
     }
@@ -2032,7 +2041,7 @@ impl App {
     /// destination as long as a display takes.
     fn route_edit_limit(&self) -> usize {
         match (&self.list_kind, self.dest_form.field) {
-            (Some(crate::game_lists::ListKind::Destinations), Some(1 | 2)) => 40,
+            (Some(crate::game_lists::ListKind::Destinations), Some(1 | 2 | 3 | 4)) => 40,
             _ => 8,
         }
     }
@@ -3047,7 +3056,7 @@ impl App {
     }
 
     /// The duty gives up the stop it is due at and goes on with the one after it (the game
-    /// menu's "Skip the next stop", Ctrl+Shift+H): the IBIS moves on with it, as it does
+    /// menu's "Skip the next stop", Ctrl+Alt+H): the IBIS moves on with it, as it does
     /// when a bus page sets the next stop.
     pub(crate) fn skip_next_stop(&mut self) {
         let Some(d) = self.duty.as_mut() else { return };
@@ -3740,6 +3749,8 @@ impl App {
                 }
             }
             "view_toggle_informationdisplay" => self.set_info_bar(!self.info_bar),
+            // [ROLLBACK guitoggle-65] the interface layer on and off (the game menu stays)
+            "view_toggle_gui" => self.gui_hidden = !self.gui_hidden,
             // (Omsi.exe's camera reset, 0x7edde4, puts back the field of view with the
             // direction: the zoom goes as well, #244)
             "view_reset_direction" => {
@@ -3773,6 +3784,9 @@ impl App {
                     && (self.look != (0.0, 0.0) || self.view_zoom.contains_key(&self.view));
                 if let Some(p) = self.player.as_mut() {
                     p.cam_choice = (0, 0);
+                    // [ROLLBACK viewreset-59] a special camera taken earlier must not be "returned
+                    // to" later: Space is the way home
+                    p.cam_before_special = None;
                 }
                 self.orbit = ORBIT_DEFAULT;
                 if eyed {
@@ -3789,7 +3803,12 @@ impl App {
                     self.look = (0.0, 0.0);
                     self.view_looks.clear();
                     self.view_zoom.clear();
+                    // [ROLLBACK viewreset-59] the look bookkeeping follows the camera change too
+                    self.look_view = self.look_key();
                 }
+                // [ROLLBACK viewreset-60] shown, so it is plain whether the key arrived
+                self.service_msg = Some(("View reset: main camera".into(), 1.5));
+                log::info!("view_reset_all_directions: camera choice (0, 0), view {}", self.view);
             }
             // the next (or the previous) view mode, driver - passenger - outside - map and
             // round again; nothing on foot (Omsi.exe 0x706278 @0x70634a: (mode + 1) and 3,
@@ -3853,7 +3872,7 @@ impl App {
     pub(crate) fn chord_bound(&self, code: KeyCode, shift: bool, ctrl: bool, alt: bool) -> bool {
         let m = omsi_content::input::chord(shift, ctrl, alt);
         let Some(scan) = keys::dik_code(code) else { return false };
-        self.game_keys.iter().any(|b| b.scan_code == scan && b.matches(m))
+        self.game_keys.iter().any(|b| b.scan_code == scan && b.matches(m) && !b.action.starts_with("walk_"))
             || self.player.as_ref().is_some_and(|p| p.bindings.iter().any(|b| b.scan_code == scan && b.matches(m)))
     }
 

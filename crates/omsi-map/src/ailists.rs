@@ -500,3 +500,275 @@ mod chrono_hof_tests {
         assert_eq!(at(19891201), "Spandau 1989-12");
     }
 }
+
+/// [ROLLBACK ailist-73] Editing `ailists.cfg` as text: the launcher's AI list page. The file is
+/// handled as bytes by lines, and a line it does not change is kept as it was (the file's code
+/// page too); a block is switched off by renaming its keyword (`[off_aigroup_depot_typgroup_2]`),
+/// which both OMSI 2 and openOMSI pass over like any other keyword they do not know.
+pub mod edit {
+    /// One `[aigroup_depot_typgroup]` / `_2` block: the buses of one vehicle file a depot has.
+    #[derive(Debug, Clone, PartialEq, Default)]
+    pub struct TypBlock {
+        /// The depot group it follows (`[aigroup_depot]`'s name; empty before any).
+        pub depot: String,
+        /// The vehicle file as written in the block.
+        pub file: String,
+        /// The `_2` form (number, plate, repaint and the dates, tab-separated).
+        pub v2: bool,
+        pub enabled: bool,
+        /// The entry lines (fleet numbers), as written.
+        pub entries: Vec<String>,
+        /// Line indices of its keyword and of its `[end]`.
+        pub head: usize,
+        pub end: usize,
+    }
+
+    fn lines_of(bytes: &[u8]) -> Vec<&[u8]> {
+        bytes.split_inclusive(|b| *b == b'\n').collect()
+    }
+
+    fn text(line: &[u8]) -> String {
+        String::from_utf8_lossy(line).trim().to_string()
+    }
+
+    /// The line's keyword (lower case, without the brackets), when it is one.
+    fn keyword(line: &[u8]) -> Option<String> {
+        let t = text(line).to_ascii_lowercase();
+        let t = t.strip_prefix('[')?.strip_suffix(']')?;
+        Some(t.to_string())
+    }
+
+    /// The names of the depot groups (`[aigroup_depot]`), in file order.
+    pub fn depots(bytes: &[u8]) -> Vec<String> {
+        let lines = lines_of(bytes);
+        (0..lines.len()).filter(|&i| keyword(lines[i]).as_deref() == Some("aigroup_depot")).filter_map(|i| lines.get(i + 1)).map(|l| text(l)).collect()
+    }
+
+    /// Every typgroup block of the file, switched off ones too.
+    pub fn typ_blocks(bytes: &[u8]) -> Vec<TypBlock> {
+        let lines = lines_of(bytes);
+        let mut out = Vec::new();
+        let mut depot = String::new();
+        let mut i = 0;
+        while i < lines.len() {
+            let Some(k) = keyword(lines[i]) else {
+                i += 1;
+                continue;
+            };
+            if k == "aigroup_depot" {
+                depot = lines.get(i + 1).map(|l| text(l)).unwrap_or_default();
+                i += 3;
+                continue;
+            }
+            let (enabled, base) = match k.strip_prefix("off_") {
+                Some(b) => (false, b.to_string()),
+                None => (true, k.clone()),
+            };
+            if base == "aigroup_depot_typgroup" || base == "aigroup_depot_typgroup_2" {
+                let file = lines.get(i + 1).map(|l| text(l)).unwrap_or_default();
+                let mut entries = Vec::new();
+                let mut j = i + 2;
+                while j < lines.len() && !text(lines[j]).eq_ignore_ascii_case("[end]") {
+                    let l = text(lines[j]);
+                    if !l.is_empty() {
+                        entries.push(String::from_utf8_lossy(lines[j]).trim_end_matches(['\r', '\n']).to_string());
+                    }
+                    j += 1;
+                }
+                out.push(TypBlock { depot: depot.clone(), file, v2: base.ends_with("_2"), enabled, entries, head: i, end: j.min(lines.len().saturating_sub(1)) });
+                i = j + 1;
+                continue;
+            }
+            i += 1;
+        }
+        out
+    }
+
+    fn eol(lines: &[&[u8]], at: usize) -> &'static [u8] {
+        if lines.get(at).is_some_and(|l| l.ends_with(b"\r\n")) {
+            b"\r\n"
+        } else {
+            b"\n"
+        }
+    }
+
+    fn join(lines: &[Vec<u8>]) -> Vec<u8> {
+        lines.concat()
+    }
+
+    /// The file with the block whose keyword is on line `head` switched on or off.
+    pub fn set_enabled(bytes: &[u8], head: usize, on: bool) -> Vec<u8> {
+        let mut lines: Vec<Vec<u8>> = lines_of(bytes).into_iter().map(|l| l.to_vec()).collect();
+        let Some(line) = lines.get_mut(head) else { return bytes.to_vec() };
+        let Some(open) = line.iter().position(|b| *b == b'[') else { return bytes.to_vec() };
+        let rest = &line[open + 1..];
+        let off = rest.len() >= 4 && rest[..4].eq_ignore_ascii_case(b"off_");
+        if on && off {
+            line.drain(open + 1..open + 5);
+        } else if !on && !off {
+            for (k, b) in b"off_".iter().enumerate() {
+                line.insert(open + 1 + k, *b);
+            }
+        }
+        join(&lines)
+    }
+
+    /// One more entry line at the end of the block that starts on line `head`.
+    pub fn add_entry(bytes: &[u8], head: usize, entry: &str) -> Vec<u8> {
+        let Some(b) = typ_blocks(bytes).into_iter().find(|b| b.head == head) else { return bytes.to_vec() };
+        let lines = lines_of(bytes);
+        let mut out: Vec<Vec<u8>> = lines.iter().map(|l| l.to_vec()).collect();
+        let nl = eol(&lines, head);
+        let mut new = entry.as_bytes().to_vec();
+        new.extend_from_slice(nl);
+        // (an [end] that is the file's last line without a newline keeps its place)
+        out.insert(b.end.min(out.len()), new);
+        join(&out)
+    }
+
+    /// The last entry line of the block that starts on line `head` taken out (at least one is
+    /// left: a block without a bus is not a block).
+    pub fn remove_last_entry(bytes: &[u8], head: usize) -> Vec<u8> {
+        let Some(b) = typ_blocks(bytes).into_iter().find(|b| b.head == head) else { return bytes.to_vec() };
+        if b.entries.len() <= 1 {
+            return bytes.to_vec();
+        }
+        let lines = lines_of(bytes);
+        let Some(at) = (b.head + 2..b.end).rev().find(|&k| !text(lines[k]).is_empty()) else { return bytes.to_vec() };
+        let out: Vec<Vec<u8>> = lines.iter().enumerate().filter(|(k, _)| *k != at).map(|(_, l)| l.to_vec()).collect();
+        join(&out)
+    }
+
+    /// A new typgroup of vehicle file `file` with `entries`, after the last block of depot group
+    /// `depot` (right after the group's own lines when it has none). The file unchanged when
+    /// there is no such depot group.
+    pub fn add_block(bytes: &[u8], depot: &str, file: &str, entries: &[String]) -> Vec<u8> {
+        let lines = lines_of(bytes);
+        let Some(d) = (0..lines.len()).find(|&i| keyword(lines[i]).as_deref() == Some("aigroup_depot") && lines.get(i + 1).is_some_and(|l| text(l) == depot)) else { return bytes.to_vec() };
+        let blocks = typ_blocks(bytes);
+        let after = blocks.iter().filter(|b| b.depot == depot && b.head > d).map(|b| b.end + 1).max().unwrap_or(d + 3).min(lines.len());
+        let nl = eol(&lines, d);
+        let mut block: Vec<u8> = Vec::new();
+        let mut push = |s: &str| {
+            block.extend_from_slice(s.as_bytes());
+            block.extend_from_slice(nl);
+        };
+        push("[aigroup_depot_typgroup_2]");
+        push(file);
+        for e in entries {
+            push(e);
+        }
+        push("[end]");
+        let mut out: Vec<Vec<u8>> = lines.iter().map(|l| l.to_vec()).collect();
+        // (the line before ends without a newline: give it one)
+        if after > 0 && !out[after - 1].ends_with(b"\n") {
+            out[after - 1].extend_from_slice(nl);
+        }
+        out.insert(after, block);
+        join(&out)
+    }
+
+    /// A `_2` entry line for fleet number `number` with plate `plate`.
+    pub fn entry_line(number: &str, plate: &str) -> String {
+        entry_line_paint(number, plate, "")
+    }
+
+    /// [ROLLBACK ailist-75] The same with the repaint (the paint scheme's name) in the third field.
+    pub fn entry_line_paint(number: &str, plate: &str, paint: &str) -> String {
+        format!("{number}\t{plate}\t{paint}\t\t")
+    }
+
+    /// The first fleet number of `offered` (number, plate) that the block's `entries` do not
+    /// have yet as an entry line, else one past the highest number there.
+    pub fn next_entry(entries: &[String], offered: &[(String, String)]) -> String {
+        let used: Vec<String> = entries.iter().map(|e| e.split('\t').next().unwrap_or("").trim().to_ascii_lowercase()).collect();
+        if let Some((n, p)) = offered.iter().find(|(n, _)| !used.contains(&n.trim().to_ascii_lowercase())) {
+            return entry_line(n.trim(), p);
+        }
+        let top = used.iter().filter_map(|u| u.parse::<u32>().ok()).max().unwrap_or(0);
+        entry_line(&format!("{:03}", top + 1), "")
+    }
+
+    /// [ROLLBACK ailist-77] `next_entry` with the repaint of the block's last entry: one more
+    /// bus of a type is painted as the one before it.
+    pub fn next_entry_like(entries: &[String], offered: &[(String, String)]) -> String {
+        let line = next_entry(entries, offered);
+        let paint = entries.iter().rev().find(|e| !e.trim().is_empty()).and_then(|e| e.split('\t').nth(2)).map(str::trim).unwrap_or("");
+        if paint.is_empty() {
+            return line;
+        }
+        let mut f: Vec<&str> = line.split('\t').collect();
+        if f.len() > 2 {
+            f[2] = paint;
+        }
+        f.join("\t")
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        const FILE: &str = "[aigroup_depot_typgroup_2]\r\nvehicles\\a\\a.bus\r\n101\tAB 101\t\t\t\r\n102\tAB 102\t\t\t\r\n[end]\r\n\r\n[aigroup_depot]\r\nBusses\r\nmy.hof\r\n\r\n[aigroup_depot_typgroup_2]\r\nvehicles\\b\\b.bus\r\n201\tCD 201\t\t\t\r\n[end]\r\n";
+
+        #[test]
+        fn the_blocks_are_found_with_their_depot() {
+            let b = typ_blocks(FILE.as_bytes());
+            assert_eq!(b.len(), 2);
+            assert_eq!((b[0].depot.as_str(), b[0].entries.len(), b[0].enabled), ("", 2, true));
+            assert_eq!((b[1].depot.as_str(), b[1].file.as_str(), b[1].v2), ("Busses", "vehicles\\b\\b.bus", true));
+            assert_eq!(depots(FILE.as_bytes()), vec!["Busses".to_string()]);
+        }
+
+        #[test]
+        fn a_switched_off_block_is_passed_over_by_the_loader_and_comes_back() {
+            let off = set_enabled(FILE.as_bytes(), typ_blocks(FILE.as_bytes())[1].head, false);
+            let s = String::from_utf8(off.clone()).unwrap();
+            assert!(s.contains("[off_aigroup_depot_typgroup_2]\r\n"));
+            assert_eq!(typ_blocks(&off)[1].enabled, false);
+            let parsed = super::super::AiLists::parse(&omsi_cfg::CfgFile::from_str("ailists.cfg", &s));
+            assert_eq!(parsed.groups.iter().map(|g| g.typgroups.len()).sum::<usize>(), 0, "the first block is before any group, the second is off");
+            let on = set_enabled(&off, typ_blocks(&off)[1].head, true);
+            assert_eq!(on, FILE.as_bytes());
+        }
+
+        #[test]
+        fn entries_are_added_and_taken_out_at_the_end_of_the_block() {
+            let h = typ_blocks(FILE.as_bytes())[1].head;
+            let more = add_entry(FILE.as_bytes(), h, &entry_line("202", "CD 202"));
+            let b = typ_blocks(&more);
+            assert_eq!(b[1].entries, vec!["201\tCD 201\t\t\t".to_string(), "202\tCD 202\t\t\t".to_string()]);
+            assert_eq!(remove_last_entry(&more, h), FILE.as_bytes());
+            assert_eq!(remove_last_entry(FILE.as_bytes(), h), FILE.as_bytes(), "the last bus stays");
+        }
+
+        #[test]
+        fn a_bus_type_is_added_after_the_depot_s_blocks() {
+            let out = add_block(FILE.as_bytes(), "Busses", "vehicles\\c\\c.bus", &[entry_line("301", "EF 301")]);
+            let b = typ_blocks(&out);
+            assert_eq!(b.len(), 3);
+            assert_eq!((b[2].depot.as_str(), b[2].file.as_str(), b[2].entries.len()), ("Busses", "vehicles\\c\\c.bus", 1));
+            assert_eq!(add_block(FILE.as_bytes(), "Nobody", "x.bus", &[]), FILE.as_bytes());
+        }
+
+        #[test]
+        fn an_entry_can_name_its_repaint() {
+            assert_eq!(entry_line_paint("5", "AB 5", "Red"), "5\tAB 5\tRed\t\t");
+            let e = crate::DepotEntry::parse(&entry_line_paint("5", "AB 5", "Red"));
+            assert_eq!((e.number.as_str(), e.registration.as_str(), e.paint.as_str()), ("5", "AB 5", "Red"));
+        }
+
+        #[test]
+        fn one_more_bus_keeps_the_repaint_of_the_last() {
+            let e = vec!["101\tAB 101\tRed\t\t".to_string()];
+            assert_eq!(next_entry_like(&e, &[]), "102\t\tRed\t\t");
+            assert_eq!(next_entry_like(&["101".to_string()], &[]), "102\t\t\t\t");
+        }
+
+        #[test]
+        fn the_next_number_is_one_the_block_lacks() {
+            let offered = vec![("101".to_string(), "AB 101".to_string()), ("103".to_string(), "AB 103".to_string())];
+            assert_eq!(next_entry(&["101\tAB 101\t\t\t".to_string()], &offered), "103\tAB 103\t\t\t");
+            assert_eq!(next_entry(&["101".to_string(), "7".to_string()], &[]), "102\t\t\t\t");
+        }
+    }
+}

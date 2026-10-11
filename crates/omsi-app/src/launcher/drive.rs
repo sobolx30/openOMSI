@@ -16,21 +16,21 @@ use omsi_ui::paint::Align;
 use omsi_ui::{Color, Rect, Weight};
 
 #[derive(Clone)]
-struct BusVariant {
-    file: String,
-    name: String,
-    variant: String,
+pub(super) struct BusVariant {
+    pub(super) file: String,
+    pub(super) name: String,
+    pub(super) variant: String,
     fresh: bool,
     installed: bool,
-    paints: usize,
+    pub(super) paints: usize,
     incomplete: bool,
 }
 
 #[derive(Clone)]
-struct BusManufacturer {
-    key: String,
-    name: String,
-    variants: Vec<BusVariant>,
+pub(super) struct BusManufacturer {
+    pub(super) key: String,
+    pub(super) name: String,
+    pub(super) variants: Vec<BusVariant>,
 }
 
 #[derive(Default)]
@@ -745,7 +745,7 @@ fn map_labels(l: &mut Launcher, map: Rect, avoid: &[Rect]) {
 
 /// OMSI takes the manufacturer and the complete type from [friendlyname]. The
 /// vehicle folder and rendering configuration do not define this hierarchy.
-fn build_bus_manufacturers(vehicles: &[omsi_launcher_lib::VehicleInfo], allowed: Option<&std::collections::HashSet<String>>, fresh: &std::collections::HashSet<String>) -> Vec<BusManufacturer> {
+pub(super) fn build_bus_manufacturers(vehicles: &[omsi_launcher_lib::VehicleInfo], allowed: Option<&std::collections::HashSet<String>>, fresh: &std::collections::HashSet<String>) -> Vec<BusManufacturer> {
     let mut grouped = std::collections::BTreeMap::<String, BusManufacturer>::new();
     for vehicle in vehicles {
         if !allowed.map(|a| a.contains(&vehicle.file.replace('\\', "/").to_lowercase())).unwrap_or(true) {

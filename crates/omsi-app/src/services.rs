@@ -23,7 +23,12 @@ pub(crate) fn run_export(args: &Args, out: &PathBuf) -> Result<()> {
     export::export_glb(&args.root, &vt, &vehicle, scheme, out)
 }
 
-/// Does the vehicle's box overlap one of the loaded `[petrolstation]` objects? That is
+/// [ROLLBACK fuelreach-69] How near (m) to a `[petrolstation]` object's box the vehicle's may be
+/// for the pump, the wash and the repair to count it as there: a pump or a charger often stands
+/// a little beside the box, and the bus had to be driven into the object.
+pub(crate) const PETROL_REACH: f64 = 5.0;
+
+/// Does the vehicle's box overlap (or come within `PETROL_REACH` of) one of the loaded `[petrolstation]` objects? That is
 /// OMSI's test for the pump, the wash and a repair without travel time.
 pub(crate) fn at_petrol_station(world: &World, v: &omsi_sim::VehicleInstance) -> bool {
     let f = crate::lan::footprint_of(v, [2.5, 11.5, 3.0, 0.0, 0.0, 1.5]);
@@ -44,7 +49,8 @@ pub(crate) fn at_petrol_station(world: &World, v: &omsi_sim::VehicleInstance) ->
             log::info!("petrol station box at ({:.1}, {:.1}) {:.1} x {:.1} m: bus {:.1} m away", p.center.x, p.center.y, p.half.x * 2.0, p.half.y * 2.0, me.separation(p));
         }
     }
-    stations.iter().any(|p| me.separation(p) < 0.0)
+    // [ROLLBACK fuelreach-69] within `PETROL_REACH` of the box, not only inside it
+    stations.iter().any(|p| me.separation(p) < PETROL_REACH)
 }
 
 /// One frame of the fuel pump (Omsi.exe 0x6fefbc / 0x7d5120). The pump is a switch: the menu

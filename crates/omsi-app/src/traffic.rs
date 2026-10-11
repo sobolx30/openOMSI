@@ -6205,6 +6205,8 @@ impl Traffic {
             let priority_warning = car.vehicle.var("TrafficPriority").is_some_and(|v| v > 0.5)
                 && (lead_now.is_some_and(|l| l.gap < PRIORITY_WARN_GAP && l.speed < car.state.speed + 0.5)
                     || stop_at.is_some_and(|x| x - car.state.front < PRIORITY_WARN_GAP));
+            // [ROLLBACK aiparked-73] a long layover at the terminus: engine off
+            car.vehicle.ai_parked = car.bus.as_ref().is_some_and(|b| b.parked(self.day_time));
             frames[i] = Some(AiFrame {
                 speed: car.state.speed,
                 odometer: car.state.odometer,
@@ -6612,11 +6614,12 @@ impl Traffic {
                     v.var_slot(n).and_then(|i| vals.get(i).copied())
                 };
                 ss.update_fired(audio, &|n| v.var(n), &xf, &fired, &at_fire);
-                ss.update_parts(
+                ss.update_parts_fired(
                     audio,
                     &|n| v.var(n),
                     &|i| v.trailers.get(i).map(|t| t.world_transform()),
                     &fired,
+                    &at_fire,
                 );
                 for (t, f) in &fired_files {
                     ss.play_file_trigger(audio, t, f, &|n| v.var(n), &xf);

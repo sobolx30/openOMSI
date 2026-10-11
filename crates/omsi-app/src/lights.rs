@@ -333,6 +333,13 @@ const COOKIE_PLAIN_COLOUR: [f32; 3] = [255.0, 255.0, 233.0];
 const COOKIE_CONE_INNER_DEG: f32 = 30.0;
 const COOKIE_CONE_OUTER_DEG: f32 = 100.0;
 
+/// [ROLLBACK flashlight-65] The walker's torch at `at` shining along `d`.
+pub(crate) fn push_flashlight(lights: &mut Vec<PointLight>, at: DVec3, d: Vec3) {
+    // (colour 255/245/220, 35 m, a 10 degree hot spot inside a 45 degree cone)
+    let vals: [f32; 12] = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 255.0, 245.0, 220.0, 35.0, 10.0, 45.0];
+    push_spot(lights, at, d, &vals, 0.5, 1.0);
+}
+
 /// The lights of one headlamp at `at` shining along `d`, with a `[spotlight]`'s numbers
 /// (`vals`: colour 6-8, range 9, inner and outer cone 10 and 11) and `share` of its light.
 fn push_spot(lights: &mut Vec<PointLight>, at: DVec3, d: Vec3, vals: &[f32; 12], share: f32, night: f32) {

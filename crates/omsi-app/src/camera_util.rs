@@ -251,7 +251,12 @@ pub(crate) fn follow_camera(traffic: Option<&traffic::Traffic>, id: u64) -> Opti
 /// `render_mirrors`): measured in the window at 23:30, the mirrors' street, the bus's own
 /// flank and the sky then match the enhanced picture beside them (0.45 left them 2-3 times
 /// as bright).
-const MIRROR_NIGHT_DIM: f32 = 0.8;
+/// [ROLLBACK mirrorlevel-53] was 0.8 and linear in the sun's darkness: now the mirrors follow
+/// the eye adaptation (up to 1.7x at night), so the full-night dimming is taken further
+/// (0.88: 0.12 of the light is left, 0.2 before), and `MIRROR_DUSK_CURVE` keeps the dusk
+/// brighter (1 = the old linear fall; the darkness is squared at 2).
+const MIRROR_NIGHT_DIM: f32 = 0.88;
+const MIRROR_DUSK_CURVE: f32 = 3.0;
 
 /// The least radius a mirror's camera counts with in the visibility test (m). A mirror's
 /// camera sits in the middle of its glass; with the file's radius 0 (`[add_camera_reflexion]`)
@@ -397,7 +402,7 @@ pub(crate) fn render_mirrors(
     if lighting.enhanced && omsi_cfg::env::var_os("OMSI_MIRROR_ENHANCED").is_none() {
         let alt = lighting.sun_dir.z.clamp(-1.0, 1.0).asin().to_degrees();
         let dark = 1.0 - ((alt + 6.0) / 12.0).clamp(0.0, 1.0);
-        let k = 1.0 - MIRROR_NIGHT_DIM * dark;
+        let k = 1.0 - MIRROR_NIGHT_DIM * dark.powf(MIRROR_DUSK_CURVE);
         lighting.ambient *= k;
         lighting.secondary *= k;
         lighting.sun_color *= k;

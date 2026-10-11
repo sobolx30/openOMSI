@@ -1752,7 +1752,7 @@ pub fn name_tags(
             _ => String::new(),
         };
         if d > 25.0 {
-            let dist = if d >= 1000.0 { format!("{:.1} km", d / 1000.0) } else { format!("{:.0} m", d) };
+            let dist = crate::units::distance(d as f64, 0.0);
             sub = if sub.is_empty() { dist } else { format!("{sub} · {dist}") };
         }
         if speaks(&r.name, r.last.id) {

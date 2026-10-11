@@ -236,6 +236,10 @@ fn trip_stations(trip: &omsi_timetable::Trip) -> Vec<i64> {
         .collect()
 }
 
+/// [ROLLBACK nexttrip-73] Seconds after its departure from the first stop that a trip is still
+/// offered as the next one.
+const NEXT_TRIP_GRACE: f64 = 20.0;
+
 /// How far from a route a bus stop may stand when the route is only a part of the trip (a
 /// stop of the missing part would otherwise be put on the nearest point of this one).
 const STOP_REACH: f64 = 25.0;
@@ -1733,6 +1737,30 @@ impl Schedule {
     /// The name each bus stop object has in the timetable (`Busstops.cfg`, the first entry
     /// of an object id): what [`Schedule::stop_targets`] calls it. The map object's own
     /// label can read otherwise (renamed in the editor, another code page than the tiles').
+    /// [ROLLBACK ridemin-71] The minutes a bus needs between two stops by name, from the trips'
+    /// times (the shortest over the trips that call at both, the first stop's departure to the
+    /// second's arrival): how far a passenger rides who wants from one to the other.
+    pub fn ride_minutes(&self) -> HashMap<(String, String), f32> {
+        let names = self.stop_names();
+        let name_of = |id: i64| names.get(&id).cloned().unwrap_or_else(|| id.to_string());
+        let mut out: HashMap<(String, String), f32> = HashMap::new();
+        for (ti, t) in self.data.trips.iter().enumerate() {
+            let Some(times) = self.times.get(ti).and_then(|v| v.first()) else { continue };
+            let stations = trip_stations(t);
+            for (k, a) in stations.iter().enumerate() {
+                let Some(ta) = times.stations.get(k) else { continue };
+                for (m, b) in stations.iter().enumerate().skip(k + 1) {
+                    let Some(tb) = times.stations.get(m) else { continue };
+                    let minutes = ((tb.0 - ta.1) / 60.0).max(0.0) as f32;
+                    let key = (name_of(*a), name_of(*b));
+                    let e = out.entry(key).or_insert(minutes);
+                    *e = e.min(minutes);
+                }
+            }
+        }
+        out
+    }
+
     pub fn stop_names(&self) -> HashMap<i64, String> {
         let mut names = HashMap::new();
         for b in &self.data.bus_stops {
@@ -3644,18 +3672,23 @@ impl Schedule {
     }
 
     /// The position (in order of departure, as `tour_trip_stops` counts) of the trip of a
-    /// tour that is under way or next to leave at `now` (seconds of the day).
+    /// tour next to leave its first stop at `now` (seconds of the day): one that has left
+    /// already (a few minutes ago) is not offered. [ROLLBACK nexttrip-73] With none left today,
+    /// the last trip of the day.
     pub fn tour_trip_now(&self, line: &str, tour: &str, now: f64) -> usize {
         let all = self.tour_stops(line, tour);
         let mut order: Vec<(usize, f64, f64)> = Vec::new();
         for s in &all {
             match order.iter_mut().find(|o| o.0 == s.0) {
-                Some(o) => o.2 = o.2.max(s.3),
+                Some(o) => {
+                    o.1 = o.1.min(s.3);
+                    o.2 = o.2.max(s.3);
+                }
                 None => order.push((s.0, s.3, s.3)),
             }
         }
         order.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal).then(a.0.cmp(&b.0)));
-        order.iter().position(|o| o.2 >= now - 60.0).unwrap_or(0)
+        order.iter().position(|o| o.1 >= now - NEXT_TRIP_GRACE).unwrap_or(order.len().saturating_sub(1))
     }
 
     /// All the stops of the trip in position `pos` of the tour's trips in order of the time
@@ -3673,17 +3706,12 @@ impl Schedule {
         all.into_iter().filter(|s| s.0 == k).collect()
     }
 
-    /// The stops of the trip of a tour that is under way or next to start at `now` (seconds
-    /// of the day): the first trip with a stop still to come (a minute of grace), and only
-    /// that trip's stops from there on. A tour with nothing left today lists its first trip
-    /// whole. Same entries and numbering as `tour_stops`.
+    /// The stops of the trip of a tour that is next to leave its first stop at `now` (seconds
+    /// of the day), whole (see `tour_trip_now`). Same entries and numbering as `tour_stops`.
     pub fn tour_stops_from(&self, line: &str, tour: &str, now: f64) -> Vec<(usize, usize, String, f64)> {
-        let all = self.tour_stops(line, tour);
-        let limit = now - 60.0;
-        let Some(k) = all.iter().find(|s| s.3 >= limit).map(|s| s.0).or_else(|| all.first().map(|s| s.0)) else { return Vec::new() };
-        let trip: Vec<_> = all.into_iter().filter(|s| s.0 == k).collect();
-        let rest: Vec<_> = trip.iter().filter(|s| s.3 >= limit).cloned().collect();
-        if rest.is_empty() { trip } else { rest }
+        // [ROLLBACK nexttrip-73] the trip next to leave its first stop, whole
+        let pos = self.tour_trip_now(line, tour, now);
+        self.tour_trip_stops(line, tour, pos)
     }
 
     /// The player drives this tour (line and tour as `player_duty` names them): OMSI leaves

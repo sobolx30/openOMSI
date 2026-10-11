@@ -2296,6 +2296,9 @@ pub struct RenderOptions {
     /// With `ray_tracing`: which surfaces get traced reflections - 0 none, 1 the player's vehicle
     /// (and the wet roads, whose puddles have no other picture in a ray tracing build), 2 all; 0: the wet roads only.
     pub rt_reflections: u8,
+    /// Enhanced: the lamps' light wraps round the terminator and comes back from the lit ground to the
+    /// surfaces that face away from the lamp (`LAMP_WRAP`, `LAMP_BOUNCE` in enhanced.wgsl).
+    pub lamp_fill: bool,
 }
 
 impl Default for RenderOptions {
@@ -2317,6 +2320,7 @@ impl Default for RenderOptions {
             ray_tracing: false,
             rt_shadows: true,
             rt_reflections: 2,
+            lamp_fill: true,
         }
     }
 }
@@ -7081,6 +7085,14 @@ impl Renderer {
         };
         self.exposure = Some(log_exposure);
         let pre = log_exposure.exp();
+        // OMSI_DEBUG_MIRRORS: what the mirrors' share of the eye is made of, about twice a second
+        if omsi_cfg::env::var_os("OMSI_DEBUG_MIRRORS").is_some() {
+            static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % 30 == 0 {
+                let alt = lighting.sun_dir.z.clamp(-1.0, 1.0).asin().to_degrees();
+                log::info!("mirror eye: sun {alt:+.1} deg, pre {pre:.2} (log2 {:.2}), asked {:.2} (log2 {:.2}), transient {:.3}", pre.log2(), target.exp(), target.exp().log2(), pre / target.exp());
+            }
+        }
         // the fog's in-scattered light: a white sphere's average in this light
         let axes = [Vec3::X, -Vec3::X, Vec3::Y, -Vec3::Y, Vec3::Z, -Vec3::Z];
         let avg = axes
@@ -7170,7 +7182,9 @@ impl Renderer {
                 // the tone curve's contrast, which self-lit pictures undo (`display_level`)
                 tone_contrast(log_exposure),
             ],
-            eye: eye_off.extend(0.0).to_array(),
+            // (w: the pre-exposure the light asks for, before the eye's 1.5 s of getting there, for
+            // the mirrors' share of it - [ROLLBACK mirroreye-55] see `mirror_dusk_gain`)
+            eye: eye_off.extend(target.exp()).to_array(),
             // x how bright an LED panel's dots burn (see `MaterialExtra::led`; the settings'
             // 16 levels give 0 = off .. 3.75), y whether the LED panels' `\S:n` masks keep
             // their mip chain (0: at full resolution, the dots stay visible when small)
@@ -7180,7 +7194,8 @@ impl Renderer {
                 // z: the player's own panes mirror the cabin from inside it (Enhanced+, experimental;
                 // `OMSI_CAB_REFLECTION=0` switches it off)
                 omsi_cfg::env::var("OMSI_CAB_REFLECTION").ok().map(|v| if v.trim() == "0" { 0.0 } else { 1.0 }).unwrap_or(1.0),
-                0.0,
+                // w: the lamps' fill light (RenderOptions::lamp_fill)
+                if self.options.lamp_fill { 1.0 } else { 0.0 },
             ],
             moon: lighting.moon_dir.normalize_or_zero().extend(MOON_RADIUS).to_array(),
             // (w of the first: the veil's optical depth, which the sky draws as the high

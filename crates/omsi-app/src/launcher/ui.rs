@@ -201,6 +201,8 @@ struct Popup {
     /// Typed while the list is open: only the options with it in their name are shown (a
     /// map's many entry points, #747).
     query: String,
+    /// [ROLLBACK widelist-67] The width the longest option wants (px), so that no name is cut.
+    wide: f32,
 }
 
 impl Popup {
@@ -749,7 +751,8 @@ impl Ui {
             } else if open {
             } else {
                 let sel = (*selected).min(options.len().saturating_sub(1));
-                let mut p = Popup { id, anchor: r, options: options.to_vec(), selected: sel, scroll: 0.0, opened: 0.0, picked: None, drag: None, query: String::new() };
+                let mut p = Popup { id, anchor: r, options: options.to_vec(), selected: sel, scroll: 0.0, opened: 0.0, picked: None, drag: None, query: String::new(), wide: 0.0 };
+                p.wide = self.options_width(options);
                 // the chosen option in view
                 let row = 34.0;
                 let visible = popup_rect(&p, self.size).h;
@@ -759,10 +762,26 @@ impl Ui {
             }
         } else if let Some(p) = self.popup.as_mut().filter(|p| p.id == id) {
             // the options may change while it is open
+            let again = p.options.len() != options.len();
             p.options = options.to_vec();
             p.anchor = r;
+            if again {
+                p.wide = -1.0;
+            }
+        }
+        if self.popup.as_ref().is_some_and(|p| p.id == id && p.wide < 0.0) {
+            let w = self.options_width(options);
+            if let Some(p) = self.popup.as_mut() {
+                p.wide = w;
+            }
         }
         changed
+    }
+
+    /// [ROLLBACK widelist-67] How wide a dropdown has to be for its longest option: the text,
+    /// the margins, the tick and the scroll bar.
+    fn options_width(&self, options: &[String]) -> f32 {
+        options.iter().map(|o| self.width(o, 13.0, Weight::Regular)).fold(0.0, f32::max) + 10.0 + 36.0 + 14.0 + 8.0
     }
 
     /// A text field. Returns true when the text changed.
@@ -1399,7 +1418,11 @@ fn popup_rect(p: &Popup, size: Vec2) -> Rect {
     let h = (p.options.len() as f32 * row + 8.0).min(320.0);
     let below = p.anchor.bottom() + 6.0;
     let y = if below + h > size.y - 10.0 { (p.anchor.y - 6.0 - h).max(10.0) } else { below };
-    Rect::new(p.anchor.x, y, p.anchor.w.max(200.0), h)
+    // [ROLLBACK widelist-67] as wide as the longest option wants, and moved left where it would
+    // run off the screen
+    let w = p.anchor.w.max(200.0).max(p.wide).min((size.x - 20.0).max(200.0));
+    let x = p.anchor.x.min(size.x - w - 10.0).max(10.0);
+    Rect::new(x, y, w, h)
 }
 
 fn date_rect(p: &DatePopup, size: Vec2) -> Rect {

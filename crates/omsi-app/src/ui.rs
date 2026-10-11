@@ -988,7 +988,7 @@ impl Ui {
             let lh = labels.iter().map(|l| l.h).max().unwrap_or(0) as f32;
             let (w, h) = (lw + pad * 2.0, lh * labels.len() as f32 + pad * 0.8);
             let x = (x0 + x1 - w) * 0.5;
-            let plate = self.text.plate(r, scene, 3);
+            let plate = self.text.plate(r, scene, 10);
             scene.overlays.push((plate, [x, y, x + w, y + h]));
             for (k, l) in labels.iter().enumerate() {
                 let (lx, ly) = (x + (w - l.w as f32) * 0.5, y + pad * 0.4 + k as f32 * lh);
@@ -1180,6 +1180,8 @@ impl TextCache {
             5 => vec![255, 255, 255, 28],
             // a hairline between groups (the card's border colour)
             9 => vec![255, 255, 255, 15],
+            // [ROLLBACK info-78] the information bar: dark and see-through
+            10 => vec![14, 14, 14, 205],
             // the picture dimmed behind the menu
             6 => vec![0, 0, 0, 120],
             // behind a note or the tooltip (the old HUD's 40 %)
@@ -1188,7 +1190,7 @@ impl TextCache {
         };
         // the backgrounds - the panels, the chat's box, the plates - as the opacity setting
         // has them (`backdrop`); the accent, the lines and the dimming stay as they are
-        if matches!(kind, 0 | 3 | 7) {
+        if matches!(kind, 0 | 3 | 7 | 10) {
             rgba[3] = (rgba[3] as f32 * self.backdrop).round().clamp(0.0, 255.0) as u8;
         }
         let key = ("\u{0}plate".to_string(), kind as u32, [rgba[0], rgba[1], rgba[2], rgba[3]]);
@@ -1740,11 +1742,20 @@ impl Ui {
         let pane_w = if preview.is_some() {
             (if timetable_kind { 320.0 } else { 340.0 }) * s
         } else if form.is_some() {
-            300.0 * s
+            // [ROLLBACK destwin-67] wider: the depot file's name and the boxes
+            420.0 * s
         } else {
             0.0
         };
-        let want = if timetable_kind { 360.0 * s } else { 380.0 * s };
+        let mut want = if timetable_kind { 360.0 * s } else { 380.0 * s };
+        // [ROLLBACK widelist-67] a list is as wide as its longest name wants (a vehicle's or a
+        // destination's was cut at 380), within the screen
+        if !timetable_kind {
+            let item_px = 16.0 * s;
+            let widest = items.iter().map(|&(_, l)| self.text.width(l, item_px)).fold(0.0f32, f32::max);
+            let needed = widest + PAD * s * 2.0 + TEXT_IN * s * 2.0 + 40.0 * s;
+            want = want.max(needed.min((f.width - 24.0 * s - pane_w).max(want.min(f.width * 0.6))));
+        }
         let w = (want + pane_w).min(f.width - 24.0 * s).max(200.0 * s);
         let list_w = w - pane_w;
         let header_h = 72.0 * s;
@@ -1759,7 +1770,7 @@ impl Ui {
         let back_footer = (timetable_kind || kind == MenuKind::List) && items.last().is_some_and(|&(id, l)| id == "back" && l == back_txt.as_str());
         let nl = items.len() - back_footer as usize;
         let foot_h = if back_footer { 48.0 * s } else { 0.0 };
-        let fixed_h = matches!(kind, MenuKind::Lines | MenuKind::Tours | MenuKind::List).then(|| if f.vr { f.height * 0.60 } else { (520.0 * s).min(f.height * 0.94) });
+        let fixed_h = matches!(kind, MenuKind::Lines | MenuKind::Tours | MenuKind::List).then(|| if f.vr { f.height * 0.60 } else { ((if form.is_some() { 660.0 } else { 520.0 }) * s).min(f.height * 0.94) });
         let room = match fixed_h {
             Some(fh) => fh - header_h - pad - foot_h,
             None => f.height * (if f.vr { 0.60 } else { 0.92 }) - header_h - pad - 8.0 * s,
@@ -2136,7 +2147,7 @@ impl Ui {
             top += 30.0 * s;
             let lpx = (11.0 * s) as u32;
             let vpx = (15.0 * s) as u32;
-            let box_h = 36.0 * s;
+            let box_h = 30.0 * s;
             for (i, (label, value, active)) in fv.fields.iter().enumerate() {
                 let lab = clip_to(&self.text, label, lpx as f32, inner);
                 self.put(r, scene, &lab, lpx, MUTED, px0 + ipad, top + 6.0 * s);
@@ -2149,10 +2160,10 @@ impl Ui {
                 let shown = if *active { tail_to(&self.text, &format!("{value}_"), vpx as f32, room) } else { clip_to(&self.text, value, vpx as f32, room) };
                 self.put(r, scene, &shown, vpx, if *active { WHITE } else { SOFT }, rect[0] + 10.0 * s, (rect[1] + rect[3]) * 0.5);
                 self.menu_form_fields.push(rect);
-                top += box_h + 12.0 * s;
+                top += box_h + 8.0 * s;
             }
-            let bh = 34.0 * s;
-            let gap_b = 8.0 * s;
+            let bh = 32.0 * s;
+            let gap_b = 6.0 * s;
             let nb = fv.buttons.len();
             let mut by = py1 - 12.0 * s - bh * nb as f32 - gap_b * nb.saturating_sub(1) as f32;
             for (j, label) in fv.buttons.iter().enumerate() {
@@ -2414,7 +2425,10 @@ impl Ui {
             let down = fits(below) >= want || fits(below) >= fits(above);
             let n_vis = (if down { fits(below) } else { fits(above) }).max(1);
             let ph = n_vis as f32 * item_h + 2.0 * inner;
-            let pw = (300.0 * s).min(cx1 - cx0);
+            // [ROLLBACK widelist-67] as wide as the longest entry wants, growing to the left over
+            // the window (a vehicle's name was cut at 300)
+            let want_w = dd.items.iter().map(|t| self.text.width(t, 14.0 * s)).fold(0.0f32, f32::max) + TEXT_IN * s * 2.0 + inner * 2.0 + 16.0 * s;
+            let pw = want_w.max(300.0 * s).min((cx1 - 6.0 * s - (x + 8.0 * s)).max(cx1 - cx0));
             let (px1, py0) = (cx1 - 6.0 * s, if down { row_b + 4.0 * s } else { ry - 4.0 * s - ph });
             let px0 = px1 - pw;
             let panel = [px0, py0, px1, py0 + ph];

@@ -121,9 +121,17 @@ pub(crate) struct DestForm {
     pub line: String,
     pub top: String,
     pub bottom: String,
-    /// 0 the route number, 1 the upper line, 2 the lower line.
+    /// [ROLLBACK destwin-67] The two search boxes over the list: by the ZIEL code, by the name.
+    pub find_code: String,
+    pub find_name: String,
+    /// 0 the route number, 1 the upper line, 2 the lower line, 3 the search by code, 4 the
+    /// search by name.
     pub field: Option<u8>,
 }
+
+/// [ROLLBACK destwin-67] The boxes of the destination window from the top: the two searches,
+/// then the route number and the two lines (the numbers of `DestForm::field`).
+pub(crate) const DEST_ORDER: [u8; 5] = [3, 4, 0, 1, 2];
 
 /// What is being typed goes into its field of the form.
 pub(crate) fn dest_commit(app: &mut App) {
@@ -132,6 +140,8 @@ pub(crate) fn dest_commit(app: &mut App) {
         Some(0) => app.dest_form.line = t.trim().to_string(),
         Some(1) => app.dest_form.top = t,
         Some(2) => app.dest_form.bottom = t,
+        Some(3) => app.dest_form.find_code = t.trim().to_string(),
+        Some(4) => app.dest_form.find_name = t,
         _ => {}
     }
 }
@@ -142,6 +152,8 @@ pub(crate) fn dest_begin(app: &mut App, n: u8) {
     app.menu_edit = Some(match n {
         0 => app.dest_form.line.clone(),
         1 => app.dest_form.top.clone(),
+        3 => app.dest_form.find_code.clone(),
+        4 => app.dest_form.find_name.clone(),
         _ => app.dest_form.bottom.clone(),
     });
     app.dest_form.field = Some(n);
@@ -152,8 +164,9 @@ pub(crate) fn dest_begin(app: &mut App, n: u8) {
 pub(crate) fn dest_next_field(app: &mut App) {
     let was = app.dest_form.field;
     dest_commit(app);
-    if let Some(n) = was.filter(|n| *n < 2) {
-        dest_begin(app, n + 1);
+    // (in the order of the window; after the last box none)
+    if let Some(at) = was.and_then(|n| DEST_ORDER.iter().position(|o| *o == n)).filter(|at| at + 1 < DEST_ORDER.len()) {
+        dest_begin(app, DEST_ORDER[at + 1]);
     }
 }
 
@@ -292,10 +305,19 @@ pub(crate) fn dest_form_view(player: Option<&crate::player::Player>, menu_edit: 
         }
     };
     let line_value = if f.line.is_empty() { now.as_str() } else { f.line.as_str() };
+    // [ROLLBACK destwin-67] the depot file in use is named in the title; two searches on top;
+    // a button for another depot file
+    let hof_name = p.vehicle.host.hof.as_ref().and_then(|h| h.path.file_name()).map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
     Some(crate::ui::FormView {
-        title: tr("Display"),
-        fields: vec![field(0, &tr("Route number"), line_value), field(1, &tr("Destination, upper line"), &f.top), field(2, &tr("Destination, lower line"), &f.bottom)],
-        buttons: vec![tr("Select"), tr("Clear display"), tr("Close")],
+        title: format!("{}  -  {} {}", tr("Display"), tr("depot file"), hof_name),
+        fields: vec![
+            field(3, &tr("Search by ZIEL code"), &f.find_code),
+            field(4, &tr("Search by destination name"), &f.find_name),
+            field(0, &tr("Route number"), line_value),
+            field(1, &tr("Destination, upper line"), &f.top),
+            field(2, &tr("Destination, lower line"), &f.bottom),
+        ],
+        buttons: vec![tr("Select"), tr("Clear display"), tr("Change depot file (.hof)"), tr("Close")],
     })
 }
 
@@ -447,6 +469,8 @@ fn hof_label(p: &std::path::Path) -> String {
 const SPEEDS: [f64; 5] = [1.0, 2.0, 4.0, 8.0, 15.0];
 pub(crate) const TRAFFIC: [usize; 7] = [0, 10, 20, 30, 50, 80, 120];
 const PAX: [f32; 6] = [0.25, 0.5, 0.75, 1.0, 1.5, 2.0];
+/// [ROLLBACK seatpick-69] Passengers' wish to sit (0: the original's random place).
+const PAX_SIT: [f32; 7] = [0.0, 0.5, 0.75, 1.0, 1.25, 1.5, 2.0];
 const VOLUME: [f32; 6] = [0.0, 0.2, 0.4, 0.6, 0.8, 1.0];
 /// The pedal strengths the options step through (see `settings::pedal_curve`).
 const PEDAL: [f32; 7] = [0.5, 0.7, 0.85, 1.0, 1.25, 1.5, 2.0];
@@ -653,16 +677,33 @@ pub(crate) fn items(app: &App, kind: &ListKind) -> Vec<(String, String)> {
                     .real_termini()
                     .iter()
                     .enumerate()
-                    .map(|(i, t)| (t.menu_name(), t.code, i))
+                    // [ROLLBACK destwin-67] the first string under the ZIEL number (the identifier)
+                    .map(|(i, t)| (if t.texture_id.trim().is_empty() { t.menu_name() } else { t.texture_id.trim().to_string() }, t.code, i))
                     .collect();
                 // (alphabetical, by name; picked by its row: several may share a name or a code)
                 termini.sort_by_key(|(name, ..)| name.trim().to_lowercase());
+                // [ROLLBACK destwin-67] the two searches (the box being typed in counts as it is typed)
+                let live = |n: u8, kept: &str| match (app.dest_form.field, app.menu_edit.as_ref()) {
+                    (Some(f), Some(t)) if f == n => t.trim().to_lowercase(),
+                    _ => kept.trim().to_lowercase(),
+                };
+                let (by_code, by_name) = (live(3, &app.dest_form.find_code), live(4, &app.dest_form.find_name));
                 for (name, code, i) in termini {
-                    out.push((format!("{:>3}  {}", code, name.trim()), format!("dest {i}")));
+                    let t = &hof.real_termini()[i];
+                    if !by_code.is_empty() && !code.to_string().contains(&by_code) {
+                        continue;
+                    }
+                    if !by_name.is_empty() {
+                        let hay = format!("{} {}", name, t.strings.join(" ")).to_lowercase();
+                        if !hay.contains(&by_name) {
+                            continue;
+                        }
+                    }
+                    out.push((format!("{:>4}  {}", code, name.trim()), format!("dest {i}")));
                 }
             }
             if out.is_empty() {
-                out.push((tr("This bus has no depot file (.hof) with destinations"), "back".into()));
+                out.push((tr("No destination matches (or this bus has no depot file with destinations)"), "back".into()));
             }
         }
         ListKind::RouteNumbers => {
@@ -1229,6 +1270,7 @@ fn steps_of(verb: &str) -> Option<Vec<f32>> {
         "speed" => SPEEDS.iter().map(|&v| v as f32).collect(),
         "traffic" => TRAFFIC.iter().map(|&v| v as f32).collect(),
         "pax" => PAX.to_vec(),
+        "pax_sit" => PAX_SIT.to_vec(),
         "volume" => VOLUME.to_vec(),
         "led_glow" => (0..16).map(|v| v as f32).collect(),
         "radio_fx_speaker" | "radio_fx_noise" | "radio_fx_dropouts" => (0..=20).map(|v| v as f32 * 0.05).collect(),
@@ -1381,6 +1423,7 @@ fn option_now(app: &App, verb: &str, arg: &str) -> Option<f32> {
         "speed" => s.time_speed as f32,
         "traffic" => app.traffic.as_ref()?.target as f32,
         "pax" => s.pax_density,
+        "pax_sit" => s.pax_sit,
         "volume" => s.volume,
         "led_glow" => s.led_glow as f32,
         "led_mips" => s.led_mips,
@@ -1472,6 +1515,13 @@ fn option_set(app: &mut App, verb: &str, arg: &str, v: f32) -> Option<(&'static 
         "pax" => {
             app.settings.pax_density = v;
             Some(("pax_density", v.to_string()))
+        }
+        "pax_sit" => {
+            app.settings.pax_sit = v;
+            if let Some(h) = app.humans.as_mut() {
+                h.sit_bias = v;
+            }
+            Some(("pax_sit", v.to_string()))
         }
         "volume" => {
             app.settings.volume = v;
@@ -1679,6 +1729,7 @@ fn toggle_now(app: &App, id: &str) -> Option<bool> {
         "mouse_smooth" => s.mouse_smooth,
         "blinker_cancel" => s.blinker_cancel,
         "fps" => s.show_fps,
+        "imperial" => s.imperial,
         "get_up" => s.get_up,
         "time_sync" => s.time_sync,
         "metar_sync" => s.metar_sync,
@@ -1694,11 +1745,13 @@ fn toggle_now(app: &App, id: &str) -> Option<bool> {
         "timetable_win" => app.timetable,
         "info_bar" => app.info_bar,
         "nav_arrows" => app.navigator.as_ref().map_or(s.nav_arrows, |n| n.arrows),
+        "nav_arrows_auto" => s.nav_arrows_auto,
         "exact_fare" => s.exact_fare,
         "trip_summary" => s.trip_summary,
         "collision_pedestrians" => s.collision_pedestrians,
         "ssao" => s.ssao,
         "rt_shadows" => s.rt_shadows,
+        "lamp_fill" => s.lamp_fill,
         "detail_textures" => s.detail_textures,
         "reflections" => s.reflections,
         "clouds" => s.clouds,
@@ -1831,6 +1884,12 @@ fn toggle_set(app: &mut App, id: &str, on: bool) -> Option<(&'static str, String
             app.settings.show_fps = on;
             Some(("show_fps", bit))
         }
+        // [ROLLBACK units-80]
+        "imperial" => {
+            app.settings.imperial = on;
+            crate::units::set_imperial(on);
+            Some(("imperial_units", bit))
+        }
         "headtrack" => {
             app.settings.head_tracking = on;
             Some(("head_tracking", bit))
@@ -1874,6 +1933,11 @@ fn toggle_set(app: &mut App, id: &str, on: bool) -> Option<(&'static str, String
             app.settings.nav_arrows = on;
             Some(("nav_arrows", bit))
         }
+        // [ROLLBACK helpers-50]
+        "nav_arrows_auto" => {
+            app.settings.nav_arrows_auto = on;
+            Some(("nav_arrows_auto", bit))
+        }
         "exact_fare" => {
             app.settings.exact_fare = on;
             Some(("exact_fare", bit))
@@ -1893,6 +1957,10 @@ fn toggle_set(app: &mut App, id: &str, on: bool) -> Option<(&'static str, String
                 app.settings.ssao = true;
             }
             Some(("rt_shadows", bit))
+        }
+        "lamp_fill" => {
+            app.settings.lamp_fill = on;
+            Some(("lamp_fill", bit))
         }
         "ssao" => {
             app.settings.ssao = on;
@@ -2382,6 +2450,7 @@ fn sync_live(app: &mut App) {
     if let Some(h) = app.humans.as_mut() {
         h.exact_fare = s.exact_fare;
         h.boarding = s.boarding.clone();
+        h.sit_bias = s.pax_sit;
         h.voices = match s.pax_voices.as_str() {
             "off" => 2,
             "tickets" => 1,
@@ -2402,6 +2471,7 @@ fn options_pages(app: &App) -> Vec<Page> {
         switch_row(app, "navigator", "Navigator", "Enables/Disables the Minimap"),
         switch_row(app, "nav_ai", "AI vehicles on the map", "Shows/hides the other (AI) vehicles on the Minimap and the city map"),
         switch_row(app, "nav_arrows", "Route arrows (as in OMSI 2)", "Shows OMSI 2's route arrows over the road"),
+        switch_row(app, "nav_arrows_auto", "Generated route arrows", "With the route arrows on, also puts arrows over the junctions and stops of the route ahead (the map's own arrows show either way)"),
         pick("navigator_corner", "Corner", later),
         switch_row(app, "get_up", "Ability to get up (Ctrl+Shift+G)", "Allows you to get out of the car and explore the world"),
         switch_row(app, "coll_objects", "Collisions with objects", "Enables/disables collisions with objects such as buildings, streetlights, etc."),
@@ -2516,6 +2586,7 @@ fn options_pages(app: &App) -> Vec<Page> {
         switch_row(app, "vsync", "V-sync", "Waits for the screen's refresh"),
         pick("max_fps", "Frame limit", "Frames a second at most"),
         switch_row(app, "fps", "Frame rate", "Show the frames per second in the top right corner"),
+        switch_row(app, "imperial", "Imperial units", "Speeds in mph, distances in yards and miles and the odometer in miles on the information bar, the navigator and the touch panel"),
         pick("view_distance", "View distance", later),
         pick("max_obj_dist", "Object distance", later),
         pick("min_obj_size", "Small objects", later),
@@ -2773,6 +2844,7 @@ fn world_pages(app: &App) -> Vec<Page> {
         people.push(button("Clear AI traffic", "Clear", "Remove the current AI cars from the road; random traffic will return automatically.", "traffic_clear"));
     }
     people.extend(slider_row(app, "pax", "Passengers", "How many passengers wait at the stops and ride.", &pct));
+    people.extend(slider_row(app, "pax_sit", "Passengers' wish to sit", "How eagerly boarding passengers look for a seat (Original: a random free place).", &|v| if v < 0.025 { "Original".to_string() } else { format!("{v:.2}x") }));
     vec![("Time", time), ("Weather", weather), ("Temperature and wind", climate), ("Traffic and people", people), ("Tools", tools)]
 }
 

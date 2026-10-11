@@ -335,6 +335,11 @@ pub struct Navigator {
     congestion_t: f32,
     /// Map camera: distance, heading, both smoothed.
     zoom: f64,
+    /// [ROLLBACK navzoom-72] The wheel's share of the zoom (1: the automatic one), whether the
+    /// cursor is on the panel, and the seconds it is held after the cursor left it.
+    zoom_bias: f64,
+    zoom_hover: bool,
+    zoom_hold: f32,
     cam_heading: f64,
     time: f32,
     /// Distance along the route to the next stop (m), refreshed now and then.
@@ -397,6 +402,9 @@ fn angle_diff(a: f64, b: f64) -> f64 {
     d
 }
 
+/// Seconds the wheel's zoom stays after the cursor left the small navigator.
+const NAV_ZOOM_HOLD: f32 = 3.0;
+
 fn ease(dt: f32, tau: f32) -> f64 {
     (1.0 - (-dt / tau.max(1e-3)).exp()) as f64
 }
@@ -448,6 +456,9 @@ impl Navigator {
             jam_version: 0,
             congestion_t: 0.0,
             zoom: 120.0,
+            zoom_bias: 1.0,
+            zoom_hover: false,
+            zoom_hold: 0.0,
             cam_heading: 0.0,
             time: 0.0,
             next_dist: None,
@@ -924,6 +935,18 @@ impl Navigator {
         self.update_congestion(f);
         // camera: zoomed out with speed, turned with the bus (both eased)
         let want = (110.0 + f.speed_kmh as f64 * 2.2).clamp(110.0, 280.0);
+        // [ROLLBACK navzoom-72] zoomed with the wheel: held while the cursor is on the panel and a
+        // few seconds after, then eased back to the automatic zoom
+        if self.zoom_hover {
+            self.zoom_hold = NAV_ZOOM_HOLD;
+        } else if self.zoom_hold > 0.0 {
+            self.zoom_hold -= f.dt;
+        } else if (self.zoom_bias - 1.0).abs() > 0.002 {
+            self.zoom_bias += (1.0 - self.zoom_bias) * ease(f.dt, 1.2);
+        } else {
+            self.zoom_bias = 1.0;
+        }
+        let want = want * self.zoom_bias;
         if self.first {
             self.zoom = want;
             self.cam_heading = f.heading;
@@ -1131,7 +1154,7 @@ impl Navigator {
                 -1 => "turn_left",
                 _ => "turn_right",
             };
-            let t = if *dist >= 1000.0 { format!("{:.1} km", dist / 1000.0) } else { format!("{:.0} m", ((dist / 10.0).round() * 10.0).max(10.0)) };
+            let t = crate::units::distance(*dist as f64, 10.0);
             let tw = self.fonts.width(&t, 14.0 * s, Weight::Bold);
             // with the street it turns into, when the map names it
             let street = street.as_deref().map(|n| self.fonts.fit(n, 12.0 * s, Weight::Medium, map.w * 0.62 - 50.0 * s - tw));
@@ -1214,9 +1237,9 @@ impl Navigator {
         let pad = 11.0 * s;
         let base = top.y + top.h * 0.5 + self.fonts.cap_height(17.0 * s, Weight::Bold) * 0.5;
         let mut x = pad;
-        x += ui.text(&mut self.atlas, &self.fonts, &format!("{:.0}", f.speed_kmh.abs()), 17.0 * s, Weight::Bold, Vec2::new(x, base), Align::Left, TEXT);
+        x += ui.text(&mut self.atlas, &self.fonts, &format!("{:.0}", crate::units::speed_value(f.speed_kmh.abs())), 17.0 * s, Weight::Bold, Vec2::new(x, base), Align::Left, TEXT);
         x += 4.0 * s;
-        x += ui.text(&mut self.atlas, &self.fonts, wd.kmh, 12.0 * s, Weight::Medium, Vec2::new(x, base), Align::Left, TEXT_DIM);
+        x += ui.text(&mut self.atlas, &self.fonts, crate::units::speed_unit(wd.kmh), 12.0 * s, Weight::Medium, Vec2::new(x, base), Align::Left, TEXT_DIM);
         let limit = net.and_then(|n| {
             let lane = if self.route.on_route { self.route.lanes.get(self.route.progress).copied() } else { None };
             let lane = lane.or_else(|| n.nearest_lane_near(f.bus, LaneKind::Street).filter(|l| l.2 < 8.0).map(|l| l.0))?;
@@ -1228,7 +1251,7 @@ impl Navigator {
             let c = Vec2::new(x + 10.0 * s, top.center().y);
             ui.circle(c, 10.5 * s, Color::rgba(200, 40, 40, 1.0));
             ui.circle(c, 8.3 * s, Color::rgba(235, 235, 235, 1.0));
-            let t = format!("{:.0}", (v / 5.0).round() * 5.0);
+            let t = format!("{:.0}", (crate::units::speed_value(v) / 5.0).round() * 5.0);
             let px = if t.len() > 2 { 7.5 } else { 9.0 } * s;
             ui.text(&mut self.atlas, &self.fonts, &t, px, Weight::Black, Vec2::new(c.x, c.y + self.fonts.cap_height(px, Weight::Black) * 0.5), Align::Center, Color::rgba(15, 15, 15, 1.0));
         }
@@ -1286,7 +1309,7 @@ impl Navigator {
                 ui.text_in(&mut self.atlas, &self.fonts, &name, 13.5 * s, Weight::Bold, stop_row, Align::Left, TEXT);
                 let mut parts = Vec::new();
                 if let Some(d) = self.next_dist {
-                    parts.push(if d >= 1000.0 { format!("{:.1} km", d / 1000.0) } else { format!("{:.0} m", (d / 10.0).round() * 10.0) });
+                    parts.push(crate::units::distance(d as f64, 10.0));
                     let secs = d / (self.speed_avg.max(5.0) as f64);
                     parts.push(if secs < 60.0 { "<1 min".to_string() } else { format!("{:.0} min", (secs / 60.0).round()) });
                 }
@@ -2349,6 +2372,18 @@ impl Navigator {
         }
     }
 
+    /// [ROLLBACK navzoom-72] The cursor moved to (x, y) physical pixels: on the small panel or not.
+    pub fn cursor_over(&mut self, x: f32, y: f32) {
+        self.zoom_hover = self.over_panel(x, y) && !self.city.open;
+    }
+
+    /// [ROLLBACK navzoom-72] The wheel over the small panel: zooms the map in (up) or out, on top
+    /// of the automatic zoom with speed.
+    pub fn panel_wheel(&mut self, amount: f32) {
+        self.zoom_bias = (self.zoom_bias * (1.0 - amount as f64 * 0.12)).clamp(0.3, 4.0);
+        self.zoom_hold = NAV_ZOOM_HOLD;
+    }
+
     /// The wheel over the map: zoom, keeping the point under the cursor where it is.
     pub fn map_wheel(&mut self, amount: f32, x: f32, y: f32) {
         let r = self.city.rect;
@@ -2609,7 +2644,7 @@ impl Navigator {
         };
         let title_w = ui.text_in(&mut self.atlas, &self.fonts, &title, 15.0 * s, Weight::Bold, Rect::new(pad, head.y, w * 0.4, head.h), Align::Left, TEXT);
         if let Some(st) = f.stops.first() {
-            let d = self.next_dist.map(|d| if d >= 1000.0 { format!("{:.1} km", d / 1000.0) } else { format!("{:.0} m", d) }).unwrap_or_default();
+            let d = self.next_dist.map(|d| crate::units::distance(d as f64, 0.0)).unwrap_or_default();
             let t = format!("{}  ·  {}  ·  {:02}:{:02}", st.name.trim(), d, (st.arrival / 3600.0) as i32 % 24, ((st.arrival % 3600.0) / 60.0) as i32);
             ui.text_in(&mut self.atlas, &self.fonts, &t, 13.5 * s, Weight::Medium, Rect::new(pad + title_w + 24.0 * s, head.y, w * 0.45, head.h), Align::Left, TEXT_DIM);
         }
@@ -2624,12 +2659,12 @@ impl Navigator {
             bx -= bs + 8.0 * s;
         }
         // a scale bar, bottom left
-        let nice = [10.0, 20.0, 50.0, 100.0, 200.0, 500.0, 1000.0, 2000.0, 5000.0];
-        let metres = nice.iter().copied().find(|m| m / self.city.mpp > 70.0 * s as f64).unwrap_or(5000.0);
+        let steps = crate::units::scale_steps();
+        let (metres, scale_text) = steps.iter().copied().find(|(m, _)| m / self.city.mpp > 70.0 * s as f64).unwrap_or(steps[steps.len() - 1]);
         let len = (metres / self.city.mpp) as f32;
         let by = h - 22.0 * s;
         ui.rect(Rect::new(pad, by, len, 2.0 * s), TEXT_DIM);
-        ui.text(&mut self.atlas, &self.fonts, &if metres >= 1000.0 { format!("{:.0} km", metres / 1000.0) } else { format!("{metres:.0} m") }, 12.0 * s, Weight::Medium, Vec2::new(pad + len + 8.0 * s, by + 4.0 * s), Align::Left, TEXT_DIM);
+        ui.text(&mut self.atlas, &self.fonts, scale_text, 12.0 * s, Weight::Medium, Vec2::new(pad + len + 8.0 * s, by + 4.0 * s), Align::Left, TEXT_DIM);
         ui.rounded_border(win, 10.0 * s, 1.0, Color::WHITE.alpha(0.08));
 
         // --- to the GPU

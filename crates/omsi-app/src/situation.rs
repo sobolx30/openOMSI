@@ -225,7 +225,7 @@ pub(crate) fn build_situation(
         // then three more numbers (zero for a standing vehicle)
         let h = v.heading.to_radians() / 2.0;
         let orientation = [0.0, h.sin(), 0.0, h.cos(), 0.0, 0.0, 0.0, 0.0, 0.0];
-        let vars: Vec<(String, f64)> =
+        let mut vars: Vec<(String, f64)> =
             v.ty.program
                 .var_names
                 .iter()
@@ -237,6 +237,14 @@ pub(crate) fn build_situation(
                     )
                 })
                 .collect();
+        // [ROLLBACK odometer-63] the odometer is kept even where no script declares it
+        for key in ["kmcounter_km", "kmcounter_m"] {
+            if !vars.iter().any(|(n, _)| n.eq_ignore_ascii_case(key)) {
+                if let Some(x) = v.var(key) {
+                    vars.push((key.to_string(), x as f64));
+                }
+            }
+        }
         let string_vars: Vec<(String, String)> =
             v.ty.program
                 .str_var_names

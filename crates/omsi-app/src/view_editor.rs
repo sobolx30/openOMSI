@@ -192,7 +192,16 @@ impl App {
         match self.view_editor.place.take() {
             Some(at) => {
                 if self.place_question_ok() {
-                    let heading = self.player.as_ref().map(|p| p.vehicle.heading).unwrap_or(0.0);
+                    // [ROLLBACK placeyaw-63] the vehicle stands facing the way the map camera
+                    // looks (its horizontal direction, wherever on the window the click was), so
+                    // that its rear is seen from where it was put; its old heading only where
+                    // there is no camera
+                    let heading = self
+                        .camera
+                        .as_ref()
+                        .map(|c| (c.yaw as f64).rem_euclid(360.0))
+                        .or_else(|| self.player.as_ref().map(|p| p.vehicle.heading))
+                        .unwrap_or(0.0);
                     crate::admin::teleport(self, at, heading);
                     self.service_msg = Some(("The vehicle stands where you clicked".into(), 3.0));
                 }
@@ -283,6 +292,10 @@ impl App {
         let hit = self.ui.as_ref().and_then(|u| u.edit_hits.iter().find(|h| x >= h.2[0] && x <= h.2[2] && y >= h.2[1] && y <= h.2[3]).map(|h| (h.0, h.1)));
         let Some((id, part)) = hit else { return true };
         if spec(id).is_some() {
+            // (a mirror's slider: the head turns to that mirror first)
+            if matches!(id, M_YAW | M_PITCH) {
+                self.view_editor_aim_at_mirror();
+            }
             self.view_editor.drag = Some(id);
             self.view_editor_drag_to(id);
             return true;
@@ -292,6 +305,7 @@ impl App {
             MIRROR if n > 0 => {
                 let at = self.view_editor.mirror % n;
                 self.view_editor.mirror = if part == 1 { (at + n - 1) % n } else { (at + 1) % n };
+                self.view_editor_aim_at_mirror();
             }
             RESET_VIEW => {
                 if let Some(p) = self.player.as_mut() {
@@ -314,6 +328,43 @@ impl App {
         true
     }
 
+    /// [ROLLBACK mirroraim-61] Turn the driver's head towards the mirror being set, so the
+    /// picture it shows is in sight while it is adjusted. Where the mirror's glass is: the
+    /// mesh that carries its `reflexionN` texture (`World::mirror_glass`); where that is not
+    /// in the cab (a screen switched off in the vehicle's config, the other kind of mirror
+    /// fitted elsewhere), the spot its camera is set at.
+    pub(crate) fn view_editor_aim_at_mirror(&mut self) {
+        if self.view != "driver" {
+            return;
+        }
+        let at = self.view_editor.mirror;
+        let Some(p) = self.player.as_ref() else { return };
+        if p.trailer_driver_camera().is_some() {
+            return;
+        }
+        let def = &p.vehicle.ty.def;
+        let n = def.cameras_driver.len().max(1);
+        let Some(cam) = def.cameras_driver.get((def.camera_std + p.cam_choice.0) % n) else { return };
+        let glass = self.world.as_ref().and_then(|w| w.mirror_glass.lock().get(at).copied().flatten()).map(|g| g.centre);
+        let target = match glass {
+            Some(c) => c,
+            None => match def.cameras_reflexion.get(at) {
+                Some(c) => glam::Vec3::from_array(c.pos),
+                None => return,
+            },
+        };
+        let eye = glam::Vec3::from_array(cam.pos) + p.head_offset() + p.seat;
+        let d = target - eye;
+        if d.length() < 0.05 {
+            return;
+        }
+        let yaw = d.x.atan2(d.y).to_degrees() - cam.yaw - p.view_adj[3];
+        let pitch = d.z.atan2(d.x.hypot(d.y)).to_degrees() - cam.pitch - self.settings.seat_pitch_deg - p.view_adj[4];
+        self.sync_view_look();
+        self.f1_reset = None;
+        self.look = (crate::input_script::cab_look_yaw(yaw), pitch.clamp(-85.0, 85.0));
+    }
+
     /// Open the panel (from the game menu).
     pub(crate) fn view_editor_open(&mut self) {
         if self.player.is_none() {
@@ -331,5 +382,6 @@ impl App {
         self.view_editor.open = true;
         self.view_editor.mirror = 0;
         self.view_editor.drag = None;
+        self.view_editor_aim_at_mirror();
     }
 }

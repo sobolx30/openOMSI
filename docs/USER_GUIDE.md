@@ -130,7 +130,7 @@ LAN session. Esc opens the game menu: drive the next placed vehicle, place any v
 the installation in front of the camera (or beside the bus), couple what stands close behind
 the bus and uncouple it again, save the situation or load the quicksave, the next weather, the clock an hour on or back, refuel and wash (only at a
 petrol station, as in OMSI), repair (the team needs the map's travel time when the bus stands
-in no depot yard), screenshot, timetable, skip the duty's next stop (also **Ctrl+Shift+H**: for a
+in no depot yard), screenshot, timetable, skip the duty's next stop (also **Ctrl+Alt+H**: for a
 stop the bus cannot reach or never registers at), the object editor (below), quit. Its *Options* hold
 one line a setting under the launcher's headings (Simulation, Display & sound, Driving,
 Camera): **Left** and **Right** (or a click on the arrows round the value) step it down and
@@ -236,6 +236,15 @@ again only when something changes; drag on it to turn the bus, scroll to zoom. I
 * **Timetable** - a map's lines, their tours and trips. Changes stay while you move between
   lines and are saved together (*Save all*); **New line** makes a line, **Repeat** turns a tour
   into a whole day of them (every *n* minutes up to a last departure).
+* **AI list** - the buses a map's depots put on the road, from its `ailists.cfg`: the types of bus of each
+  depot group, a switch for each (switched off, its block is passed over: the keyword is renamed
+  `[off_...]`, which OMSI 2 passes over too), `+` / `-` for how many of the type there are (one fleet
+  number a bus; the numbers come from the bus's own list), and *Add a bus* as in Drive: manufacturer, model,
+  livery, a fleet number and a number plate (empty: the bus's own rule), with the bus shown above the list; a
+  click on a type's count shows that bus.
+  *Save* writes the file in the content folder (a map of the original installation gets a copy there, the
+  original stays as it is; a file in the content folder is kept once as `ailists.cfg.orig`); *Reset AI list*
+  puts the map's own back. It counts the next time a game starts.
 * **Setup** - where the original installation and the game binary are. The OMSI 2 folder may
   be given as a path with quotes, as `Omsi.exe` itself or as a folder inside it; unpacked into
   the OMSI 2 folder itself, openOMSI keeps its own content in an `openOMSI` folder there and
@@ -314,6 +323,19 @@ cabin's `[ticket_sale]` names, turn to the driver, put the money down, take thei
 themselves after a moment and walk on; `pay` - they wait for the driver to sell the ticket
 (the bus's printer, or **T**) and give up after 25 s; `walk` - straight into the saloon,
 no cash desk (flat fare / ticket machines). People keep a body's width apart outside.
+
+`pax_sit` (*Passengers' wish to sit*, 1.0 by default) is how passengers choose their place: `0` is the
+original's random free place; anything above makes them look for a seat first and for a standing place
+after, the number scaling the odds of sitting (0.5 .. 2). Whoever rides far sits (a short ride stands,
+by the doors), the elderly (`[age]` of the `.hum` from 65) nearly always, and the fewer seats are free
+the fewer short riders take one. Of the seats, an empty bench and a window (far from the middle of the
+bus) go first, the ones next to somebody last; people do not stand close to one another. In the bus a
+standing passenger with a long ride takes a seat that has been freed, and now and then (not more often
+than once in two and a half minutes per bus) somebody gives their seat to an elderly passenger who stands.
+About one in five of the waiting wait in a party of two to four with the same destination: two take a bench of two
+together, three or four a "four" (two pairs of seats facing each other) if the cabin has one; failing that they sit or stand
+close to each other. Who rides deep into the bus prefers the window, and elderly passengers often take the pilot's seat (across
+the aisle from the driver, a little behind the cab) if there is one.
 Who gets on the player's bus: on a duty (a line and tour, or a trip) with a destination on
 the display, the people waiting for a stop the trip calls at later - also where the bus's
 depot file (`.hof`) names the terminus otherwise than the map's timetable does - and those

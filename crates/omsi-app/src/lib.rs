@@ -14,6 +14,7 @@ mod discord;
 #[cfg(steam)]
 mod steam;
 mod voice;
+mod units;
 mod head_idle;
 mod headtrack;
 #[cfg(windows)]
@@ -443,6 +444,7 @@ pub(crate) fn make_app(mut args: Args, server_cfg: Option<server::ServerCfg>) ->
     let clock_note = args.clock_moved.clone();
     // (as the last session left it, #1164)
     let info_bar = settings.info_bar;
+    units::set_imperial(settings.imperial);
     let mut app = App {
         args,
         instance: graphics_instance(),
@@ -575,6 +577,7 @@ pub(crate) fn make_app(mut args: Args, server_cfg: Option<server::ServerCfg>) ->
         key_capture: None,
         menu_prev_pause: false,
         info_bar,
+        gui_hidden: false,
         devtools: Default::default(),
         pending_time: None,
         world_day: None,

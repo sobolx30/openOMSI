@@ -21,6 +21,7 @@ mod state;
 pub(crate) use state::crash_of;
 mod theme;
 mod timetable;
+mod ailist;
 mod ui;
 mod dialogs;
 
@@ -50,10 +51,12 @@ pub enum Page {
     Mods,
     Tutorials,
     Timetable,
+    /// [ROLLBACK ailist-73]
+    AiList,
     Setup,
 }
 
-const PAGES: [(Page, &str, &str); 10] = [
+const PAGES: [(Page, &str, &str); 11] = [
     (Page::Drive, "Drive", "directions_bus"),
     (Page::Multiplayer, "Multiplayer", "groups"),
     (Page::Profile, "Profile", "badge"),
@@ -63,6 +66,7 @@ const PAGES: [(Page, &str, &str); 10] = [
     (Page::Mods, "Mods", "extension"),
     (Page::Tutorials, "Tutorials", "help"),
     (Page::Timetable, "Timetable", "schedule"),
+    (Page::AiList, "AI list", "garage"),
     (Page::Setup, "Setup", "folder_open"),
 ];
 
@@ -129,6 +133,9 @@ pub struct Launcher {
     /// Where the bus preview is this frame, its texture in the interface pipeline, and the
     /// showroom picture it was bound to.
     preview_rect: Option<Rect>,
+    /// [ROLLBACK ailist-75] A bus the page shows instead of the chosen one (bus file, paint):
+    /// the AI list page sets it every frame it is up, the next frame takes it.
+    preview_other: Option<(String, String)>,
     preview_tex: Option<usize>,
     preview_gen: u64,
     /// The chosen map's picture (see `mapview`): where it is this frame and its texture.
@@ -207,6 +214,7 @@ impl Launcher {
             .unwrap_or_default(),
         release_next: false,
         preview_rect: None,
+        preview_other: None,
         preview_tex: None,
         preview_gen: 0,
         mapview: mapview::MapView::new(),
@@ -734,7 +742,8 @@ impl Launcher {
         self.update_discord();
         // the preview shows the chosen bus in the chosen light
         let c = &self.state.choice;
-        let look = showroom::Look { root: std::path::PathBuf::from(&self.state.config.root), map: c.map.clone(), bus: c.bus.clone(), paint: c.paint.clone(), weather: c.weather.clone(), time: c.time, date: c.date.clone() };
+        let (look_bus, look_paint) = self.preview_other.take().unwrap_or_else(|| (c.bus.clone(), c.paint.clone()));
+        let look = showroom::Look { root: std::path::PathBuf::from(&self.state.config.root), map: c.map.clone(), bus: look_bus, paint: look_paint, weather: c.weather.clone(), time: c.time, date: c.date.clone() };
         // (not while a game runs: the launcher looked at meanwhile loads no bus onto the card)
         if !look.bus.is_empty() && !look.map.is_empty() && !self.state.in_game() {
             self.showroom.want(look);
@@ -1002,6 +1011,7 @@ impl Launcher {
             Page::Mods => pages::mods(self, content),
             Page::Tutorials => pages::tutorials(self, content),
             Page::Timetable => timetable::draw(self, content),
+            Page::AiList => ailist::draw(self, content),
             Page::Setup => pages::setup(self, content),
         }
         // the rail over the page (a scrolled page passes under it)

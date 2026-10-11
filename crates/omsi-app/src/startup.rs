@@ -94,6 +94,8 @@ pub(crate) fn own_bindings(root: &Path, modifier: i32) -> std::collections::Hash
     m.vehicles
         .iter()
         .chain(m.game.iter())
+        // (the walker's keys are the on-foot keys, not the driver's own: W A S D drive still)
+        .filter(|b| !b.action.to_ascii_lowercase().starts_with("walk_"))
         .filter(|b| b.chord() == modifier && b.scan_code != 0 && !stock.contains(&(b.action.to_ascii_lowercase(), b.scan_code, b.modifier)))
         .map(|b| b.scan_code)
         .collect()

@@ -69,6 +69,8 @@ pub struct BusService {
     pub delay: f64,
     /// Put out before its departure: it waits for it at its first stop.
     pub layover: bool,
+    /// [ROLLBACK aiparked-73] The wait at this stop is a long one (`PARKED_WAIT`): the engine stops.
+    long_wait: bool,
     /// The timetable still carries the route on as tiles bring their lanes: at the end of
     /// what it has, it waits for more.
     pub route_open: bool,
@@ -121,6 +123,10 @@ fn early_wait(depart: f64, now: f64, layover: bool, rail: bool) -> f64 {
     };
     (depart - lead - now).clamp(0.0, LAYOVER_WAIT)
 }
+/// [ROLLBACK aiparked-73] A wait at a stop this long (3.5 minutes) stops the engine; it starts
+/// again this long (s) before the departure.
+const PARKED_WAIT: f64 = 210.0;
+const PARKED_START: f64 = 75.0;
 /// On a layover, the doors open this long before the departure.
 const LAYOVER_BOARDING: f64 = 45.0;
 /// Pull into the bay over this distance before the stop: the stop's docking distance,
@@ -171,6 +177,7 @@ impl BusService {
             boarded: false,
             delay: 0.0,
             layover: false,
+            long_wait: false,
             route_open: false,
             terminus: String::new(),
             near_d: f32::INFINITY,
@@ -198,6 +205,12 @@ impl BusService {
 
     pub fn trip_done(&self) -> bool {
         self.phase == Phase::TripDone
+    }
+
+    /// [ROLLBACK aiparked-73] Standing out a long layover with the engine off: it starts again
+    /// `PARKED_START` before the doors open for the departure.
+    pub fn parked(&self, day_time: f64) -> bool {
+        self.phase == Phase::Waiting && self.long_wait && self.leave_at - day_time > PARKED_START
     }
 
     /// Standing at a stop (boarding, waiting or pulling out).
@@ -266,6 +279,7 @@ impl BusService {
         let rail = ctx.net.lanes.get(at.0).is_some_and(|l| l.kind == LaneKind::Rail);
         let wait = early_wait(depart, ctx.day_time, layover, rail);
         self.leave_at = ctx.day_time + wait;
+        self.long_wait = wait >= PARKED_WAIT;
         self.boarding = boarding_time(ctx.id);
         self.boarded = false;
         // a layover opens the doors for the last minute only; anywhere else people get off

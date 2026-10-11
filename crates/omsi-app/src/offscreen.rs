@@ -168,6 +168,7 @@ pub(crate) fn run_offscreen(
         }
         h.exact_fare = settings.exact_fare;
         h.boarding = settings.boarding.clone();
+        h.sit_bias = settings.pax_sit;
         h.voices = match settings.pax_voices.as_str() { "off" => 2, "tickets" => 1, _ => 0 };
         if let Some(p) = player.as_mut() {
             h.set_cabin(&mut p.vehicle);
@@ -185,6 +186,7 @@ pub(crate) fn run_offscreen(
         h.time_of_day = parse_time(&args.time);
         h.stop_targets = schedule.as_ref().map(|s| s.stop_targets());
         h.stop_names = schedule.as_ref().map(|s| s.stop_names());
+        h.ride_minutes = schedule.as_ref().map(|s| s.ride_minutes());
         h.populate(&world, &renderer, &mut scene, center);
         if let Some(p) = player.as_ref() {
             if args.riders > 0 {
